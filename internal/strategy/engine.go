@@ -1,0 +1,1618 @@
+package strategy
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"math"
+	"math/big"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"robinhood-go/internal/chain"
+	secret "robinhood-go/internal/crypto"
+	"robinhood-go/internal/store"
+)
+
+// Event is the normalized event consumed by the strategy engine.  The parser
+// accepts both the legacy short names and the names emitted by the Node
+// listener (quoteAmountRaw, priceImpactRatio, blockNumber).
+type Event struct {
+	Key              string    `json:"sourceEventKey"`
+	UserID           int64     `json:"userId"`
+	TokenAddress     string    `json:"tokenAddress"`
+	CurveAddress     string    `json:"curveAddress"`
+	PoolID           string    `json:"poolId"`
+	Amount0Raw       string    `json:"amount0Raw"`
+	Amount1Raw       string    `json:"amount1Raw"`
+	Side             string    `json:"side"`
+	QuoteUSD         float64   `json:"quoteUSD"`
+	QuoteAmountRaw   float64   `json:"quoteAmountRaw"`
+	TokenAmountRaw   float64   `json:"tokenAmountRaw"`
+	QuoteAmountText  string    `json:"-"`
+	TokenAmountText  string    `json:"-"`
+	Impact           float64   `json:"impact"`
+	PriceImpactRatio float64   `json:"priceImpactRatio"`
+	PriceChangeRatio float64   `json:"priceChangeRatio"`
+	SqrtPriceX96     string    `json:"sqrtPriceX96"`
+	Price            float64   `json:"price"`
+	PriceRaw         float64   `json:"priceRaw"`
+	TokenDecimals    int       `json:"tokenDecimals"`
+	QuoteDecimals    int       `json:"quoteDecimals"`
+	MarketCap        float64   `json:"marketCap"`
+	Block            string    `json:"block"`
+	Own              bool      `json:"own"`
+	Sender           string    `json:"sender"`
+	ReceivedAt       time.Time `json:"receivedAt"`
+	// ExecutionAmountRaw is an internal exact quantity hint for sell actions;
+	// it is never serialized as part of the public event contract.
+	ExecutionAmountRaw string `json:"-"`
+}
+
+type position struct {
+	// AmountRaw is kept as an integer string because ERC-20 quantities commonly
+	// exceed float64's 53-bit exact range. Amount remains a derived value used
+	// by the existing strategy arithmetic and API-compatible callbacks.
+	AmountRaw                                          string
+	Amount, AverageCost, FirstPrice, LastPrice         float64
+	BuyCount, SellCount, ProfitLevel                   int
+	PendingSell                                        bool
+	FirstBought, NextScheduled, CooldownUntil, LastBuy *time.Time
+}
+
+type Engine struct {
+	Store *store.Store
+	RPC   *chain.RPC
+	locks sync.Map
+	// ExecuteAction is injected by the server when live strategy trading is
+	// enabled. It must return only after broadcast (or dry-run) and must not
+	// mutate strategy state; own-chain fill events call applyOwnFill after a
+	// successful receipt. Keeping this hook optional preserves deterministic
+	// replay/testing of the strategy engine.
+	ExecuteAction func(context.Context, Event, string, float64) (map[string]any, error)
+	Trading       *chain.Trading
+	EncryptionKey string
+	prices        sync.Map // pool/curve key -> last observed execution price
+	curveBlocks   sync.Map // curve address -> last polled block
+	pollMu        sync.Mutex
+	monitorMu     sync.RWMutex
+	monitorUsers  map[int64]store.User
+	monitorTokens map[int64][]store.Token
+	monitorAt     time.Time
+	monitorLoadMu sync.Mutex
+}
+
+func New(s *store.Store, r *chain.RPC) *Engine {
+	return &Engine{Store: s, RPC: r, monitorUsers: make(map[int64]store.User), monitorTokens: make(map[int64][]store.Token)}
+}
+
+func (e *Engine) ConfigureTrading(t *chain.Trading, encryptionKey string) {
+	e.Trading, e.EncryptionKey = t, encryptionKey
+}
+
+// InvalidateMonitorCache is called by the HTTP mutation handlers after a
+// user/token change so the next WSS event observes the new switch immediately
+// instead of waiting for the normal two-second refresh interval.
+func (e *Engine) InvalidateMonitorCache() {
+	e.monitorMu.Lock()
+	e.monitorAt = time.Time{}
+	e.monitorMu.Unlock()
+}
+
+func (e *Engine) Run(ctx context.Context) {
+	// Decode and evaluate independent pools in parallel. A stable shard key
+	// keeps events for one user/token/pool in chain order, while unrelated
+	// positions no longer wait behind a slow database or RPC call.
+	const workerCount = 16
+	queues := make([]chan map[string]any, workerCount)
+	var wg sync.WaitGroup
+	for i := range queues {
+		queues[i] = make(chan map[string]any, 512)
+		wg.Add(1)
+		go func(queue <-chan map[string]any) {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case raw, ok := <-queue:
+					if !ok {
+						return
+					}
+					e.processDecoded(ctx, raw)
+				}
+			}
+		}(queues[i])
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			for _, queue := range queues {
+				close(queue)
+			}
+			wg.Wait()
+			return
+		case raw, ok := <-e.RPC.Events:
+			if !ok {
+				for _, queue := range queues {
+					close(queue)
+				}
+				wg.Wait()
+				return
+			}
+			idx := eventShard(raw, workerCount)
+			select {
+			case queues[idx] <- raw:
+			case <-ctx.Done():
+			}
+		}
+	}
+}
+
+func (e *Engine) processDecoded(ctx context.Context, raw map[string]any) {
+	if ev, ok := decodeEvent(raw); ok {
+		if ev.UserID > 0 {
+			_ = e.Process(ctx, ev)
+		} else {
+			_ = e.processForMonitors(ctx, ev)
+		}
+	}
+}
+
+func eventShard(raw map[string]any, workers int) int {
+	if workers <= 1 {
+		return 0
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(strings.ToLower(firstString(raw, "userId", "userID"))))
+	_, _ = h.Write([]byte{':'})
+	_, _ = h.Write([]byte(strings.ToLower(firstString(raw, "token", "tokenAddress", "targetToken"))))
+	_, _ = h.Write([]byte{':'})
+	_, _ = h.Write([]byte(strings.ToLower(firstString(raw, "poolId", "poolID", "curve", "curveAddress", "marketAddress"))))
+	return int(h.Sum32() % uint32(workers))
+}
+
+func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
+	if err := e.refreshMonitorCache(ctx, false); err != nil {
+		return err
+	}
+	e.monitorMu.RLock()
+	users := make([]store.User, 0, len(e.monitorUsers))
+	for _, u := range e.monitorUsers {
+		users = append(users, u)
+	}
+	tokenSnapshot := make(map[int64][]store.Token, len(e.monitorTokens))
+	for uid, tokens := range e.monitorTokens {
+		tokenSnapshot[uid] = append([]store.Token(nil), tokens...)
+	}
+	e.monitorMu.RUnlock()
+	// Compute the adjacent-event price change once per pool event.  Updating
+	// the shared price map inside every user's copy made the first monitored
+	// user see the drop while all later users saw zero change.
+	var eventPriceChange float64
+	var eventPriceReady bool
+	for _, u := range users {
+		tokens := tokenSnapshot[u.UserID]
+		for _, t := range tokens {
+			if (ev.CurveAddress != "" && strings.EqualFold(t.CurveAddress, ev.CurveAddress)) || (ev.PoolID != "" && strings.EqualFold(t.PoolID, ev.PoolID)) {
+				copy := ev
+				copy.UserID = u.UserID
+				copy.TokenAddress = t.TokenAddress
+				copy.CurveAddress = t.CurveAddress
+				if t.Decimals != nil {
+					copy.TokenDecimals = *t.Decimals
+				}
+				if t.QuoteDecimals != nil {
+					copy.QuoteDecimals = *t.QuoteDecimals
+				}
+				if copy.MarketCap == 0 && t.MarketCap != nil {
+					copy.MarketCap, _ = strconv.ParseFloat(*t.MarketCap, 64)
+				}
+				copy.Own = copy.Sender != "" && strings.EqualFold(copy.Sender, u.WalletAddress)
+				if ev.PoolID != "" && (ev.Amount0Raw != "" || ev.Amount1Raw != "") {
+					a0, _ := strconv.ParseFloat(ev.Amount0Raw, 64)
+					a1, _ := strconv.ParseFloat(ev.Amount1Raw, 64)
+					// PoolManager amounts are deltas from the pool's perspective:
+					// a negative token delta means the token was paid out (buy), a
+					// positive token delta means it was sold into the pool.
+					amt := a1
+					quote := a0
+					if strings.EqualFold(t.Currency0, t.TokenAddress) {
+						amt, quote = a0, a1
+					}
+					if amt < 0 {
+						copy.Side = "buy"
+					} else if amt > 0 {
+						copy.Side = "sell"
+					}
+					copy.QuoteAmountRaw = math.Abs(quote)
+					copy.TokenAmountRaw = math.Abs(amt)
+					copy.QuoteAmountText = absIntegerText(ev.Amount0Raw)
+					copy.TokenAmountText = absIntegerText(ev.Amount1Raw)
+					if strings.EqualFold(t.Currency0, t.TokenAddress) {
+						copy.QuoteAmountText = absIntegerText(ev.Amount1Raw)
+						copy.TokenAmountText = absIntegerText(ev.Amount0Raw)
+					}
+					if copy.PriceRaw == 0 && copy.QuoteAmountRaw > 0 && copy.TokenAmountRaw > 0 {
+						copy.PriceRaw = copy.QuoteAmountRaw / copy.TokenAmountRaw
+					}
+					if copy.Price == 0 && copy.PriceRaw > 0 {
+						copy.Price = usdTokenPrice(copy.PriceRaw, t)
+					}
+					if copy.QuoteUSD == 0 && copy.QuoteAmountRaw > 0 {
+						copy.QuoteUSD = rawQuoteUSD(copy.QuoteAmountRaw, t)
+					}
+					// Derive price impact from this swap's own execution price and
+					// the PoolManager post-swap sqrt price. This deliberately does
+					// not compare adjacent events, which is not a price-impact
+					// measurement and caused false external-buy triggers.
+					if copy.PriceImpactRatio == 0 && ev.SqrtPriceX96 != "" {
+						copy.PriceImpactRatio = v4PriceImpact(ev.SqrtPriceX96, copy.QuoteAmountRaw, copy.TokenAmountRaw, strings.EqualFold(t.Currency0, t.TokenAddress))
+						copy.Impact = copy.PriceImpactRatio
+					}
+					if copy.Price > 0 && !eventPriceReady {
+						priceKey := strings.ToLower(copy.PoolID)
+						if priceKey == "" {
+							priceKey = strings.ToLower(copy.CurveAddress)
+						}
+						if old, loaded := e.prices.LoadOrStore(priceKey, copy.Price); loaded {
+							if previous, ok := old.(float64); ok && previous > 0 {
+								eventPriceChange = copy.Price/previous - 1
+							}
+							e.prices.Store(priceKey, copy.Price)
+						}
+						eventPriceReady = true
+					}
+					if ev.PriceChangeRatio == 0 && eventPriceReady {
+						copy.PriceChangeRatio = eventPriceChange
+					}
+					_ = e.Process(ctx, copy)
+				} else {
+					if copy.PriceRaw == 0 && copy.QuoteAmountRaw > 0 && copy.TokenAmountRaw > 0 {
+						copy.PriceRaw = copy.QuoteAmountRaw / copy.TokenAmountRaw
+					}
+					if copy.Price == 0 && copy.PriceRaw > 0 {
+						copy.Price = usdTokenPrice(copy.PriceRaw, t)
+					}
+					if copy.Price > 0 && !eventPriceReady {
+						priceKey := strings.ToLower(copy.PoolID)
+						if priceKey == "" {
+							priceKey = strings.ToLower(copy.CurveAddress)
+						}
+						if old, loaded := e.prices.LoadOrStore(priceKey, copy.Price); loaded {
+							if previous, ok := old.(float64); ok && previous > 0 {
+								eventPriceChange = copy.Price/previous - 1
+							}
+							e.prices.Store(priceKey, copy.Price)
+						}
+						eventPriceReady = true
+					}
+					if ev.PriceChangeRatio == 0 && eventPriceReady {
+						copy.PriceChangeRatio = eventPriceChange
+					}
+					_ = e.Process(ctx, copy)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (e *Engine) refreshMonitorCache(ctx context.Context, force bool) error {
+	e.monitorLoadMu.Lock()
+	defer e.monitorLoadMu.Unlock()
+	e.monitorMu.RLock()
+	fresh := !e.monitorAt.IsZero() && time.Since(e.monitorAt) < 2*time.Second
+	e.monitorMu.RUnlock()
+	if fresh && !force {
+		return nil
+	}
+	users, err := e.Store.Users(ctx)
+	if err != nil {
+		return err
+	}
+	userMap := make(map[int64]store.User, len(users))
+	tokenMap := make(map[int64][]store.Token, len(users))
+	for _, u := range users {
+		userMap[u.UserID] = u
+		tokens, tokenErr := e.Store.Tokens(ctx, u.UserID, nil)
+		if tokenErr != nil {
+			return tokenErr
+		}
+		tokenMap[u.UserID] = tokens
+	}
+	e.monitorMu.Lock()
+	e.monitorUsers, e.monitorTokens, e.monitorAt = userMap, tokenMap, time.Now()
+	e.monitorMu.Unlock()
+	return nil
+}
+
+func (e *Engine) cachedUser(ctx context.Context, userID int64) (store.User, error) {
+	_ = e.refreshMonitorCache(ctx, false)
+	e.monitorMu.RLock()
+	u, ok := e.monitorUsers[userID]
+	e.monitorMu.RUnlock()
+	if ok {
+		return u, nil
+	}
+	return e.Store.User(ctx, userID)
+}
+
+func (e *Engine) cachedTokenEnabled(ctx context.Context, userID int64, address, curve string) (bool, error) {
+	_ = e.refreshMonitorCache(ctx, false)
+	e.monitorMu.RLock()
+	for _, t := range e.monitorTokens[userID] {
+		if strings.EqualFold(t.TokenAddress, address) && strings.EqualFold(t.CurveAddress, curve) {
+			e.monitorMu.RUnlock()
+			return t.Enabled, nil
+		}
+	}
+	e.monitorMu.RUnlock()
+	return e.Store.TokenEnabled(ctx, userID, address, curve)
+}
+
+func rawQuoteUSD(raw float64, t store.Token) float64 {
+	decimals := 0
+	if t.QuoteDecimals != nil {
+		decimals = *t.QuoteDecimals
+	}
+	price := 0.0
+	if t.QuoteUSDPrice != nil {
+		price, _ = strconv.ParseFloat(*t.QuoteUSDPrice, 64)
+	}
+	if price == 0 {
+		return 0
+	}
+	return raw / math.Pow10(decimals) * price
+}
+
+func usdTokenPrice(rawPrice float64, t store.Token) float64 {
+	if rawPrice <= 0 {
+		return 0
+	}
+	quoteDecimals, tokenDecimals := 0, 0
+	if t.QuoteDecimals != nil {
+		quoteDecimals = *t.QuoteDecimals
+	}
+	if t.Decimals != nil {
+		tokenDecimals = *t.Decimals
+	}
+	quoteUSD := 0.0
+	if t.QuoteUSDPrice != nil {
+		quoteUSD, _ = strconv.ParseFloat(*t.QuoteUSDPrice, 64)
+	}
+	if quoteUSD <= 0 {
+		return rawPrice
+	}
+	return rawPrice * math.Pow10(tokenDecimals-quoteDecimals) * quoteUSD
+}
+
+func rawTokenPriceFromUSD(usdPrice float64, t store.Token) float64 {
+	if usdPrice <= 0 {
+		return 0
+	}
+	quoteDecimals, tokenDecimals := 0, 0
+	if t.QuoteDecimals != nil {
+		quoteDecimals = *t.QuoteDecimals
+	}
+	if t.Decimals != nil {
+		tokenDecimals = *t.Decimals
+	}
+	quoteUSD := 0.0
+	if t.QuoteUSDPrice != nil {
+		quoteUSD, _ = strconv.ParseFloat(*t.QuoteUSDPrice, 64)
+	}
+	if quoteUSD <= 0 {
+		return usdPrice
+	}
+	return usdPrice / (math.Pow10(tokenDecimals-quoteDecimals) * quoteUSD)
+}
+
+func v4PriceImpact(sqrt, quoteRaw, tokenRaw float64, tokenIsCurrency0 bool) float64 {
+	if quoteRaw <= 0 || tokenRaw <= 0 {
+		return 0
+	}
+	value := strings.TrimPrefix(strings.TrimPrefix(sqrt, "0x"), "0X")
+	base := 10
+	if strings.HasPrefix(strings.ToLower(sqrt), "0x") {
+		base = 16
+	}
+	s, ok := new(big.Int).SetString(value, base)
+	if !ok {
+		return 0
+	}
+	// sqrtPriceX96^2 / 2^192 is currency1 per currency0 in raw units.
+	sf := new(big.Float).SetInt(s)
+	spot := new(big.Float).Quo(new(big.Float).Mul(sf, sf), new(big.Float).SetInt(new(big.Int).Lsh(big.NewInt(1), 192)))
+	spotF, _ := spot.Float64()
+	if spotF <= 0 {
+		return 0
+	}
+	exec := quoteRaw / tokenRaw
+	if !tokenIsCurrency0 {
+		spotF = 1 / spotF
+	}
+	if spotF <= 0 {
+		return 0
+	}
+	// Match Node's signed estimate: startPrice ~= averageExecution^2 / final
+	// spotPrice, then impact = final/start - 1.  Keeping the sign matters;
+	// externalBuySell is intended to react to an upward price impact only.
+	impact := (spotF*spotF)/(exec*exec) - 1
+	if math.IsNaN(impact) || math.IsInf(impact, 0) {
+		return 0
+	}
+	return impact
+}
+
+func decodeEvent(raw map[string]any) (Event, bool) {
+	b, _ := json.Marshal(raw)
+	var ev Event
+	// Chain decoders intentionally keep raw amounts as decimal strings.  A
+	// direct json.Unmarshal into float64 rejects those fields and silently
+	// drops every WSS event, so use the struct for string fields and normalize
+	// numeric aliases below instead of treating a type mismatch as a bad event.
+	_ = json.Unmarshal(b, &ev)
+	if ev.UserID == 0 {
+		ev.UserID = int64(firstFloat(raw, "userId", "userID"))
+	}
+	if ev.Key == "" {
+		ev.Key = firstString(raw, "eventKey", "sourceEventKey", "transactionHash", "txHash")
+	}
+	if ev.TokenAddress == "" {
+		ev.TokenAddress = firstString(raw, "token", "tokenAddress", "targetToken")
+	}
+	if ev.CurveAddress == "" {
+		ev.CurveAddress = firstString(raw, "curve", "curveAddress", "marketAddress")
+	}
+	if ev.Side == "" {
+		ev.Side = strings.ToLower(firstString(raw, "type", "side", "direction"))
+	}
+	if ev.QuoteUSD == 0 {
+		ev.QuoteUSD = firstFloat(raw, "quoteUsd", "quoteUSD", "amountUsd", "quoteAmountUSD")
+	}
+	if n := firstFloat(raw, "quoteAmountRaw", "amountRaw", "quoteInRaw", "quoteOutRaw"); n != 0 {
+		ev.QuoteAmountRaw = n
+	}
+	ev.QuoteAmountText = firstString(raw, "quoteAmountRaw", "amountRaw", "quoteInRaw", "quoteOutRaw")
+	if n := firstFloat(raw, "tokenAmountRaw", "tokensOutRaw", "tokensInRaw"); n != 0 {
+		ev.TokenAmountRaw = n
+	}
+	ev.TokenAmountText = firstString(raw, "tokenAmountRaw", "tokensOutRaw", "tokensInRaw")
+	if ev.Impact == 0 {
+		ev.Impact = firstFloat(raw, "impact", "priceImpactRatio")
+	}
+	if ev.PriceImpactRatio == 0 {
+		ev.PriceImpactRatio = firstFloat(raw, "priceImpactRatio", "impact")
+	}
+	if ev.PriceChangeRatio == 0 {
+		ev.PriceChangeRatio = firstFloat(raw, "priceChangeRatio", "priceChange", "signedPriceChangeRatio")
+	}
+	if ev.Price == 0 {
+		ev.Price = firstFloat(raw, "price", "tokenPriceUsd", "priceUsd")
+	}
+	if ev.PriceRaw == 0 {
+		ev.PriceRaw = firstFloat(raw, "priceRaw")
+	}
+	if ev.TokenDecimals == 0 {
+		ev.TokenDecimals = int(firstFloat(raw, "tokenDecimals", "decimals"))
+	}
+	if ev.QuoteDecimals == 0 {
+		ev.QuoteDecimals = int(firstFloat(raw, "quoteDecimals"))
+	}
+	if ev.MarketCap == 0 {
+		ev.MarketCap = firstFloat(raw, "marketCap", "marketCapUsd")
+	}
+	if ev.Block == "" {
+		ev.Block = firstString(raw, "block", "blockNumber", "blockNumberHex")
+	}
+	if ev.Key == "" || (ev.TokenAddress == "" && ev.CurveAddress == "" && ev.PoolID == "") {
+		return ev, false
+	}
+	return ev, true
+}
+func firstString(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k]; ok && v != nil {
+			s := fmt.Sprint(v)
+			if s != "" && s != "<nil>" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func absIntegerText(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	n := new(big.Int)
+	if _, ok := n.SetString(value, 10); !ok {
+		if strings.HasPrefix(strings.ToLower(value), "0x") {
+			if _, ok := n.SetString(value[2:], 16); !ok {
+				return ""
+			}
+		} else {
+			return ""
+		}
+	}
+	return n.Abs(n).String()
+}
+
+func integerText(value string) string {
+	if value := absIntegerText(value); value != "" {
+		return value
+	}
+	return "0"
+}
+
+func rawFloat(value string) float64 {
+	if value == "" {
+		return 0
+	}
+	n, ok := new(big.Float).SetString(value)
+	if !ok {
+		return 0
+	}
+	f, _ := n.Float64()
+	return f
+}
+
+func scaleRawText(raw string, numerator, denominator float64) string {
+	if raw == "" || numerator <= 0 || denominator <= 0 {
+		return "0"
+	}
+	n, ok := new(big.Float).SetString(integerText(raw))
+	if !ok {
+		return "0"
+	}
+	n.Mul(n, new(big.Float).Quo(new(big.Float).SetFloat64(numerator), new(big.Float).SetFloat64(denominator)))
+	out, _ := n.Int(nil)
+	if out == nil || out.Sign() <= 0 {
+		return "0"
+	}
+	return out.String()
+}
+
+func rawRatio(raw string, ratio float64) string {
+	if raw == "" || ratio <= 0 || ratio > 1 {
+		return "0"
+	}
+	n := new(big.Int)
+	if _, ok := n.SetString(integerText(raw), 10); !ok || n.Sign() <= 0 {
+		return "0"
+	}
+	r, ok := new(big.Rat).SetString(strconv.FormatFloat(ratio, 'f', 18, 64))
+	if !ok || r.Sign() <= 0 {
+		return "0"
+	}
+	out := new(big.Rat).Mul(new(big.Rat).SetInt(n), r)
+	result := new(big.Int).Quo(out.Num(), out.Denom())
+	if result.Sign() <= 0 {
+		return "0"
+	}
+	return result.String()
+}
+
+func rawQuoteRatio(quoteRaw string, rawPrice, ratio float64) string {
+	if quoteRaw == "" || rawPrice <= 0 || ratio <= 0 || ratio > 1 {
+		return "0"
+	}
+	quote := new(big.Float)
+	if _, ok := quote.SetString(integerText(quoteRaw)); !ok {
+		return "0"
+	}
+	value := new(big.Float).Quo(quote, new(big.Float).SetFloat64(rawPrice))
+	value.Mul(value, new(big.Float).SetFloat64(ratio))
+	out, _ := value.Int(nil)
+	if out == nil || out.Sign() <= 0 {
+		return "0"
+	}
+	return out.String()
+}
+
+func firstFloat(m map[string]any, keys ...string) float64 {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			switch x := v.(type) {
+			case float64:
+				return x
+			case float32:
+				return float64(x)
+			case int:
+				return float64(x)
+			case int64:
+				return float64(x)
+			case uint64:
+				return float64(x)
+			case json.Number:
+				f, _ := strconv.ParseFloat(string(x), 64)
+				return f
+			case string:
+				f, _ := strconv.ParseFloat(x, 64)
+				return f
+			}
+		}
+	}
+	return 0
+}
+
+func (e *Engine) Process(ctx context.Context, ev Event) error {
+	key := fmt.Sprintf("%d:%s:%s", ev.UserID, strings.ToLower(ev.TokenAddress), strings.ToLower(ev.CurveAddress))
+	muI, _ := e.locks.LoadOrStore(key, &sync.Mutex{})
+	mu := muI.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	u, err := e.cachedUser(ctx, ev.UserID)
+	if err != nil {
+		return err
+	}
+	cfg := Parse(u.Config)
+	if !u.Enabled || !cfg.Enabled {
+		return nil
+	}
+	if enabled, err := e.cachedTokenEnabled(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress); err != nil || !enabled {
+		return err
+	}
+	if cfg.MinMCP > 0 && ev.MarketCap <= 0 {
+		return nil
+	}
+	if ev.MarketCap > 0 && ev.MarketCap < cfg.MinMCP {
+		return nil
+	}
+	rule, ok := cfg.Rule(ev.MarketCap)
+	if !ok {
+		return nil
+	}
+	p, err := e.loadPosition(ctx, ev)
+	if err != nil {
+		return err
+	}
+	if ev.Own {
+		if inserted, markErr := e.markStrategyEvent(ctx, ev); markErr != nil || !inserted {
+			return markErr
+		}
+		return e.applyOwnFill(ctx, ev, p, cfg)
+	}
+	// A position may receive several market events while a previous sell is
+	// still waiting for its receipt. loadPosition includes the durable pending
+	// flag in the same round trip, so a later event cannot broadcast a second
+	// sell without adding another database latency hop to the WSS path.
+	if p.PendingSell {
+		return nil
+	}
+	if action, amount, reason := evaluate(cfg, rule, ev, p); action != "" && amount > 0 {
+		if action == "sell" && reason == "external_buy_signal" && cfg.ExternalBuySell.BuyAmountRatio > 0 {
+			rawEventToken := ev.TokenAmountText
+			if rawEventToken == "" {
+				rawEventToken = integerRaw(ev.TokenAmountRaw)
+			}
+			candidate := "0"
+			if ev.QuoteAmountText != "" && ev.PriceRaw > 0 {
+				candidate = rawQuoteRatio(ev.QuoteAmountText, ev.PriceRaw, cfg.ExternalBuySell.BuyAmountRatio)
+			}
+			if candidate == "0" {
+				candidate = rawRatio(rawEventToken, cfg.ExternalBuySell.BuyAmountRatio)
+			}
+			if candidate != "0" {
+				ev.ExecutionAmountRaw = candidate
+			}
+			if balance, ok := new(big.Int).SetString(integerText(p.AmountRaw), 10); ok && ev.ExecutionAmountRaw != "" {
+				if requested, ok := new(big.Int).SetString(integerText(ev.ExecutionAmountRaw), 10); ok && requested.Cmp(balance) > 0 {
+					ev.ExecutionAmountRaw = balance.String()
+				}
+			}
+		}
+		if inserted, markErr := e.markStrategyEvent(ctx, ev); markErr != nil || !inserted {
+			return markErr
+		}
+		if action == "buy" {
+			// Pending replacement is a V4-only path. Legacy Pons buys keep the
+			// original one-shot transaction behavior even when the strategy flag
+			// is enabled.
+			accepted, pe := e.persistPendingBuy(ctx, ev, amount, cfg.ReplacePending && ev.PoolID != "")
+			if pe != nil || !accepted {
+				return pe
+			}
+		}
+		if reason == "external_buy_signal" && cfg.ExternalBuySell.CooldownSecond > 0 {
+			until := time.Now().Add(time.Duration(cfg.ExternalBuySell.CooldownSecond) * time.Second)
+			p.CooldownUntil = &until
+			if err := e.savePosition(ctx, ev, p); err != nil {
+				return err
+			}
+		}
+		var result map[string]any
+		if e.ExecuteAction != nil {
+			var execErr error
+			result, execErr = e.ExecuteAction(ctx, ev, action, amount)
+			if execErr != nil {
+				// Keep the pending buy row for reconciliation/replacement and do
+				// not claim a successful sell before its receipt is confirmed.
+				return execErr
+			}
+			if mode := strings.ToLower(fmt.Sprint(result["mode"])); mode == "dry-run" || mode == "simulated" {
+				return e.recordAction(ctx, ev, action, amount, reason)
+			}
+		} else if e.Trading != nil {
+			var execErr error
+			result, execErr = e.executeLive(ctx, ev, action, amount, cfg)
+			if execErr != nil {
+				return execErr
+			}
+		}
+		// Live broadcasts are intents. The position and sell counters are
+		// updated only by applyOwnFill after a confirmed chain event.
+		if hash := firstString(result, "transactionHash", "hash"); hash != "" {
+			if err := e.savePendingAction(ctx, hash, ev, action, amount, reason); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
+func (e *Engine) markStrategyEvent(ctx context.Context, ev Event) (bool, error) {
+	eventKey := fmt.Sprintf("%d:%s", ev.UserID, ev.Key)
+	var inserted bool
+	err := e.Store.DB.QueryRow(ctx, `INSERT INTO strategy_events(source_event_key,user_id,token_address,curve_address,created_at) VALUES($1,$2,$3,$4,now()) ON CONFLICT(source_event_key) DO NOTHING RETURNING true`, eventKey, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&inserted)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "no rows") {
+		return false, nil
+	}
+	return inserted, err
+}
+
+func integerRaw(v float64) string {
+	if v <= 0 {
+		return "0"
+	}
+	f := new(big.Float).SetFloat64(v)
+	n, _ := f.Int(nil)
+	return n.String()
+}
+
+func amountAtRawPrice(amount string, rawPrice, slippage float64, buy bool) string {
+	if amount == "" || rawPrice <= 0 || slippage < 0 || slippage >= 1 {
+		return "0"
+	}
+	n, ok := new(big.Float).SetString(amount)
+	if !ok {
+		return "0"
+	}
+	price := new(big.Float).SetFloat64(rawPrice)
+	if buy {
+		n.Quo(n, price)
+	} else {
+		n.Mul(n, price)
+	}
+	n.Mul(n, new(big.Float).SetFloat64(1-slippage))
+	out, _ := n.Int(nil)
+	if out == nil || out.Sign() <= 0 {
+		return "0"
+	}
+	return out.String()
+}
+
+// amountAtRawRatio performs the same minimum-output calculation with the
+// exact integer quote/token amounts carried by a chain event. It avoids first
+// converting a 18-decimal raw amount to float64 and is used when the event
+// contains its original decimal strings.
+func amountAtRawRatio(amount, quoteRaw, tokenRaw string, slippage float64, buy bool) string {
+	if amount == "" || quoteRaw == "" || tokenRaw == "" || slippage < 0 || slippage >= 1 {
+		return "0"
+	}
+	n, ok1 := new(big.Int).SetString(integerText(amount), 10)
+	q, ok2 := new(big.Int).SetString(integerText(quoteRaw), 10)
+	t, ok3 := new(big.Int).SetString(integerText(tokenRaw), 10)
+	if !ok1 || !ok2 || !ok3 || q.Sign() <= 0 || t.Sign() <= 0 {
+		return "0"
+	}
+	// Convert the configured decimal ratio through a rational value so the
+	// floor operation remains deterministic.
+	slipText := strconv.FormatFloat(1-slippage, 'f', 18, 64)
+	slipRat, ok := new(big.Rat).SetString(slipText)
+	if !ok || slipRat.Sign() <= 0 {
+		return "0"
+	}
+	out := new(big.Rat).SetInt(n)
+	if buy {
+		out.Mul(out, new(big.Rat).SetInt(t))
+		out.Quo(out, new(big.Rat).SetInt(q))
+	} else {
+		out.Mul(out, new(big.Rat).SetInt(q))
+		out.Quo(out, new(big.Rat).SetInt(t))
+	}
+	out.Mul(out, slipRat)
+	result := new(big.Int).Quo(out.Num(), out.Denom())
+	if result.Sign() <= 0 {
+		return "0"
+	}
+	return result.String()
+}
+
+// executeLive is the default strategy executor. It deliberately broadcasts
+// through the same Trading implementation exposed by the HTTP API; receipt
+// events remain the single source of truth for position accounting.
+func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount float64, cfg Config) (map[string]any, error) {
+	u, err := e.Store.User(ctx, ev.UserID)
+	if err != nil {
+		return nil, err
+	}
+	if u.PrivateKeyEncrypted == nil {
+		return nil, fmt.Errorf("monitor user private key not found")
+	}
+	key, err := secret.Decrypt(*u.PrivateKeyEncrypted, e.EncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	t, err := e.Store.Token(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress)
+	if err != nil {
+		return nil, err
+	}
+	// Prefer a validated cached V4 route. Route input is raw quote/token units;
+	// strategy buy amounts are USD, so convert using the event's quote price.
+	routes, err := e.Store.Routes(ctx, ev.UserID)
+	if err != nil {
+		return nil, err
+	}
+	direction := strings.ToLower(side)
+	for _, route := range routes {
+		if !strings.EqualFold(fmt.Sprint(route["direction"]), direction) {
+			continue
+		}
+		if target := fmt.Sprint(route["targetToken"]); target != "" && !strings.EqualFold(target, ev.TokenAddress) {
+			continue
+		}
+		if ev.PoolID != "" && fmt.Sprint(route["targetPoolId"]) != "" && !strings.EqualFold(fmt.Sprint(route["targetPoolId"]), ev.PoolID) {
+			continue
+		}
+		hops, ok := route["hops"].([]any)
+		if !ok || len(hops) == 0 {
+			continue
+		}
+		amountRaw := integerRaw(amount)
+		if side == "sell" && ev.ExecutionAmountRaw != "" {
+			amountRaw = integerText(ev.ExecutionAmountRaw)
+		}
+		if side == "buy" {
+			usdPerRaw := 0.0
+			if ev.QuoteUSD > 0 && ev.QuoteAmountRaw > 0 {
+				usdPerRaw = ev.QuoteUSD / ev.QuoteAmountRaw
+			} else if t.QuoteUSDPrice != nil && t.QuoteDecimals != nil {
+				usdPerRaw, _ = strconv.ParseFloat(*t.QuoteUSDPrice, 64)
+				usdPerRaw /= math.Pow10(*t.QuoteDecimals)
+			}
+			if usdPerRaw > 0 {
+				amountRaw = integerRaw(amount / usdPerRaw)
+			}
+		}
+		path := make([]any, 0, len(hops))
+		first := fmt.Sprint(route["sourceToken"])
+		for _, raw := range hops {
+			h, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			intermediate := h["intermediateCurrency"]
+			if intermediate == nil {
+				intermediate = h["tokenOut"]
+			}
+			path = append(path, map[string]any{"intermediateCurrency": intermediate, "fee": h["fee"], "tickSpacing": h["tickSpacing"], "hooks": h["hooks"], "hookData": h["hookData"]})
+		}
+		if amountRaw == "0" {
+			continue
+		}
+		minOut := "0"
+		rawPrice := ev.PriceRaw
+		if rawPrice <= 0 && ev.QuoteAmountRaw > 0 && ev.TokenAmountRaw > 0 {
+			rawPrice = ev.QuoteAmountRaw / ev.TokenAmountRaw
+		}
+		if rawPrice > 0 && cfg.Slippage >= 0 && cfg.Slippage < 1 {
+			if side == "buy" {
+				if ev.QuoteAmountText != "" && ev.TokenAmountText != "" {
+					minOut = amountAtRawRatio(amountRaw, ev.QuoteAmountText, ev.TokenAmountText, cfg.Slippage, true)
+				} else {
+					minOut = amountAtRawPrice(amountRaw, rawPrice, cfg.Slippage, true)
+				}
+			} else {
+				minOut = amountAtRawPrice(amountRaw, rawPrice, cfg.Slippage, false)
+			}
+		}
+		req := map[string]any{"currencyIn": first, "path": path, "amountInRaw": amountRaw, "amountOutMinimumRaw": minOut, "recipient": u.WalletAddress, "privateKey": key, "wrapNative": side == "buy" && strings.EqualFold(first, chain.NativeAddress), "unwrapNative": side == "sell" && strings.EqualFold(fmt.Sprint(route["destinationToken"]), chain.NativeAddress)}
+		if e.Trading.DryRun {
+			return e.Trading.Swap(ctx, req)
+		}
+		opts := chain.BroadcastOptions{}
+		if side == "buy" {
+			var pendingNonce *int64
+			var previousFee, previousTip *string
+			if qe := e.Store.DB.QueryRow(ctx, `SELECT nonce,max_fee_per_gas::text,max_priority_fee_per_gas::text FROM strategy_pending_buys WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND status='pending'`, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&pendingNonce, &previousFee, &previousTip); qe == nil && pendingNonce != nil {
+				n := uint64(*pendingNonce)
+				opts.Nonce = &n
+				opts.FeeBumpBps = 1250
+				if previousFee != nil {
+					opts.MaxFeePerGas = chain.ToBig(*previousFee)
+				}
+				if previousTip != nil {
+					opts.TipPerGas = chain.ToBig(*previousTip)
+				}
+			}
+		}
+		broadcast, be := e.Trading.BroadcastV4(ctx, req, opts)
+		if be != nil {
+			return nil, be
+		}
+		if side == "buy" {
+			maxFee, tip := "", ""
+			if broadcast.MaxFeePerGas != nil {
+				maxFee = broadcast.MaxFeePerGas.String()
+			}
+			if broadcast.TipPerGas != nil {
+				tip = broadcast.TipPerGas.String()
+			}
+			if err := e.UpdatePendingBroadcast(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, broadcast.TransactionHash, broadcast.Nonce, maxFee, tip, minOut); err != nil {
+				// The RPC already accepted the transaction.  Returning the database
+				// error keeps the position lock/error visible to the caller so the
+				// pending row can be reconciled instead of falsely treating the
+				// broadcast as accounted for.
+				return nil, err
+			}
+		}
+		return map[string]any{"mode": "broadcasted", "transactionHash": broadcast.TransactionHash, "hash": broadcast.TransactionHash, "nonce": broadcast.Nonce, "from": broadcast.From}, nil
+	}
+	// Pons V2 fallback. Buy amounts are USD and are converted to curve quote
+	// units when AVE supplied a quote price; sells already use token raw units.
+	amountRaw := integerRaw(amount)
+	if side == "sell" && ev.ExecutionAmountRaw != "" {
+		amountRaw = integerText(ev.ExecutionAmountRaw)
+	}
+	if side == "buy" && ev.QuoteUSD > 0 && ev.QuoteAmountRaw > 0 {
+		amountRaw = integerRaw(amount * ev.QuoteAmountRaw / ev.QuoteUSD)
+	}
+	return e.Trading.PonsSwap(ctx, map[string]any{"curveAddress": t.CurveAddress, "tokenAddress": t.TokenAddress, "recipient": u.WalletAddress, "privateKey": key, "amountRaw": amountRaw, "slippageBps": integerRaw(cfg.Slippage * 10000)}, side == "buy")
+}
+
+func (e *Engine) persistPendingBuy(ctx context.Context, ev Event, amount float64, replace bool) (bool, error) {
+	var accepted bool
+	if replace {
+		err := e.Store.DB.QueryRow(ctx, `INSERT INTO strategy_pending_buys(user_id,token_address,curve_address,quote_usd,source_event_key,replacement_count,status) VALUES($1,$2,$3,$4,$5,0,'pending') ON CONFLICT(user_id,token_address,curve_address) DO UPDATE SET quote_usd=EXCLUDED.quote_usd,source_event_key=EXCLUDED.source_event_key,replacement_count=strategy_pending_buys.replacement_count+1,updated_at=now() WHERE strategy_pending_buys.status='pending' RETURNING true`, ev.UserID, ev.TokenAddress, ev.CurveAddress, amount, ev.Key).Scan(&accepted)
+		if err != nil && strings.Contains(strings.ToLower(err.Error()), "no rows") {
+			return false, nil
+		}
+		return accepted, err
+	}
+	err := e.Store.DB.QueryRow(ctx, `INSERT INTO strategy_pending_buys(user_id,token_address,curve_address,quote_usd,source_event_key,status) VALUES($1,$2,$3,$4,$5,'pending') ON CONFLICT(user_id,token_address,curve_address) DO NOTHING RETURNING true`, ev.UserID, ev.TokenAddress, ev.CurveAddress, amount, ev.Key).Scan(&accepted)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "no rows") {
+		return false, nil
+	}
+	return accepted, err
+}
+
+// UpdatePendingBroadcast records the transaction identity after RPC accepts a
+// buy. It is intentionally separate from persistPendingBuy: the strategy can
+// accept a signal before the signing/broadcast phase, and a replacement keeps
+// the same nonce while updating only the latest hash and fee caps.
+func (e *Engine) UpdatePendingBroadcast(ctx context.Context, userID int64, token, curve, hash string, nonce uint64, maxFee, tip, amountOutMinimum string) error {
+	var quoteUSD float64
+	var sourceKey string
+	if err := e.Store.DB.QueryRow(ctx, `SELECT quote_usd::double precision,source_event_key FROM strategy_pending_buys WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND status='pending'`, userID, token, curve).Scan(&quoteUSD, &sourceKey); err != nil {
+		return err
+	}
+	if _, err := e.Store.DB.Exec(ctx, `UPDATE strategy_pending_buys SET transaction_hash=$4,nonce=$5,max_fee_per_gas=NULLIF($6,'')::numeric,max_priority_fee_per_gas=NULLIF($7,'')::numeric,amount_out_minimum_raw=NULLIF($8,''),updated_at=now() WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND status='pending'`, userID, token, curve, hash, nonce, maxFee, tip, amountOutMinimum); err != nil {
+		return err
+	}
+	_, err := e.Store.DB.Exec(ctx, `INSERT INTO strategy_buy_attempts(user_id,token_address,curve_address,transaction_hash,nonce,quote_usd,source_event_key,amount_out_minimum_raw,status,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''),'pending',now()) ON CONFLICT(transaction_hash) DO UPDATE SET nonce=EXCLUDED.nonce,quote_usd=EXCLUDED.quote_usd,source_event_key=EXCLUDED.source_event_key,amount_out_minimum_raw=EXCLUDED.amount_out_minimum_raw,updated_at=now()`, userID, token, curve, hash, nonce, quoteUSD, sourceKey, amountOutMinimum)
+	return err
+}
+
+// MarkPendingWinner closes a pending buy only after the corresponding receipt
+// has been confirmed and accounting has succeeded. A reverted or timed-out
+// transaction remains pending for reconciliation/retry.
+func (e *Engine) MarkPendingWinner(ctx context.Context, userID int64, token, curve, hash string) error {
+	_, err := e.Store.DB.Exec(ctx, `UPDATE strategy_pending_buys SET status='confirmed',winner_transaction_hash=$4,updated_at=now() WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND status IN ('pending','confirmed_pending_accounting')`, userID, token, curve, hash)
+	if err == nil {
+		_, err = e.Store.DB.Exec(ctx, `UPDATE strategy_buy_attempts SET status=CASE WHEN transaction_hash=$4 THEN 'confirmed' ELSE 'replaced' END,updated_at=now() WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND status='pending'`, userID, token, curve, hash)
+	}
+	return err
+}
+
+func (e *Engine) loadPosition(ctx context.Context, ev Event) (position, error) {
+	var p position
+	var amountRaw string
+	var first, next, cool, last *time.Time
+	err := e.Store.DB.QueryRow(ctx, `SELECT token_amount_raw::text,average_cost_usd::double precision,first_buy_price::double precision,last_buy_price::double precision,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at,EXISTS(SELECT 1 FROM strategy_pending_actions a WHERE a.user_id=strategy_positions.user_id AND a.token_address=strategy_positions.token_address AND a.curve_address=strategy_positions.curve_address AND a.side='sell' AND a.status IN ('pending','confirmed_pending_accounting')) FROM strategy_positions WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&amountRaw, &p.AverageCost, &p.FirstPrice, &p.LastPrice, &p.BuyCount, &p.SellCount, &p.ProfitLevel, &first, &next, &cool, &last, &p.PendingSell)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no rows") {
+			return position{}, nil
+		}
+		return p, err
+	}
+	p.AmountRaw = integerText(amountRaw)
+	p.Amount = rawFloat(p.AmountRaw)
+	p.FirstBought, p.NextScheduled, p.CooldownUntil, p.LastBuy = first, next, cool, last
+	return p, nil
+}
+func (e *Engine) savePosition(ctx context.Context, ev Event, p position) error {
+	amountRaw := p.AmountRaw
+	if amountRaw == "" {
+		amountRaw = integerRaw(p.Amount)
+	}
+	_, err := e.Store.DB.Exec(ctx, `INSERT INTO strategy_positions(user_id,token_address,curve_address,token_amount_raw,average_cost_usd,first_buy_price,last_buy_price,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at,last_event_key,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now()) ON CONFLICT(user_id,token_address,curve_address) DO UPDATE SET token_amount_raw=EXCLUDED.token_amount_raw,average_cost_usd=EXCLUDED.average_cost_usd,first_buy_price=EXCLUDED.first_buy_price,last_buy_price=EXCLUDED.last_buy_price,buy_count=EXCLUDED.buy_count,sell_count=EXCLUDED.sell_count,profit_sell_level=EXCLUDED.profit_sell_level,first_bought_at=EXCLUDED.first_bought_at,next_scheduled_sell_at=EXCLUDED.next_scheduled_sell_at,external_cooldown_until=EXCLUDED.external_cooldown_until,last_buy_at=EXCLUDED.last_buy_at,last_event_key=EXCLUDED.last_event_key,updated_at=now()`, ev.UserID, ev.TokenAddress, ev.CurveAddress, amountRaw, p.AverageCost, p.FirstPrice, p.LastPrice, p.BuyCount, p.SellCount, p.ProfitLevel, p.FirstBought, p.NextScheduled, p.CooldownUntil, p.LastBuy, ev.Key)
+	return err
+}
+
+func (e *Engine) applyOwnFill(ctx context.Context, ev Event, p position, cfg Config) error {
+	if ev.Price <= 0 {
+		return nil
+	}
+	amountRawText := integerText(ev.TokenAmountText)
+	amount := ev.TokenAmountRaw
+	if amountRawText != "0" {
+		amount = rawFloat(amountRawText)
+	}
+	if amount <= 0 {
+		// quoteAmountRaw/tokenAmountRaw are raw pool units.  Prefer the raw
+		// execution price when available; dividing raw quote units by a USD
+		// price mixes units and badly corrupts the position on non-18-decimal
+		// tokens or quote currencies.
+		if ev.PriceRaw > 0 {
+			amount = ev.QuoteAmountRaw / ev.PriceRaw
+		} else if ev.QuoteUSD > 0 && ev.Price > 0 {
+			amount = ev.QuoteUSD / ev.Price * math.Pow10(ev.TokenDecimals)
+		}
+	}
+	if amount <= 0 {
+		return nil
+	}
+	actionReason := "confirmed_fill"
+	txHash := strings.Split(ev.Key, ":")[0]
+	var pendingActionReason, pendingActionSide string
+	var pendingActionAmount float64
+	if txHash != "" {
+		if err := e.Store.DB.QueryRow(ctx, `SELECT side,reason,amount FROM strategy_pending_actions WHERE transaction_hash=$1 AND user_id=$2 AND token_address=$3 AND curve_address=$4 AND status='pending'`, txHash, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&pendingActionSide, &pendingActionReason, &pendingActionAmount); err == nil {
+			actionReason = pendingActionReason
+			_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_pending_actions SET status='confirmed',updated_at=now() WHERE transaction_hash=$1`, txHash)
+		}
+	}
+	if strings.ToLower(ev.Side) == "buy" {
+		winner := ev.Key
+		if i := strings.IndexByte(winner, ':'); i > 0 {
+			winner = winner[:i]
+		}
+		_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_pending_buys SET status='confirmed',winner_transaction_hash=$4,updated_at=now() WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND status IN ('pending','confirmed_pending_accounting')`, ev.UserID, ev.TokenAddress, ev.CurveAddress, winner)
+		_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_buy_attempts SET status=CASE WHEN transaction_hash=$4 THEN 'confirmed' ELSE 'replaced' END,updated_at=now() WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND status='pending'`, ev.UserID, ev.TokenAddress, ev.CurveAddress, winner)
+		old := p.Amount
+		oldRaw := new(big.Int)
+		if _, ok := oldRaw.SetString(integerText(p.AmountRaw), 10); !ok {
+			oldRaw.SetInt64(0)
+		}
+		fillRaw := new(big.Int)
+		if _, ok := fillRaw.SetString(amountRawText, 10); !ok || fillRaw.Sign() <= 0 {
+			fillRaw.SetString(integerRaw(amount), 10)
+		}
+		newRaw := new(big.Int).Add(oldRaw, fillRaw)
+		p.AmountRaw = newRaw.String()
+		p.Amount = rawFloat(p.AmountRaw)
+		if old+amount > 0 {
+			p.AverageCost = (old*p.AverageCost + amount*ev.Price) / (old + amount)
+		}
+		now := time.Now()
+		if p.FirstPrice <= 0 {
+			p.FirstPrice = ev.Price
+			p.FirstBought = &now
+		}
+		p.LastPrice = ev.Price
+		p.LastBuy = &now
+		p.BuyCount++
+		// Persist the confirmed fill separately from the strategy intent. The
+		// intent may have been recorded at broadcast time, while this row is
+		// written only after the own transaction event has supplied a real fill.
+		tokenRawText := fillRaw.String()
+		if tokenRawText == "" || tokenRawText == "0" {
+			tokenRawText = integerRaw(amount)
+		}
+		quoteRawText := absIntegerText(ev.QuoteAmountText)
+		if quoteRawText == "" {
+			quoteRawText = integerRaw(ev.QuoteAmountRaw)
+		}
+		_, _ = e.Store.DB.Exec(ctx, `INSERT INTO monitor_records(user_id,token_address,curve_address,type,token_amount_raw,quote_amount_raw,remain_token_amount_raw,remain_quote_amount_raw,reason,source_event_key,transaction_hash,created_at) VALUES($1,$2,$3,'buy',$4,$5,$4,$5,'confirmed_fill',$6,$7,now()) ON CONFLICT(source_event_key) DO NOTHING`, ev.UserID, ev.TokenAddress, ev.CurveAddress, tokenRawText, quoteRawText, ev.Key, strings.Split(ev.Key, ":")[0])
+		if cfg.SellPolicy.ResetSellCountOnBuy {
+			p.SellCount = 0
+		}
+		if cfg.ProfitSell.ResetOnBuy {
+			p.ProfitLevel = 0
+		}
+		if cfg.ScheduledSell.Enabled && (cfg.ScheduledSell.ResetOnBuy || p.NextScheduled == nil) {
+			n := time.Now().Add(time.Duration(cfg.ScheduledSell.IntervalSecond) * time.Second)
+			p.NextScheduled = &n
+		}
+	} else if strings.ToLower(ev.Side) == "sell" {
+		oldRaw := new(big.Int)
+		if _, ok := oldRaw.SetString(integerText(p.AmountRaw), 10); !ok {
+			oldRaw.SetString(integerRaw(p.Amount), 10)
+		}
+		sellRaw := new(big.Int)
+		if _, ok := sellRaw.SetString(amountRawText, 10); !ok || sellRaw.Sign() <= 0 {
+			sellRaw.SetString(integerRaw(amount), 10)
+		}
+		if sellRaw.Cmp(oldRaw) > 0 {
+			sellRaw.Set(oldRaw)
+		}
+		amount = rawFloat(sellRaw.String())
+		remainingRaw := new(big.Int).Sub(oldRaw, sellRaw)
+		if remainingRaw.Sign() <= 0 {
+			p = position{}
+		} else {
+			p.AmountRaw = remainingRaw.String()
+			p.Amount = rawFloat(p.AmountRaw)
+		}
+		if p.Amount > 0 {
+			p.SellCount++
+			if actionReason == "profit_sell" {
+				p.ProfitLevel++
+			}
+			if actionReason == "scheduled_sell" && cfg.ScheduledSell.Enabled {
+				n := time.Now().Add(time.Duration(cfg.ScheduledSell.IntervalSecond) * time.Second)
+				p.NextScheduled = &n
+			}
+			if cfg.SellPolicy.FullSellAfterSellCount > 0 && p.SellCount > cfg.SellPolicy.FullSellAfterSellCount {
+				p.Amount = 0
+			}
+		}
+		quoteRawText := absIntegerText(ev.QuoteAmountText)
+		if quoteRawText == "" {
+			quoteRawText = integerRaw(ev.QuoteAmountRaw)
+		}
+		remainRawText := p.AmountRaw
+		if remainRawText == "" {
+			remainRawText = integerRaw(p.Amount)
+		}
+		_, _ = e.Store.DB.Exec(ctx, `INSERT INTO monitor_records(user_id,token_address,curve_address,type,token_amount_raw,quote_amount_raw,remain_token_amount_raw,remain_quote_amount_raw,reason,source_event_key,transaction_hash,created_at) VALUES($1,$2,$3,'sell',$4,$5,$6,$5,$7,$8,$9,now()) ON CONFLICT(source_event_key) DO NOTHING`, ev.UserID, ev.TokenAddress, ev.CurveAddress, sellRaw.String(), quoteRawText, remainRawText, actionReason, ev.Key, txHash)
+	}
+	return e.savePosition(ctx, ev, p)
+}
+
+func evaluate(c Config, r TokenRule, ev Event, p position) (string, float64, string) {
+	price := ev.Price
+	if price <= 0 {
+		price = p.LastPrice
+	}
+	if price <= 0 {
+		return "", 0, ""
+	}
+	if strings.ToLower(ev.Side) == "sell" {
+		priceDrop := -ev.PriceChangeRatio
+		impactDrop := ev.PriceImpactRatio
+		if impactDrop < 0 {
+			impactDrop = -impactDrop
+		}
+		legacyImpactDrop := ev.Impact
+		if legacyImpactDrop < 0 {
+			legacyImpactDrop = -legacyImpactDrop
+		}
+		if impactDrop < r.MinSellRatio && legacyImpactDrop < r.MinSellRatio && priceDrop < r.MinSellRatio {
+			return "", 0, ""
+		}
+		if p.Amount > 0 && p.BuyCount > 0 {
+			if c.MaxLossBuyTimes <= 0 || p.BuyCount >= c.MaxLossBuyTimes {
+				return "", 0, ""
+			}
+		}
+		if p.LastBuy != nil && c.DiffBuySecond > 0 && time.Since(*p.LastBuy) < time.Duration(c.DiffBuySecond)*time.Second {
+			return "", 0, ""
+		}
+		amt := r.BuyUSD
+		if r.BuyRatio > 0 {
+			amt = ev.QuoteUSD * r.BuyRatio
+		}
+		if amt <= 0 {
+			return "", 0, ""
+		}
+		if p.FirstPrice > 0 && p.BuyCount > 0 && price >= p.FirstPrice {
+			return "", 0, ""
+		}
+		if p.LastPrice > 0 && c.MinLossBuyRatio > 0 && price > p.LastPrice*(1-c.MinLossBuyRatio) {
+			return "", 0, ""
+		}
+		return "buy", amt, "external_sell_signal"
+	}
+	if strings.ToLower(ev.Side) != "buy" || p.Amount <= 0 {
+		return "", 0, ""
+	}
+	force := c.SellPolicy.FullSellAfterSellCount > 0 && p.SellCount >= c.SellPolicy.FullSellAfterSellCount
+	if p.CooldownUntil != nil && time.Now().Before(*p.CooldownUntil) {
+		// An already reached public full-sell threshold has priority over the
+		// external-buy cooldown.  Other ladder/protection decisions are skipped
+		// while the cooldown is active.
+		if force && strings.ToLower(ev.Side) == "buy" {
+			return "sell", p.Amount, "sell_count_force_full"
+		}
+		return "", 0, ""
+	}
+	gain := 0.0
+	if p.AverageCost > 0 {
+		gain = price/p.AverageCost - 1
+	}
+	impact := ev.PriceImpactRatio
+	if impact == 0 {
+		impact = ev.Impact
+	}
+	if c.ExternalBuySell.Enabled && (c.ExternalBuySell.MinBuyUSD <= 0 || ev.QuoteUSD >= c.ExternalBuySell.MinBuyUSD) && (c.ExternalBuySell.BuyImpactRatio <= 0 || impact >= c.ExternalBuySell.BuyImpactRatio) && (!c.ExternalBuySell.NeedProfit || gain >= c.ExternalBuySell.ProfitRatio) {
+		if force {
+			return "sell", p.Amount, "external_buy_signal"
+		}
+		if c.ExternalBuySell.BuyAmountRatio > 0 {
+			a := 0.0
+			if ev.PriceRaw > 0 && ev.QuoteAmountRaw > 0 {
+				a = ev.QuoteAmountRaw * c.ExternalBuySell.BuyAmountRatio / ev.PriceRaw
+			} else {
+				a = ev.QuoteUSD * c.ExternalBuySell.BuyAmountRatio / price * math.Pow10(ev.TokenDecimals)
+			}
+			if a > p.Amount {
+				a = p.Amount
+			}
+			return "sell", a, "external_buy_signal"
+		}
+		return "sell", p.Amount * c.ExternalBuySell.SellRatio, "external_buy_signal"
+	}
+	if c.ProfitSell.Enabled && p.ProfitLevel < len(c.ProfitSell.Levels) {
+		l := c.ProfitSell.Levels[p.ProfitLevel]
+		if gain >= l.ProfitRatio {
+			if force {
+				return "sell", p.Amount, "profit_sell"
+			}
+			return "sell", p.Amount * l.SellRatio, "profit_sell"
+		}
+	}
+	if c.LossSell.Enabled && c.LossSell.TriggerRatio > 0 && gain <= -c.LossSell.TriggerRatio {
+		if c.LossSell.SellAll || force {
+			return "sell", p.Amount, "loss_protection"
+		}
+		return "", 0, ""
+	}
+	if force {
+		return "sell", p.Amount, "sell_count_force_full"
+	}
+	return "", 0, ""
+}
+
+func (e *Engine) recordAction(ctx context.Context, ev Event, side string, amount float64, reason string) error {
+	if amount <= 0 {
+		return nil
+	}
+	key := fmt.Sprintf("%d:%s:%s", ev.UserID, ev.Key, reason)
+	tokenRaw, quoteRaw := "0", "0"
+	if side == "buy" {
+		if ev.Price > 0 {
+			tokenRaw = integerRaw(amount / ev.Price * math.Pow10(ev.TokenDecimals))
+		}
+		if ev.QuoteAmountText != "" && ev.QuoteUSD > 0 {
+			quoteRaw = scaleRawText(ev.QuoteAmountText, amount, ev.QuoteUSD)
+		} else if ev.PriceRaw > 0 {
+			quoteRaw = integerRaw(rawFloat(tokenRaw) * ev.PriceRaw)
+		}
+	} else if ev.PriceRaw > 0 {
+		tokenRaw = integerRaw(amount)
+		quoteRaw = integerRaw(amount * ev.PriceRaw)
+	} else {
+		tokenRaw = integerRaw(amount)
+	}
+	_, err := e.Store.DB.Exec(ctx, `INSERT INTO monitor_records(user_id,token_address,curve_address,type,token_amount_raw,quote_amount_raw,remain_token_amount_raw,remain_quote_amount_raw,reason,source_event_key,created_at) VALUES($1,$2,$3,$4,$5,$6,$5,$6,$7,$8,now()) ON CONFLICT(source_event_key) DO NOTHING`, ev.UserID, ev.TokenAddress, ev.CurveAddress, side, tokenRaw, quoteRaw, reason, key)
+	return err
+}
+
+func (e *Engine) savePendingAction(ctx context.Context, hash string, ev Event, side string, amount float64, reason string) error {
+	hash = strings.Split(hash, ":")[0]
+	var alreadyFilled bool
+	_ = e.Store.DB.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM monitor_records WHERE transaction_hash=$1 AND user_id=$2 AND token_address=$3 AND curve_address=$4)`, hash, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&alreadyFilled)
+	status := "pending"
+	if alreadyFilled {
+		status = "confirmed"
+		if side == "sell" {
+			if p, loadErr := e.loadPosition(ctx, ev); loadErr == nil {
+				if reason == "profit_sell" {
+					p.ProfitLevel++
+				}
+				interval := 0
+				if u, userErr := e.Store.User(ctx, ev.UserID); userErr == nil {
+					interval = Parse(u.Config).ScheduledSell.IntervalSecond
+				}
+				if reason == "scheduled_sell" && p.Amount > 0 && interval > 0 {
+					n := time.Now().Add(time.Duration(interval) * time.Second)
+					p.NextScheduled = &n
+				}
+				_ = e.savePosition(ctx, ev, p)
+			}
+		}
+	}
+	_, err := e.Store.DB.Exec(ctx, `INSERT INTO strategy_pending_actions(transaction_hash,user_id,token_address,curve_address,side,reason,amount,status,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,now()) ON CONFLICT(transaction_hash) DO UPDATE SET amount=EXCLUDED.amount,reason=EXCLUDED.reason,status=EXCLUDED.status,updated_at=now()`, hash, ev.UserID, ev.TokenAddress, ev.CurveAddress, side, reason, amount, status)
+	return err
+}
+
+func (e *Engine) Tick(ctx context.Context) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			_ = e.refreshMonitorCache(ctx, false)
+			e.checkScheduled(ctx)
+			e.pollCurves(ctx)
+			if time.Now().Unix()%5 == 0 {
+				e.reconcilePending(ctx)
+			}
+		}
+	}
+}
+
+// reconcilePending makes accepted broadcasts survive a service restart. A
+// receipt is never treated as a fill by itself: its decoded logs are replayed
+// through the normal monitor path, where own-address matching, idempotency and
+// position accounting remain centralized.
+func (e *Engine) reconcilePending(ctx context.Context) {
+	if e.RPC == nil || e.Store == nil {
+		return
+	}
+	rows, err := e.Store.DB.Query(ctx, `SELECT transaction_hash FROM strategy_pending_buys WHERE status IN ('pending','confirmed_pending_accounting') AND transaction_hash IS NOT NULL UNION SELECT transaction_hash FROM strategy_buy_attempts WHERE status='pending' UNION SELECT transaction_hash FROM strategy_pending_actions WHERE status='pending'`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	hashes := map[string]struct{}{}
+	for rows.Next() {
+		var hash string
+		if rows.Scan(&hash) == nil && hash != "" {
+			hashes[hash] = struct{}{}
+		}
+	}
+	for hash := range hashes {
+		receipt, re := e.RPC.Receipt(ctx, hash)
+		if re != nil || receipt == nil {
+			continue
+		}
+		if revertedReceipt(receipt) {
+			_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_pending_buys SET status='reverted',updated_at=now() WHERE transaction_hash=$1 AND status='pending'`, hash)
+			_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_buy_attempts SET status='reverted',updated_at=now() WHERE transaction_hash=$1 AND status='pending'`, hash)
+			_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_pending_actions SET status='reverted',updated_at=now() WHERE transaction_hash=$1 AND status='pending'`, hash)
+			continue
+		}
+		_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_pending_buys SET status='confirmed_pending_accounting',updated_at=now() WHERE transaction_hash=$1 AND status='pending'`, hash)
+		m, ok := receipt.(map[string]any)
+		if !ok {
+			continue
+		}
+		logs, ok := m["logs"].([]any)
+		if !ok {
+			continue
+		}
+		for _, raw := range logs {
+			if log, ok := raw.(map[string]any); ok {
+				decoded := chain.DecodeChainEvent(log)
+				if _, good := decodeEvent(decoded); good {
+					_ = e.processForMonitors(ctx, decoded)
+				}
+			}
+		}
+	}
+}
+
+func revertedReceipt(receipt any) bool {
+	m, ok := receipt.(map[string]any)
+	if !ok {
+		return false
+	}
+	switch v := m["status"].(type) {
+	case string:
+		return v == "0x0" || v == "0x00" || v == "0"
+	case float64:
+		return v == 0
+	}
+	return false
+}
+
+func (e *Engine) pollCurves(ctx context.Context) {
+	if e.RPC == nil || e.Store == nil {
+		return
+	}
+	e.pollMu.Lock()
+	defer e.pollMu.Unlock()
+	headHex, err := e.RPC.LatestBlock(ctx)
+	if err != nil {
+		return
+	}
+	head := new(big.Int)
+	if _, ok := head.SetString(strings.TrimPrefix(headHex, "0x"), 16); !ok {
+		return
+	}
+	if err := e.refreshMonitorCache(ctx, false); err != nil {
+		return
+	}
+	e.monitorMu.RLock()
+	tokenSnapshot := make(map[int64][]store.Token, len(e.monitorTokens))
+	for uid, tokens := range e.monitorTokens {
+		tokenSnapshot[uid] = append([]store.Token(nil), tokens...)
+	}
+	e.monitorMu.RUnlock()
+	curves := map[string]struct{}{}
+	for _, tokens := range tokenSnapshot {
+		for _, token := range tokens {
+			if commonCurve(token.CurveAddress) {
+				curves[strings.ToLower(token.CurveAddress)] = struct{}{}
+			}
+		}
+	}
+	// Curves are independent positions.  Bound concurrent RPC calls so a
+	// large monitor list does not flood the node, while allowing slow curves
+	// to be polled in parallel with the rest.
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for curve := range curves {
+		curve := curve
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			from := new(big.Int).Set(head)
+			if v, ok := e.curveBlocks.Load(curve); ok {
+				if n, ok2 := v.(*big.Int); ok2 {
+					from = new(big.Int).Add(n, big.NewInt(1))
+				}
+			} else if from.Sign() > 0 {
+				from.Sub(from, big.NewInt(2))
+			}
+			if from.Cmp(head) > 0 {
+				return
+			}
+			allOK := true
+			decodedLogs := make([]map[string]any, 0)
+			// eth_getLogs accepts an OR-list for the first topic.  Fetching buy and
+			// sell logs in one request removes one network round trip per curve on
+			// every polling tick while preserving the later block/log ordering.
+			logs, le := e.RPC.Logs(ctx, map[string]any{
+				"address":   curve,
+				"topics":    []any{[]string{chain.CurveBuyTopic, chain.CurveSellTopic}},
+				"fromBlock": "0x" + fmt.Sprintf("%x", from),
+				"toBlock":   "0x" + fmt.Sprintf("%x", head),
+			})
+			if le != nil {
+				allOK = false
+			} else if arr, ok := logs.([]any); ok {
+				for _, raw := range arr {
+					if m, ok := raw.(map[string]any); ok {
+						decodedLogs = append(decodedLogs, chain.DecodeChainEvent(m))
+					}
+				}
+			}
+			sort.SliceStable(decodedLogs, func(i, j int) bool {
+				bi := hexNumber(firstString(decodedLogs[i], "blockNumber", "block"))
+				bj := hexNumber(firstString(decodedLogs[j], "blockNumber", "block"))
+				li := hexNumber(firstString(decodedLogs[i], "logIndex"))
+				lj := hexNumber(firstString(decodedLogs[j], "logIndex"))
+				bc := bi.Cmp(bj)
+				return bc < 0 || (bc == 0 && li.Cmp(lj) < 0)
+			})
+			for _, decoded := range decodedLogs {
+				if ev, good := decodeEvent(decoded); good {
+					_ = e.processForMonitors(ctx, ev)
+				}
+			}
+			if allOK {
+				e.curveBlocks.Store(curve, new(big.Int).Set(head))
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func commonCurve(s string) bool { return s != "" && !strings.EqualFold(s, chain.NativeAddress) }
+func hexNumber(s string) *big.Int {
+	n := new(big.Int)
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "0x"), "0X")
+	if _, ok := n.SetString(s, 16); !ok {
+		n.SetString("0", 10)
+	}
+	return n
+}
+func (e *Engine) checkScheduled(ctx context.Context) {
+	rows, err := e.Store.DB.Query(ctx, `SELECT user_id,token_address,curve_address,token_amount_raw::text,average_cost_usd::double precision,first_buy_price::double precision,last_buy_price::double precision,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at FROM strategy_positions WHERE next_scheduled_sell_at IS NOT NULL AND next_scheduled_sell_at<=now() AND token_amount_raw>0`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ev Event
+		var p position
+		if rows.Scan(&ev.UserID, &ev.TokenAddress, &ev.CurveAddress, &p.AmountRaw, &p.AverageCost, &p.FirstPrice, &p.LastPrice, &p.BuyCount, &p.SellCount, &p.ProfitLevel, &p.FirstBought, &p.NextScheduled, &p.CooldownUntil, &p.LastBuy) != nil {
+			continue
+		}
+		p.AmountRaw = integerText(p.AmountRaw)
+		p.Amount = rawFloat(p.AmountRaw)
+		u, err := e.cachedUser(ctx, ev.UserID)
+		if err != nil {
+			continue
+		}
+		c := Parse(u.Config)
+		if !c.Enabled || !c.ScheduledSell.Enabled {
+			continue
+		}
+		price := p.LastPrice
+		if price <= 0 {
+			continue
+		}
+		token, tokenErr := e.Store.Token(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress)
+		if tokenErr != nil {
+			continue
+		}
+		tokenDecimals := 0
+		if token.Decimals != nil {
+			tokenDecimals = *token.Decimals
+		}
+		forceFull := c.SellPolicy.FullSellAfterSellCount > 0 && p.SellCount >= c.SellPolicy.FullSellAfterSellCount
+		amount := p.Amount
+		if !forceFull && c.ScheduledSell.SellRatio > 0 {
+			amount = p.Amount * c.ScheduledSell.SellRatio
+		}
+		if c.ScheduledSell.BaseUSD > 0 && price > 0 {
+			cap := c.ScheduledSell.BaseUSD / price * math.Pow10(tokenDecimals)
+			if amount > cap {
+				amount = cap
+			}
+		}
+		if amount <= 0 {
+			continue
+		}
+		var pendingScheduled bool
+		if err := e.Store.DB.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM strategy_pending_actions WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND side='sell' AND reason='scheduled_sell' AND status='pending')`, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&pendingScheduled); err == nil && pendingScheduled {
+			continue
+		}
+		ev.Key = fmt.Sprintf("scheduled:%d:%s:%d", ev.UserID, ev.TokenAddress, time.Now().Unix())
+		ev.Side = "sell"
+		ev.Price = price
+		ev.PriceRaw = rawTokenPriceFromUSD(price, token)
+		ev.TokenDecimals = tokenDecimals
+		if token.QuoteDecimals != nil {
+			ev.QuoteDecimals = *token.QuoteDecimals
+		}
+		ev.QuoteUSD = amount / math.Pow10(tokenDecimals) * price
+		var result map[string]any
+		if e.ExecuteAction != nil {
+			var ee error
+			result, ee = e.ExecuteAction(ctx, ev, "sell", amount)
+			if ee != nil {
+				continue
+			}
+		} else if e.Trading != nil {
+			var ee error
+			result, ee = e.executeLive(ctx, ev, "sell", amount, c)
+			if ee != nil {
+				continue
+			}
+		}
+		mode := strings.ToLower(fmt.Sprint(result["mode"]))
+		confirmedOrSimulated := mode == "dry-run" || mode == "simulated"
+		if mode == "dry-run" || mode == "simulated" {
+			if e.recordAction(ctx, ev, "sell", amount, "scheduled_sell") != nil {
+				continue
+			}
+		} else if hash := firstString(result, "transactionHash", "hash"); hash != "" {
+			if e.savePendingAction(ctx, hash, ev, "sell", amount, "scheduled_sell") != nil {
+				continue
+			}
+		}
+		if confirmedOrSimulated {
+			n := time.Now().Add(time.Duration(c.ScheduledSell.IntervalSecond) * time.Second)
+			p.NextScheduled = &n
+		}
+		_ = e.savePosition(ctx, ev, p)
+	}
+}

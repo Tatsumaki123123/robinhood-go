@@ -1,0 +1,55 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    env_file:
+      - .env.dev
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgres://robinhood:robinhood@postgres:5432/robinhood?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      LOCAL_STORAGE_PATH: /data/uploads
+    ports:
+      - "${PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/workspace
+      - go-build-cache:/root/.cache/go-build
+      - go-mod-cache:/go/pkg/mod
+      - uploads-dev:/data/uploads
+    command: ["go", "run", "./cmd/server"]
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: robinhood
+      POSTGRES_PASSWORD: robinhood
+      POSTGRES_DB: robinhood
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres-dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U robinhood -d robinhood"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres-dev:
+  uploads-dev:
+  go-build-cache:
+  go-mod-cache:
