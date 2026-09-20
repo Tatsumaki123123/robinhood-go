@@ -96,6 +96,6 @@ docker compose up -d --build
 ## 配置清单
 
 `PORT`、`DATABASE_URL`、`REDIS_URL`、`RPC_HTTP_URL`、`RPC_WS_URL`、`CHAIN_ID`、
-`AVE_BASE_URL`、`AVE_X_AUTH`、私钥密码、存储路径、监听开关、PoolManager、Universal Router、
+`AVE_BASE_URL`、`AVE_X_AUTH`、`AVE_VISITOR_ID`（AVE 网页的浏览器指纹，用于自动刷新认证）、私钥密码、存储路径、监听开关、PoolManager、Universal Router、
 Permit2、Pons Factory 和 Pons 外部 Hook 地址均从环境变量读取；
 `.env.example` 给出可直接用于 Compose 的默认值。

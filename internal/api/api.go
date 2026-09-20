@@ -13,7 +13,6 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"math/big"
-	"net/http"
 	"os"
 	"path/filepath"
 	"robinhood-go/internal/chain"
@@ -39,6 +38,7 @@ type API struct {
 	invalidateMonitorCache func()
 	clients                map[*websocket.Conn]struct{}
 	clientsMu              sync.RWMutex
+	aveAuthMu              sync.Mutex
 	eventsMu               sync.RWMutex
 	deployments            []map[string]any
 	swaps                  []map[string]any
@@ -278,19 +278,20 @@ func (a *API) deploymentGet(c *fiber.Ctx) error {
 	return httpx.Error(c, 404, "Pons V2 deployment event not found")
 }
 func (a *API) aveGetConfig(c *fiber.Ctx) error {
-	var x string
-	err := a.Store.DB.QueryRow(c.Context(), "SELECT x_auth FROM ave_configs WHERE id=1").Scan(&x)
+	x, err := a.aveAuth(c.Context())
 	if err != nil {
-		x = a.Cfg.AveXAuth
+		return a.fail(c, err)
 	}
 	return a.ok(c, map[string]any{"id": 1, "xAuth": x})
 }
 func (a *API) aveUpdateConfig(c *fiber.Ctx) error {
-	x := str(body(c)["xAuth"])
+	x := strings.TrimSpace(str(body(c)["xAuth"]))
 	if x == "" {
 		return httpx.Error(c, 400, "xAuth is required")
 	}
-	_, e := a.Store.DB.Exec(c.Context(), "INSERT INTO ave_configs(id,x_auth) VALUES(1,$1) ON CONFLICT(id) DO UPDATE SET x_auth=EXCLUDED.x_auth,updated_at=now()", x)
+	a.aveAuthMu.Lock()
+	defer a.aveAuthMu.Unlock()
+	e := a.saveAveAuth(c.Context(), x)
 	if e != nil {
 		return a.fail(c, e)
 	}
@@ -828,52 +829,6 @@ func firstAny(m map[string]any, keys ...string) any {
 	return nil
 }
 
-func (a *API) aveJSON(ctx context.Context, path string, q map[string]string) (map[string]any, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.Cfg.AveBaseURL+path, nil)
-	if err != nil {
-		return nil, err
-	}
-	vals := req.URL.Query()
-	for k, v := range q {
-		if v != "" {
-			vals.Set(k, v)
-		}
-	}
-	req.URL.RawQuery = vals.Encode()
-	auth := a.aveAuth(ctx)
-	if auth == "" {
-		return nil, fmt.Errorf("AVE x-auth is not configured")
-	}
-	req.Header.Set("x-auth", auth)
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	if res.StatusCode >= 300 {
-		return nil, fmt.Errorf("AVE status %d", res.StatusCode)
-	}
-	var out map[string]any
-	if err = json.NewDecoder(res.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	if n, ok := out["status"].(float64); ok && n != 1 {
-		return nil, fmt.Errorf("AVE request failed: %v", out["msg"])
-	}
-	return out, nil
-}
-
-func (a *API) aveAuth(ctx context.Context) string {
-	var value string
-	if a.Store != nil && a.Store.DB != nil {
-		_ = a.Store.DB.QueryRow(ctx, "SELECT x_auth FROM ave_configs WHERE id=1").Scan(&value)
-	}
-	if value != "" {
-		return value
-	}
-	return a.Cfg.AveXAuth
-}
-
 func (a *API) startAve(c *fiber.Ctx) error {
 	d := body(c)
 	target := low(str(d["targetToken"]))
@@ -1313,29 +1268,9 @@ func parseEtherRaw(s string) string {
 	return n.Quo(n, r.Denom()).String()
 }
 func (a *API) aveRequest(c *fiber.Ctx, path string, q map[string]string) error {
-	ctx, cancel := context.WithTimeout(c.Context(), 15*time.Second)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "GET", a.Cfg.AveBaseURL+path, nil)
-	vals := req.URL.Query()
-	for k, v := range q {
-		if v != "" {
-			vals.Set(k, v)
-		}
-	}
-	req.URL.RawQuery = vals.Encode()
-	auth := a.aveAuth(ctx)
-	if auth == "" {
-		return httpx.Error(c, 503, "AVE x-auth is not configured")
-	}
-	req.Header.Set("x-auth", auth)
-	res, e := http.DefaultClient.Do(req)
-	if e != nil {
-		return httpx.Error(c, 503, e.Error())
-	}
-	defer res.Body.Close()
-	var v any
-	if e = json.NewDecoder(res.Body).Decode(&v); e != nil {
-		return httpx.Error(c, 503, e.Error())
+	v, err := a.aveJSON(c.Context(), path, q)
+	if err != nil {
+		return httpx.Error(c, 503, err.Error())
 	}
 	return a.ok(c, v)
 }
