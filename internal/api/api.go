@@ -395,7 +395,82 @@ func (a *API) userUpdate(c *fiber.Ctx) error {
 	return a.ok(c, a.userView(u, false))
 }
 
-// userView mirrors the Node service's public monitor-user DTO.  Database
+type apiSellPolicyView struct {
+	FullSellAfterSellCount int  `json:"fullSellAfterSellCount"`
+	ResetSellCountOnBuy    bool `json:"resetSellCountOnBuy"`
+}
+
+type apiScheduledSellView struct {
+	Enabled        bool    `json:"enabled"`
+	IntervalSecond int     `json:"intervalSecond"`
+	SellRatio      float64 `json:"sellRatio"`
+	BaseUSD        float64 `json:"baseUSD"`
+	ResetOnBuy     bool    `json:"resetOnBuy"`
+}
+
+type apiExternalBuySellView struct {
+	Enabled        bool    `json:"enabled"`
+	MinBuyUSD      float64 `json:"minBuyUSD"`
+	BuyImpactRatio float64 `json:"buyImpactRatio"`
+	NeedProfit     bool    `json:"needProfit"`
+	ProfitRatio    float64 `json:"profitRatio"`
+	SellRatio      float64 `json:"sellRatio"`
+	BuyAmountRatio float64 `json:"buyAmountRatio"`
+	CooldownSecond int     `json:"cooldownSecond"`
+}
+
+type apiProfitLevelView struct {
+	ProfitRatio float64 `json:"profitRatio"`
+	SellRatio   float64 `json:"sellRatio"`
+}
+
+type apiProfitSellView struct {
+	Enabled    bool                 `json:"enabled"`
+	ResetOnBuy bool                 `json:"resetOnBuy"`
+	Levels     []apiProfitLevelView `json:"levels"`
+}
+
+type apiLossSellView struct {
+	Enabled      bool    `json:"enabled"`
+	TriggerRatio float64 `json:"triggerRatio"`
+	SellAll      bool    `json:"sellAll"`
+}
+
+type apiTokenRuleView struct {
+	MaxMCP       float64 `json:"maxMcp"`
+	BuyUSD       float64 `json:"buyUSD"`
+	BuyRatio     float64 `json:"buyRatio"`
+	MinSellRatio float64 `json:"minSellRatio"`
+}
+
+type apiListConfigView struct {
+	MaxMCP    float64 `json:"maxMcp"`
+	MinMCP    float64 `json:"minMcp"`
+	Source    string  `json:"source"`
+	Category  string  `json:"category"`
+	CreateDay int     `json:"createDay"`
+}
+
+// apiConfigView is deliberately a struct: encoding a map cannot guarantee
+// the field order required by the existing frontend response contract.
+type apiConfigView struct {
+	Name            string                 `json:"name"`
+	MinMCP          float64                `json:"minMcp"`
+	Slippage        float64                `json:"slippage"`
+	DiffBuySecond   int                    `json:"diffBuySecond"`
+	MaxLossBuyTimes int                    `json:"maxLossBuyTimes"`
+	MinLossBuyRatio float64                `json:"minLossBuyRatio"`
+	ReplacePending  bool                   `json:"replacePending"`
+	SellPolicy      apiSellPolicyView      `json:"sellPolicy"`
+	ScheduledSell   apiScheduledSellView   `json:"scheduledSell"`
+	ExternalBuySell apiExternalBuySellView `json:"externalBuySell"`
+	ProfitSell      apiProfitSellView      `json:"profitSell"`
+	LossSell        apiLossSellView        `json:"lossSell"`
+	TokenConfig     []apiTokenRuleView     `json:"tokenConfig"`
+	ListConfig      apiListConfigView      `json:"listConfig"`
+}
+
+// userView mirrors the Node service's public monitor-user DTO. Database
 // columns such as the internal id and encrypted key are deliberately omitted;
 // configuration is normalized so partial legacy rows return the same shape as
 // newly-created users.
@@ -405,24 +480,26 @@ func (a *API) userView(u store.User, withBalance bool) map[string]any {
 	if name == "" || name == "strategy" {
 		name = fmt.Sprintf("User%d", u.UserID)
 	}
-	public := map[string]any{
-		"name": name, "minMcp": cfg.MinMCP, "slippage": cfg.Slippage,
-		"diffBuySecond": cfg.DiffBuySecond, "maxLossBuyTimes": cfg.MaxLossBuyTimes,
-		"minLossBuyRatio": cfg.MinLossBuyRatio, "replacePending": cfg.ReplacePending,
-		"sellPolicy": cfg.SellPolicy, "scheduledSell": cfg.ScheduledSell,
-		"externalBuySell": cfg.ExternalBuySell, "profitSell": cfg.ProfitSell,
-		"lossSell": cfg.LossSell, "listConfig": cfg.ListConfig,
-	}
-	if rawList, ok := u.Config["listConfig"].(map[string]any); ok {
-		// Node keeps listConfig as an extensible AVE options object in the
-		// public DTO (pageSize, amm, createdAtMin, ... may be present).
-		public["listConfig"] = rawList
-	}
-	rules := make([]map[string]any, 0, len(cfg.TokenConfig))
+	rules := make([]apiTokenRuleView, 0, len(cfg.TokenConfig))
 	for _, rule := range cfg.TokenConfig {
-		rules = append(rules, map[string]any{"maxMcp": rule.MaxMCP, "buyUSD": rule.BuyUSD, "buyRatio": rule.BuyRatio, "minSellRatio": rule.MinSellRatio})
+		rules = append(rules, apiTokenRuleView{MaxMCP: rule.MaxMCP, BuyUSD: rule.BuyUSD, BuyRatio: rule.BuyRatio, MinSellRatio: rule.MinSellRatio})
 	}
-	public["tokenConfig"] = rules
+	levels := make([]apiProfitLevelView, 0, len(cfg.ProfitSell.Levels))
+	for _, level := range cfg.ProfitSell.Levels {
+		levels = append(levels, apiProfitLevelView{ProfitRatio: level.ProfitRatio, SellRatio: level.SellRatio})
+	}
+	public := apiConfigView{
+		Name: name, MinMCP: cfg.MinMCP, Slippage: cfg.Slippage,
+		DiffBuySecond: cfg.DiffBuySecond, MaxLossBuyTimes: cfg.MaxLossBuyTimes,
+		MinLossBuyRatio: cfg.MinLossBuyRatio, ReplacePending: cfg.ReplacePending,
+		SellPolicy:      apiSellPolicyView{FullSellAfterSellCount: cfg.SellPolicy.FullSellAfterSellCount, ResetSellCountOnBuy: cfg.SellPolicy.ResetSellCountOnBuy},
+		ScheduledSell:   apiScheduledSellView{Enabled: cfg.ScheduledSell.Enabled, IntervalSecond: cfg.ScheduledSell.IntervalSecond, SellRatio: cfg.ScheduledSell.SellRatio, BaseUSD: cfg.ScheduledSell.BaseUSD, ResetOnBuy: cfg.ScheduledSell.ResetOnBuy},
+		ExternalBuySell: apiExternalBuySellView{Enabled: cfg.ExternalBuySell.Enabled, MinBuyUSD: cfg.ExternalBuySell.MinBuyUSD, BuyImpactRatio: cfg.ExternalBuySell.BuyImpactRatio, NeedProfit: cfg.ExternalBuySell.NeedProfit, ProfitRatio: cfg.ExternalBuySell.ProfitRatio, SellRatio: cfg.ExternalBuySell.SellRatio, BuyAmountRatio: cfg.ExternalBuySell.BuyAmountRatio, CooldownSecond: cfg.ExternalBuySell.CooldownSecond},
+		ProfitSell:      apiProfitSellView{Enabled: cfg.ProfitSell.Enabled, ResetOnBuy: cfg.ProfitSell.ResetOnBuy, Levels: levels},
+		LossSell:        apiLossSellView{Enabled: cfg.LossSell.Enabled, TriggerRatio: cfg.LossSell.TriggerRatio, SellAll: cfg.LossSell.SellAll},
+		TokenConfig:     rules,
+		ListConfig:      apiListConfigView{MaxMCP: cfg.ListConfig.MaxMCP, MinMCP: cfg.ListConfig.MinMCP, Source: cfg.ListConfig.Source, Category: cfg.ListConfig.Category, CreateDay: cfg.ListConfig.CreateDay},
+	}
 	out := map[string]any{"userId": u.UserID, "walletAddress": strings.ToLower(u.WalletAddress), "config": public, "enabled": u.Enabled, "createdAt": u.CreatedAt, "updatedAt": u.UpdatedAt}
 	if withBalance && a.RPC != nil {
 		if raw, err := a.RPC.Balance(context.Background(), u.WalletAddress); err == nil {
