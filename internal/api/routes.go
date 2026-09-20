@@ -48,8 +48,8 @@ func normalizeAddress(v string) string { return strings.ToLower(strings.TrimSpac
 
 func aveTaxValue(item map[string]any, keys ...string) *string {
 	for _, key := range keys {
-		v, ok := item[key]
-		if !ok || v == nil {
+		v := pairValue(item, key)
+		if v == nil {
 			continue
 		}
 		switch x := v.(type) {
@@ -64,6 +64,27 @@ func aveTaxValue(item map[string]any, keys ...string) *string {
 		case json.Number:
 			value := string(x)
 			return &value
+		case int:
+			value := strconv.Itoa(x)
+			return &value
+		case int64:
+			value := strconv.FormatInt(x, 10)
+			return &value
+		case int32:
+			value := strconv.FormatInt(int64(x), 10)
+			return &value
+		}
+	}
+	return nil
+}
+
+func aveTaxSources(sources []map[string]any, keys ...string) *string {
+	for _, source := range sources {
+		if source == nil {
+			continue
+		}
+		if value := aveTaxValue(source, keys...); value != nil {
+			return value
 		}
 	}
 	return nil

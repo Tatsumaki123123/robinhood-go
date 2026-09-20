@@ -945,6 +945,68 @@ func aveInt64Ptr(sources []map[string]any, keys ...string) *int64 {
 	return &n
 }
 
+func decimalRat(value any) (*big.Rat, bool) {
+	s := strings.TrimSpace(str(value))
+	if s == "" {
+		return nil, false
+	}
+	if r, ok := new(big.Rat).SetString(s); ok {
+		return r, true
+	}
+	f, ok := new(big.Float).SetString(s)
+	if !ok {
+		return nil, false
+	}
+	r, _ := f.Rat(nil)
+	return r, r != nil
+}
+
+func formatDecimalRat(value *big.Rat) string {
+	if value == nil {
+		return ""
+	}
+	text := value.FloatString(18)
+	text = strings.TrimRight(strings.TrimRight(text, "0"), ".")
+	if text == "" || text == "-0" {
+		return "0"
+	}
+	return text
+}
+
+func derivedMarketCapFromSupply(totalSupplyRaw string, decimals int, tokenPriceUSD any) *string {
+	supply, ok := new(big.Int).SetString(strings.TrimSpace(totalSupplyRaw), 10)
+	if !ok || supply.Sign() <= 0 || decimals < 0 || decimals > 255 {
+		return nil
+	}
+	price, ok := decimalRat(tokenPriceUSD)
+	if !ok || price.Sign() < 0 {
+		return nil
+	}
+	denominator := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
+	result := new(big.Rat).SetFrac(new(big.Int).Mul(supply, price.Num()), new(big.Int).Mul(denominator, price.Denom()))
+	text := formatDecimalRat(result)
+	if text == "" {
+		return nil
+	}
+	return &text
+}
+
+func derivedMarketCapFromAve(sources []map[string]any) *string {
+	total := aveValue(sources, "total", "total_supply", "totalSupply")
+	price := aveValue(sources, "current_price_usd", "currentPriceUsd")
+	totalRat, totalOK := decimalRat(total)
+	priceRat, priceOK := decimalRat(price)
+	if !totalOK || !priceOK || totalRat.Sign() <= 0 || priceRat.Sign() < 0 {
+		return nil
+	}
+	value := new(big.Rat).Mul(totalRat, priceRat)
+	text := formatDecimalRat(value)
+	if text == "" {
+		return nil
+	}
+	return &text
+}
+
 func (a *API) startAve(c *fiber.Ctx) error {
 	d := body(c)
 	target := low(str(d["targetToken"]))
@@ -967,6 +1029,7 @@ func (a *API) startAve(c *fiber.Ctx) error {
 		extraData = nested
 	}
 	data, _ := detail["data"].(map[string]any)
+	tokenDetail, _ := data["token"].(map[string]any)
 	pairs, _ := data["pairs"].([]any)
 	requested := normalizePoolID(str(d["pair"]))
 	var pair map[string]any
@@ -1051,7 +1114,12 @@ func (a *API) startAve(c *fiber.Ctx) error {
 	// extraDetail responses. Use the pair first, then fill missing fields from
 	// the token-level responses so startAveToken stores the same data shown by
 	// the Node client.
-	sources := []map[string]any{pair, extraData, data}
+	// AVE puts token-level values below data.token. Include that object before
+	// the response wrapper so fields such as total/current_price_usd are found.
+	sources := []map[string]any{pair, extraData, tokenDetail, data}
+	taxSources := []map[string]any{extraData, pair, tokenDetail, data}
+	buyTax := aveTaxSources(taxSources, "buy_tax", "buyTax", "buy_tax_rate", "buyTaxRate", "buy_tax_percent", "buyTaxPercent")
+	sellTax := aveTaxSources(taxSources, "sell_tax", "sellTax", "sell_tax_rate", "sellTaxRate", "sell_tax_percent", "sellTaxPercent")
 	if value := aveValue(sources, "token_name", "tokenName", "name_en", "name_zh", "name"); str(d["tokenName"]) == "" && value != nil {
 		d["tokenName"] = value
 	}
@@ -1072,8 +1140,6 @@ func (a *API) startAve(c *fiber.Ctx) error {
 	// Upsert directly so route discovery can fail before an HTTP success body
 	// is committed. The Node service disables the monitor and returns an error
 	// when no executable native route exists.
-	buyTax := aveTaxValue(extraData, "buy_tax", "buyTax", "buy_tax_rate", "buyTaxRate", "buy_tax_percent", "buyTaxPercent")
-	sellTax := aveTaxValue(extraData, "sell_tax", "sellTax", "sell_tax_rate", "sellTaxRate", "sell_tax_percent", "sellTaxPercent")
 	quoteDecimals := 18
 	tokenDecimals := 0
 	var tokenDecimalsPtr *int
@@ -1095,13 +1161,58 @@ func (a *API) startAve(c *fiber.Ctx) error {
 		quoteUSD = "1"
 	}
 	targetIsToken0 := strings.EqualFold(str(pair["token0_address"]), target)
-	quotePriceUSD := any(nil)
+	var targetPriceEth, targetPriceUSD any
 	if targetIsToken0 {
-		quotePriceUSD = pair["token1_price_usd"]
+		targetPriceEth = pairValue(pair, "token0_price_eth")
+		targetPriceUSD = pairValue(pair, "token0_price_usd")
 	} else {
-		quotePriceUSD = pair["token0_price_usd"]
+		targetPriceEth = pairValue(pair, "token1_price_eth")
+		targetPriceUSD = pairValue(pair, "token1_price_usd")
 	}
-	t := store.Token{UserID: id(d["userId"]), TokenAddress: target, CurveAddress: low(str(d["curveAddress"])), PoolID: normalizePoolID(poolID), Pair: normalizePoolID(poolID), Amm: str(d["amm"]), Currency0: c0, Currency1: c1, Fee: int(bigIntToInt64(launched.PoolFee)), TickSpacing: int(bigIntToInt64(launched.TickSpacing)), Hooks: low(a.Cfg.PonsExternalHooks), QuoteTokenAddress: pairToken, Name: strPtr(d["tokenName"]), Symbol: strPtr(d["tokenSymbol"]), TokenLogoURL: strPtr(d["tokenLogoUrl"]), QuoteTokenSymbol: strPtr(d["quoteTokenSymbol"]), QuoteTokenLogoURL: strPtr(d["quoteTokenLogoUrl"]), Decimals: tokenDecimalsPtr, TotalSupplyRaw: aveStringPtr(sources, "total_supply_raw", "totalSupplyRaw", "total_supply", "totalSupply", "token_supply", "supply"), MarketCap: aveStringPtr(sources, "market_cap", "marketCap", "marketcap", "market_cap_usd", "mcap"), TokenPriceEth: aveStringPtr(sources, "token_price_eth", "tokenPriceEth", "price_eth", "priceEth"), TokenPriceUsd: aveStringPtr(sources, "token_price_usd", "tokenPriceUsd", "price_usd", "priceUsd", "price"), PriceChange5m: aveStringPtr(sources, "price_change_5m", "priceChange5m", "price_change_5min"), PriceChange1h: aveStringPtr(sources, "price_change_1h", "priceChange1h"), PriceChange24h: aveStringPtr(sources, "price_change_24h", "priceChange24h"), HoldersCount: aveInt64Ptr(sources, "holders_count", "holdersCount", "holder_count", "holders"), BuyCount5m: aveInt64Ptr(sources, "buy_count_5m", "buyCount5m", "buys_tx_5m_count"), SellCount5m: aveInt64Ptr(sources, "sell_count_5m", "sellCount5m", "sells_tx_5m_count"), Volume5m: aveStringPtr(sources, "volume_5m", "volume5m", "volume_usd_5m"), QuoteDecimals: &quoteDecimals, QuoteUSDPrice: func() *string {
+	if targetPriceEth == nil {
+		targetPriceEth = aveValue(sources, "token_price_eth", "tokenPriceEth", "price_eth", "priceEth")
+	}
+	if targetPriceUSD == nil {
+		targetPriceUSD = aveValue(sources, "token_price_usd", "tokenPriceUsd", "price_usd", "priceUsd", "current_price_usd", "currentPriceUsd", "price")
+	}
+	var quotePriceUSD any
+	if targetIsToken0 {
+		quotePriceUSD = pairValue(pair, "token1_price_usd")
+	} else {
+		quotePriceUSD = pairValue(pair, "token0_price_usd")
+	}
+	if tokenDecimalsPtr == nil {
+		key := "token1_decimal"
+		if targetIsToken0 {
+			key = "token0_decimal"
+		}
+		if decimals := id(pairValue(pair, key)); decimals > 0 {
+			tokenDecimals = int(decimals)
+			tokenDecimalsPtr = &tokenDecimals
+		}
+	}
+	var totalSupplyRaw *string
+	if a.RPC != nil {
+		if raw, supplyErr := a.RPC.ERC20TotalSupply(c.Context(), target); supplyErr == nil && raw != "" {
+			totalSupplyRaw = &raw
+		}
+	}
+	if totalSupplyRaw == nil {
+		totalSupplyRaw = aveStringPtr(sources, "total_supply_raw", "totalSupplyRaw", "total_supply", "totalSupply", "token_supply", "supply")
+	}
+	marketCap := aveStringPtr(sources, "market_cap", "marketCap", "marketcap", "market_cap_usd", "mcap")
+	if marketCap == nil {
+		marketCap = derivedMarketCapFromAve(sources)
+	}
+	if marketCap == nil && totalSupplyRaw != nil && tokenDecimalsPtr != nil {
+		marketCap = derivedMarketCapFromSupply(*totalSupplyRaw, *tokenDecimalsPtr, targetPriceUSD)
+	}
+	volume5m := aveStringPtr(sources, "volume_u_5m", "volume_5m", "volume5m", "volume_usd_5m")
+	buyCount5m := aveInt64Ptr(sources, "buys_tx_5m_count", "buy_count_5m", "buyCount5m")
+	sellCount5m := aveInt64Ptr(sources, "sells_tx_5m_count", "sell_count_5m", "sellCount5m")
+	tokenPriceEth := aveStringPtr([]map[string]any{{"value": targetPriceEth}}, "value")
+	tokenPriceUSD := aveStringPtr([]map[string]any{{"value": targetPriceUSD}}, "value")
+	t := store.Token{UserID: id(d["userId"]), TokenAddress: target, CurveAddress: low(str(d["curveAddress"])), PoolID: normalizePoolID(poolID), Pair: normalizePoolID(poolID), Amm: str(d["amm"]), Currency0: c0, Currency1: c1, Fee: int(bigIntToInt64(launched.PoolFee)), TickSpacing: int(bigIntToInt64(launched.TickSpacing)), Hooks: low(a.Cfg.PonsExternalHooks), QuoteTokenAddress: pairToken, Name: strPtr(d["tokenName"]), Symbol: strPtr(d["tokenSymbol"]), TokenLogoURL: strPtr(d["tokenLogoUrl"]), QuoteTokenSymbol: strPtr(d["quoteTokenSymbol"]), QuoteTokenLogoURL: strPtr(d["quoteTokenLogoUrl"]), Decimals: tokenDecimalsPtr, TotalSupplyRaw: totalSupplyRaw, MarketCap: marketCap, TokenPriceEth: tokenPriceEth, TokenPriceUsd: tokenPriceUSD, PriceChange5m: aveStringPtr(sources, "price_change_5m", "priceChange5m", "price_change_5min"), PriceChange1h: aveStringPtr(sources, "price_change_1h", "priceChange1h"), PriceChange24h: aveStringPtr(sources, "price_change_24h", "priceChange24h"), HoldersCount: aveInt64Ptr(sources, "holders_count", "holdersCount", "holder_count", "holders"), BuyCount5m: buyCount5m, SellCount5m: sellCount5m, Volume5m: volume5m, QuoteDecimals: &quoteDecimals, QuoteUSDPrice: func() *string {
 		if quoteUSD != "" {
 			return strPtr(quoteUSD)
 		}

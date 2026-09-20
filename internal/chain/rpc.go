@@ -188,6 +188,21 @@ func (r *RPC) ERC20Decimals(ctx context.Context, token string) (int, error) {
 	}
 	return int(n.Int64()), nil
 }
+
+// ERC20TotalSupply reads the raw ERC20 totalSupply() value. Keeping this as a
+// string avoids overflowing native integer types for tokens with large supply.
+func (r *RPC) ERC20TotalSupply(ctx context.Context, token string) (string, error) {
+	v, err := r.Call(ctx, "eth_call", []any{map[string]any{"to": common.HexToAddress(token).Hex(), "data": "0x18160ddd"}, "latest"})
+	if err != nil {
+		return "", err
+	}
+	s := strings.TrimPrefix(strings.Trim(string(v), `"`), "0x")
+	n := new(big.Int)
+	if _, ok := n.SetString(s, 16); !ok || n.Sign() < 0 {
+		return "", fmt.Errorf("invalid ERC20 total supply")
+	}
+	return n.String(), nil
+}
 func (r *RPC) Tx(ctx context.Context, hash string) (any, error) {
 	v, e := r.Call(ctx, "eth_getTransactionByHash", []any{hash})
 	if e != nil {
