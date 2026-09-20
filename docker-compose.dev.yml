@@ -22,7 +22,7 @@ services:
       - go-build-cache:/root/.cache/go-build
       - go-mod-cache:/go/pkg/mod
       - uploads-dev:/data/uploads
-    command: ["go", "run", "-mod=mod", "./cmd/server"]
+    command: ["go", "run", "-a", "-mod=mod", "./cmd/server"]
   postgres:
     image: postgres:16-alpine
     environment:
