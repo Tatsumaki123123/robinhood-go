@@ -173,15 +173,6 @@ func (e *Engine) Run(ctx context.Context) {
 
 func (e *Engine) processDecoded(ctx context.Context, raw map[string]any) {
 	if ev, ok := decodeEvent(raw); ok {
-		e.devInfo("监听到交易事件",
-			zap.String("eventKey", ev.Key),
-			zap.String("side", strings.ToLower(ev.Side)),
-			zap.String("token", ev.TokenAddress),
-			zap.String("curve", ev.CurveAddress),
-			zap.String("pool", ev.PoolID),
-			zap.Float64("quoteUSD", ev.QuoteUSD),
-			zap.Float64("price", ev.Price),
-		)
 		if ev.UserID > 0 {
 			_ = e.Process(ctx, ev)
 		} else {
@@ -687,6 +678,16 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 	if enabled, err := e.cachedTokenEnabled(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress); err != nil || !enabled {
 		return err
 	}
+	e.devInfo("监听到匹配 token 的交易",
+		zap.Int64("userID", ev.UserID),
+		zap.String("eventKey", ev.Key),
+		zap.String("side", strings.ToLower(ev.Side)),
+		zap.String("token", ev.TokenAddress),
+		zap.String("curve", ev.CurveAddress),
+		zap.String("pool", ev.PoolID),
+		zap.Float64("quoteUSD", ev.QuoteUSD),
+		zap.Float64("price", ev.Price),
+	)
 	if cfg.MinMCP > 0 && ev.MarketCap <= 0 {
 		return nil
 	}
