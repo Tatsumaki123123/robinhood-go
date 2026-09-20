@@ -4,10 +4,10 @@ WORKDIR /workspace
 
 RUN apk add --no-cache ca-certificates git
 
-COPY go.mod ./
+COPY go.* ./
 RUN go mod download
 
 ENV CGO_ENABLED=0
 ENV GOFLAGS=-buildvcs=false
 
-CMD ["go", "run", "./cmd/server"]
+CMD ["go", "run", "-mod=mod", "./cmd/server"]

@@ -11,11 +11,15 @@ Copy-Item .env.example .env
 docker compose up -d --build
 ```
 
-开发环境使用源码挂载和 `go run`，修改代码后容器会自动重新编译：
+开发环境使用源码挂载和 `go run -mod=mod`，启动时自动补齐依赖并将 `go.mod`、`go.sum` 更新写回宿主机；请将这两个文件一起纳入版本控制。修改代码后需要重启应用容器才能重新编译：
 
 ```powershell
 Copy-Item .env.dev.example .env.dev
 docker compose -f docker-compose.dev.yml up --build
+```
+
+```powershell
+docker compose -f docker-compose.dev.yml restart app
 ```
 
 生产环境使用默认的 `docker-compose.yml`，构建出的应用镜像为 distroless 静态镜像：
