@@ -80,6 +80,7 @@ type Engine struct {
 	Trading       *chain.Trading
 	EncryptionKey string
 	prices        sync.Map // pool/curve key -> last observed execution price
+	supplies      sync.Map // token address -> cached total supply raw
 	curveBlocks   sync.Map // curve address -> last polled block
 	pollMu        sync.Mutex
 	monitorMu     sync.RWMutex
@@ -217,6 +218,7 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 		tokens := tokenSnapshot[u.UserID]
 		for _, t := range tokens {
 			if (ev.CurveAddress != "" && strings.EqualFold(t.CurveAddress, ev.CurveAddress)) || (ev.PoolID != "" && strings.EqualFold(t.PoolID, ev.PoolID)) {
+				t = e.enrichTokenSupply(ctx, t)
 				copy := ev
 				copy.UserID = u.UserID
 				copy.TokenAddress = t.TokenAddress
@@ -255,11 +257,19 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 						copy.QuoteAmountText = absIntegerText(ev.Amount1Raw)
 						copy.TokenAmountText = absIntegerText(ev.Amount0Raw)
 					}
+					if ev.SqrtPriceX96 != "" {
+						if spot := v4SpotPrice(ev.SqrtPriceX96, strings.EqualFold(t.Currency0, t.TokenAddress)); spot > 0 {
+							copy.PriceRaw = spot
+						}
+					}
 					if copy.PriceRaw == 0 && copy.QuoteAmountRaw > 0 && copy.TokenAmountRaw > 0 {
 						copy.PriceRaw = copy.QuoteAmountRaw / copy.TokenAmountRaw
 					}
 					if copy.Price == 0 && copy.PriceRaw > 0 {
 						copy.Price = usdTokenPrice(copy.PriceRaw, t)
+					}
+					if marketCap := marketCapFromEvent(copy, t); marketCap > 0 {
+						copy.MarketCap = marketCap
 					}
 					if copy.QuoteUSD == 0 && copy.QuoteAmountRaw > 0 {
 						copy.QuoteUSD = rawQuoteUSD(copy.QuoteAmountRaw, t)
@@ -290,11 +300,19 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 					}
 					_ = e.Process(ctx, copy)
 				} else {
+					if ev.SqrtPriceX96 != "" {
+						if spot := v4SpotPrice(ev.SqrtPriceX96, strings.EqualFold(t.Currency0, t.TokenAddress)); spot > 0 {
+							copy.PriceRaw = spot
+						}
+					}
 					if copy.PriceRaw == 0 && copy.QuoteAmountRaw > 0 && copy.TokenAmountRaw > 0 {
 						copy.PriceRaw = copy.QuoteAmountRaw / copy.TokenAmountRaw
 					}
 					if copy.Price == 0 && copy.PriceRaw > 0 {
 						copy.Price = usdTokenPrice(copy.PriceRaw, t)
+					}
+					if marketCap := marketCapFromEvent(copy, t); marketCap > 0 {
+						copy.MarketCap = marketCap
 					}
 					if copy.Price > 0 && !eventPriceReady {
 						priceKey := strings.ToLower(copy.PoolID)
@@ -318,6 +336,30 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 		}
 	}
 	return nil
+}
+
+func (e *Engine) enrichTokenSupply(ctx context.Context, t store.Token) store.Token {
+	if t.TotalSupplyRaw != nil && strings.TrimSpace(*t.TotalSupplyRaw) != "" {
+		return t
+	}
+	key := strings.ToLower(strings.TrimSpace(t.TokenAddress))
+	if key == "" || e.RPC == nil {
+		return t
+	}
+	if cached, ok := e.supplies.Load(key); ok {
+		if supply, ok := cached.(string); ok && supply != "" {
+			t.TotalSupplyRaw = &supply
+		}
+		return t
+	}
+	supply, err := e.RPC.ERC20TotalSupply(ctx, t.TokenAddress)
+	if err != nil || supply == "" {
+		e.supplies.Store(key, "")
+		return t
+	}
+	e.supplies.Store(key, supply)
+	t.TotalSupplyRaw = &supply
+	return t
 }
 
 func (e *Engine) refreshMonitorCache(ctx context.Context, force bool) error {
@@ -407,6 +449,77 @@ func usdTokenPrice(rawPrice float64, t store.Token) float64 {
 		return rawPrice
 	}
 	return rawPrice * math.Pow10(tokenDecimals-quoteDecimals) * quoteUSD
+}
+
+func v4SpotPrice(sqrt string, tokenIsCurrency0 bool) float64 {
+	value := strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(sqrt), "0x"), "0X")
+	base := 10
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(sqrt)), "0x") {
+		base = 16
+	}
+	s, ok := new(big.Int).SetString(value, base)
+	if !ok || s.Sign() <= 0 {
+		return 0
+	}
+	spot := new(big.Float).Quo(
+		new(big.Float).Mul(new(big.Float).SetInt(s), new(big.Float).SetInt(s)),
+		new(big.Float).SetInt(new(big.Int).Lsh(big.NewInt(1), 192)),
+	)
+	if !tokenIsCurrency0 {
+		spot.Quo(big.NewFloat(1), spot)
+	}
+	result, _ := spot.Float64()
+	if result <= 0 || math.IsNaN(result) || math.IsInf(result, 0) {
+		return 0
+	}
+	return result
+}
+
+// marketCapFromEvent mirrors the Node strategy's marketCapUsdScaledRaw: use
+// the current event price and total supply so a stale or missing persisted
+// market_cap value cannot disable an otherwise valid strategy signal.
+func marketCapFromEvent(ev Event, t store.Token) float64 {
+	if t.TotalSupplyRaw == nil || strings.TrimSpace(*t.TotalSupplyRaw) == "" {
+		return 0
+	}
+	rawPrice := ev.PriceRaw
+	if rawPrice <= 0 && ev.QuoteAmountRaw > 0 && ev.TokenAmountRaw > 0 {
+		rawPrice = ev.QuoteAmountRaw / ev.TokenAmountRaw
+	}
+	if rawPrice <= 0 {
+		return 0
+	}
+	supply := new(big.Int)
+	if _, ok := supply.SetString(integerText(*t.TotalSupplyRaw), 10); !ok || supply.Sign() <= 0 {
+		return 0
+	}
+	quoteUSD := 0.0
+	if t.QuoteUSDPrice != nil {
+		quoteUSD, _ = strconv.ParseFloat(strings.TrimSpace(*t.QuoteUSDPrice), 64)
+	}
+	if quoteUSD <= 0 {
+		switch strings.ToUpper(strings.TrimSpace(t.QuoteTokenSymbol)) {
+		case "USDG", "USDC", "USDT", "DAI":
+			quoteUSD = 1
+		}
+	}
+	if quoteUSD <= 0 {
+		return 0
+	}
+	quoteDecimals := 18
+	if t.QuoteDecimals != nil && *t.QuoteDecimals >= 0 {
+		quoteDecimals = *t.QuoteDecimals
+	}
+	value := new(big.Float).SetInt(supply)
+	value.Mul(value, big.NewFloat(rawPrice))
+	value.Mul(value, big.NewFloat(quoteUSD))
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(quoteDecimals)), nil)
+	value.Quo(value, new(big.Float).SetInt(scale))
+	marketCap, _ := value.Float64()
+	if marketCap <= 0 || math.IsNaN(marketCap) || math.IsInf(marketCap, 0) {
+		return 0
+	}
+	return marketCap
 }
 
 func rawTokenPriceFromUSD(usdPrice float64, t store.Token) float64 {
@@ -1003,15 +1116,11 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 		if rawPrice <= 0 && ev.QuoteAmountRaw > 0 && ev.TokenAmountRaw > 0 {
 			rawPrice = ev.QuoteAmountRaw / ev.TokenAmountRaw
 		}
-		if rawPrice > 0 && cfg.Slippage >= 0 && cfg.Slippage < 1 {
-			if side == "buy" {
-				if ev.QuoteAmountText != "" && ev.TokenAmountText != "" {
-					minOut = amountAtRawRatio(amountRaw, ev.QuoteAmountText, ev.TokenAmountText, cfg.Slippage, true)
-				} else {
-					minOut = amountAtRawPrice(amountRaw, rawPrice, cfg.Slippage, true)
-				}
+		if side == "buy" && rawPrice > 0 && cfg.Slippage >= 0 && cfg.Slippage < 1 {
+			if ev.QuoteAmountText != "" && ev.TokenAmountText != "" {
+				minOut = amountAtRawRatio(amountRaw, ev.QuoteAmountText, ev.TokenAmountText, cfg.Slippage, true)
 			} else {
-				minOut = amountAtRawPrice(amountRaw, rawPrice, cfg.Slippage, false)
+				minOut = amountAtRawPrice(amountRaw, rawPrice, cfg.Slippage, true)
 			}
 		}
 		req := map[string]any{"currencyIn": first, "path": path, "amountInRaw": amountRaw, "amountOutMinimumRaw": minOut, "recipient": u.WalletAddress, "privateKey": key, "wrapNative": side == "buy" && strings.EqualFold(first, chain.NativeAddress), "unwrapNative": side == "sell" && strings.EqualFold(fmt.Sprint(route["destinationToken"]), chain.NativeAddress)}
@@ -1286,21 +1395,12 @@ func evaluate(c Config, r TokenRule, ev Event, p position) (string, float64, str
 	}
 	if strings.ToLower(ev.Side) == "sell" {
 		priceDrop := -ev.PriceChangeRatio
-		impactDrop := ev.PriceImpactRatio
-		if impactDrop < 0 {
-			impactDrop = -impactDrop
+		impactDrop := -ev.PriceImpactRatio
+		if ev.PriceImpactRatio == 0 {
+			impactDrop = -ev.Impact
 		}
-		legacyImpactDrop := ev.Impact
-		if legacyImpactDrop < 0 {
-			legacyImpactDrop = -legacyImpactDrop
-		}
-		if impactDrop < r.MinSellRatio && legacyImpactDrop < r.MinSellRatio && priceDrop < r.MinSellRatio {
+		if impactDrop < r.MinSellRatio && priceDrop < r.MinSellRatio {
 			return "", 0, ""
-		}
-		if p.Amount > 0 && p.BuyCount > 0 {
-			if c.MaxLossBuyTimes <= 0 || p.BuyCount >= c.MaxLossBuyTimes {
-				return "", 0, ""
-			}
 		}
 		if p.LastBuy != nil && c.DiffBuySecond > 0 && time.Since(*p.LastBuy) < time.Duration(c.DiffBuySecond)*time.Second {
 			return "", 0, ""
@@ -1314,6 +1414,11 @@ func evaluate(c Config, r TokenRule, ev Event, p position) (string, float64, str
 		}
 		if p.FirstPrice > 0 && p.BuyCount > 0 && price >= p.FirstPrice {
 			return "", 0, ""
+		}
+		if p.Amount > 0 && p.BuyCount > 0 && p.FirstPrice > 0 && price < p.FirstPrice {
+			if c.MaxLossBuyTimes <= 0 || p.BuyCount >= c.MaxLossBuyTimes {
+				return "", 0, ""
+			}
 		}
 		if p.LastPrice > 0 && c.MinLossBuyRatio > 0 && price > p.LastPrice*(1-c.MinLossBuyRatio) {
 			return "", 0, ""

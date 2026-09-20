@@ -655,7 +655,37 @@ func (a *API) tokenAdd(c *fiber.Ctx) error {
 	if tokenAddress == c1 {
 		quote = c0
 	}
-	t := store.Token{UserID: u, TokenAddress: tokenAddress, CurveAddress: low(str(d["curveAddress"])), PoolID: normalizePoolID(poolID), Pair: pair, Amm: str(d["amm"]), Currency0: c0, Currency1: c1, Fee: int(id(d["fee"])), TickSpacing: int(id(d["tickSpacing"])), Hooks: low(str(d["hooks"])), QuoteTokenAddress: quote, Name: strPtr(d["tokenName"]), Symbol: strPtr(d["tokenSymbol"]), TokenLogoURL: strPtr(d["tokenLogoUrl"]), QuoteTokenSymbol: strPtr(d["quoteTokenSymbol"]), QuoteTokenLogoURL: strPtr(d["quoteTokenLogoUrl"]), Decimals: intPtr(d["decimals"]), TotalSupplyRaw: strPtr(d["totalSupplyRaw"]), MarketCap: strPtr(d["marketCap"]), TokenPriceUsd: strPtr(d["tokenPriceUsd"]), QuoteDecimals: intPtr(d["quoteDecimals"]), QuoteUSDPrice: strPtr(d["quoteUsdPrice"]), Enabled: true}
+	tokenDecimals := intPtr(d["decimals"])
+	if tokenDecimals == nil && a.RPC != nil {
+		if decimals, de := a.RPC.ERC20Decimals(c.Context(), tokenAddress); de == nil {
+			tokenDecimals = &decimals
+		}
+	}
+	totalSupplyRaw := strPtr(d["totalSupplyRaw"])
+	if (totalSupplyRaw == nil || strings.TrimSpace(*totalSupplyRaw) == "") && a.RPC != nil {
+		if supply, se := a.RPC.ERC20TotalSupply(c.Context(), tokenAddress); se == nil && supply != "" {
+			totalSupplyRaw = &supply
+		}
+	}
+	quoteDecimals := intPtr(d["quoteDecimals"])
+	if quoteDecimals == nil && a.RPC != nil && !strings.EqualFold(quote, chain.NativeAddress) {
+		if decimals, de := a.RPC.ERC20Decimals(quote); de == nil {
+			quoteDecimals = &decimals
+		}
+	}
+	quoteUSDPrice := strPtr(d["quoteUsdPrice"])
+	if quoteUSDPrice == nil || strings.TrimSpace(*quoteUSDPrice) == "" {
+		if strings.EqualFold(quote, chain.NativeAddress) && a.Cfg.NativeUSDPrice != "" {
+			quoteUSDPrice = &a.Cfg.NativeUSDPrice
+		} else {
+			switch strings.ToUpper(str(d["quoteTokenSymbol"])) {
+			case "USDG", "USDC", "USDT", "DAI":
+				stableUSD := "1"
+				quoteUSDPrice = &stableUSD
+			}
+		}
+	}
+	t := store.Token{UserID: u, TokenAddress: tokenAddress, CurveAddress: low(str(d["curveAddress"])), PoolID: normalizePoolID(poolID), Pair: pair, Amm: str(d["amm"]), Currency0: c0, Currency1: c1, Fee: int(id(d["fee"])), TickSpacing: int(id(d["tickSpacing"])), Hooks: low(str(d["hooks"])), QuoteTokenAddress: quote, Name: strPtr(d["tokenName"]), Symbol: strPtr(d["tokenSymbol"]), TokenLogoURL: strPtr(d["tokenLogoUrl"]), Decimals: tokenDecimals, TotalSupplyRaw: totalSupplyRaw, MarketCap: strPtr(d["marketCap"]), TokenPriceUsd: strPtr(d["tokenPriceUsd"]), QuoteDecimals: quoteDecimals, QuoteUSDPrice: quoteUSDPrice, Enabled: true}
 	if v, ok := d["enabled"].(bool); ok {
 		t.Enabled = v
 	}
@@ -767,6 +797,11 @@ func (a *API) syncTokens(c *fiber.Ctx) error {
 				token.PriceChange1h = &s
 			}
 			break
+		}
+		if (token.MarketCap == nil || strings.TrimSpace(*token.MarketCap) == "") && token.TotalSupplyRaw != nil && token.Decimals != nil && token.TokenPriceUsd != nil {
+			if marketCap := derivedMarketCapFromSupply(*token.TotalSupplyRaw, *token.Decimals, *token.TokenPriceUsd); marketCap != nil {
+				token.MarketCap = marketCap
+			}
 		}
 		if _, upsertErr := a.Store.UpsertToken(c.Context(), token); upsertErr == nil {
 			// Continue refreshing other tokens if one AVE item is malformed.
