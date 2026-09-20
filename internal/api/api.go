@@ -147,6 +147,12 @@ func str(v any) string {
 	}
 	return fmt.Sprint(v)
 }
+func bigIntToInt64(v *big.Int) int64 {
+	if v == nil {
+		return 0
+	}
+	return v.Int64()
+}
 func low(v string) string                   { return strings.ToLower(strings.TrimSpace(v)) }
 func (a *API) ok(c *fiber.Ctx, v any) error { return httpx.OK(c, v) }
 func (a *API) fail(c *fiber.Ctx, e error) error {
@@ -965,7 +971,7 @@ func (a *API) startAve(c *fiber.Ctx) error {
 	} else {
 		quotePriceUSD = pair["token0_price_usd"]
 	}
-	t := store.Token{UserID: id(d["userId"]), TokenAddress: target, CurveAddress: low(str(d["curveAddress"])), PoolID: normalizePoolID(poolID), Pair: normalizePoolID(poolID), Amm: str(d["amm"]), Currency0: c0, Currency1: c1, Fee: int(launched.PoolFee), TickSpacing: int(launched.TickSpacing), Hooks: low(a.Cfg.PonsExternalHooks), QuoteTokenAddress: pairToken, Name: strPtr(d["tokenName"]), Symbol: strPtr(d["tokenSymbol"]), TokenLogoURL: strPtr(d["tokenLogoUrl"]), QuoteTokenSymbol: strPtr(d["quoteTokenSymbol"]), QuoteTokenLogoURL: strPtr(d["quoteTokenLogoUrl"]), Decimals: tokenDecimalsPtr, MarketCap: strPtr(pair["market_cap"]), TokenPriceUsd: strPtr(func() any {
+	t := store.Token{UserID: id(d["userId"]), TokenAddress: target, CurveAddress: low(str(d["curveAddress"])), PoolID: normalizePoolID(poolID), Pair: normalizePoolID(poolID), Amm: str(d["amm"]), Currency0: c0, Currency1: c1, Fee: int(bigIntToInt64(launched.PoolFee)), TickSpacing: int(bigIntToInt64(launched.TickSpacing)), Hooks: low(a.Cfg.PonsExternalHooks), QuoteTokenAddress: pairToken, Name: strPtr(d["tokenName"]), Symbol: strPtr(d["tokenSymbol"]), TokenLogoURL: strPtr(d["tokenLogoUrl"]), QuoteTokenSymbol: strPtr(d["quoteTokenSymbol"]), QuoteTokenLogoURL: strPtr(d["quoteTokenLogoUrl"]), Decimals: tokenDecimalsPtr, MarketCap: strPtr(pair["market_cap"]), TokenPriceUsd: strPtr(func() any {
 		if targetIsToken0 {
 			return pair["token0_price_usd"]
 		}
@@ -983,7 +989,7 @@ func (a *API) startAve(c *fiber.Ctx) error {
 		return a.fail(c, err)
 	}
 	a.invalidateCache()
-	targetHop := routeHop{PoolID: normalizePoolID(poolID), Currency0: c0, Currency1: c1, Fee: int64(launched.PoolFee), TickSpacing: int64(launched.TickSpacing), Hooks: low(a.Cfg.PonsExternalHooks), TokenIn: pairToken, TokenOut: target, HookData: "0x"}
+	targetHop := routeHop{PoolID: normalizePoolID(poolID), Currency0: c0, Currency1: c1, Fee: bigIntToInt64(launched.PoolFee), TickSpacing: bigIntToInt64(launched.TickSpacing), Hooks: low(a.Cfg.PonsExternalHooks), TokenIn: pairToken, TokenOut: target, HookData: "0x"}
 	hops, ok := a.discoverNativeRoute(c.Context(), id(d["userId"]), target, normalizePoolID(poolID), pairToken, targetHop)
 	if !ok {
 		_ = a.Store.SetTokenEnabled(c.Context(), id(d["userId"]), target, false)

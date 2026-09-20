@@ -69,14 +69,16 @@ func aveTaxValue(item map[string]any, keys ...string) *string {
 	return nil
 }
 
-func pairValue(pair map[string]any, key string) any {
-	if v, ok := pair[key]; ok && v != nil {
-		return v
-	}
-	for _, containerKey := range []string{"rawData", "data", "pool"} {
-		if container, ok := pair[containerKey].(map[string]any); ok {
-			if v, exists := container[key]; exists && v != nil {
-				return v
+func pairValue(pair map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if v, ok := pair[key]; ok && v != nil {
+			return v
+		}
+		for _, containerKey := range []string{"rawData", "data", "pool"} {
+			if container, ok := pair[containerKey].(map[string]any); ok {
+				if v, exists := container[key]; exists && v != nil {
+					return v
+				}
 			}
 		}
 	}
@@ -200,7 +202,7 @@ func (a *API) resolveAveHop(ctx context.Context, pair map[string]any, tokenIn, t
 			}
 			calculated, err := chain.PoolID(map[string]any{"currency0": c0, "currency1": c1, "fee": launched.PoolFee, "tickSpacing": launched.TickSpacing, "hooks": a.Cfg.PonsExternalHooks})
 			if err == nil && strings.EqualFold(calculated, poolID) {
-				return routeHop{PoolID: poolID, Currency0: c0, Currency1: c1, Fee: int64(launched.PoolFee), TickSpacing: int64(launched.TickSpacing), Hooks: normalizeAddress(a.Cfg.PonsExternalHooks), TokenIn: normalizeAddress(tokenIn), TokenOut: normalizeAddress(tokenOut), HookData: "0x"}, true
+				return routeHop{PoolID: poolID, Currency0: c0, Currency1: c1, Fee: bigIntToInt64(launched.PoolFee), TickSpacing: bigIntToInt64(launched.TickSpacing), Hooks: normalizeAddress(a.Cfg.PonsExternalHooks), TokenIn: normalizeAddress(tokenIn), TokenOut: normalizeAddress(tokenOut), HookData: "0x"}, true
 			}
 		}
 	}
