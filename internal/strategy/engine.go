@@ -234,17 +234,17 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 				if ev.PoolID != "" && (ev.Amount0Raw != "" || ev.Amount1Raw != "") {
 					a0, _ := strconv.ParseFloat(ev.Amount0Raw, 64)
 					a1, _ := strconv.ParseFloat(ev.Amount1Raw, 64)
-					// PoolManager amounts are deltas from the pool's perspective:
-					// a negative token delta means the token was paid out (buy), a
-					// positive token delta means it was sold into the pool.
+					// V4 Swap amounts use the swapper's perspective: a positive
+					// token delta means the token was paid out (buy), while a
+					// negative token delta means it was sold into the pool.
 					amt := a1
 					quote := a0
 					if strings.EqualFold(t.Currency0, t.TokenAddress) {
 						amt, quote = a0, a1
 					}
-					if amt < 0 {
+					if amt > 0 {
 						copy.Side = "buy"
-					} else if amt > 0 {
+					} else if amt < 0 {
 						copy.Side = "sell"
 					}
 					copy.QuoteAmountRaw = math.Abs(quote)
