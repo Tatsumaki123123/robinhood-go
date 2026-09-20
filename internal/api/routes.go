@@ -74,7 +74,7 @@ func pairValue(pair map[string]any, keys ...string) any {
 		if v, ok := pair[key]; ok && v != nil {
 			return v
 		}
-		for _, containerKey := range []string{"rawData", "data", "pool"} {
+		for _, containerKey := range []string{"rawData", "data", "pool", "token_info", "tokenInfo", "token", "info", "stats", "extra", "result"} {
 			if container, ok := pair[containerKey].(map[string]any); ok {
 				if v, exists := container[key]; exists && v != nil {
 					return v
