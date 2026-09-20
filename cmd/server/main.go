@@ -54,6 +54,7 @@ func main() {
 	}
 	engine := strategy.New(st, rpc)
 	engine.ConfigureTrading(tr, cfg.EncryptionKey)
+	engine.ConfigureLogging(log, cfg.Env)
 	service.SetMonitorCacheInvalidator(engine.InvalidateMonitorCache)
 	go engine.Run(ctx)
 	go engine.Tick(ctx)

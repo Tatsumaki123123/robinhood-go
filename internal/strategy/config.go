@@ -311,10 +311,18 @@ func Parse(v map[string]any) Config {
 	return c
 }
 func (c Config) Rule(mcp float64) (TokenRule, bool) {
-	for _, r := range c.TokenConfig {
+	r, _, ok := c.RuleWithIndex(mcp)
+	return r, ok
+}
+
+// RuleWithIndex returns the first token rule that matches the market cap. The
+// index is useful for diagnostics because several rules can be configured for
+// one strategy.
+func (c Config) RuleWithIndex(mcp float64) (TokenRule, int, bool) {
+	for i, r := range c.TokenConfig {
 		if r.MaxMCP == 0 || mcp <= r.MaxMCP {
-			return r, true
+			return r, i, true
 		}
 	}
-	return TokenRule{}, false
+	return TokenRule{}, -1, false
 }

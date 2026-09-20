@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
 	"robinhood-go/internal/chain"
 	secret "robinhood-go/internal/crypto"
 	"robinhood-go/internal/store"
@@ -67,6 +68,8 @@ type position struct {
 type Engine struct {
 	Store *store.Store
 	RPC   *chain.RPC
+	log   *zap.Logger
+	dev   bool
 	locks sync.Map
 	// ExecuteAction is injected by the server when live strategy trading is
 	// enabled. It must return only after broadcast (or dry-run) and must not
@@ -88,6 +91,21 @@ type Engine struct {
 
 func New(s *store.Store, r *chain.RPC) *Engine {
 	return &Engine{Store: s, RPC: r, monitorUsers: make(map[int64]store.User), monitorTokens: make(map[int64][]store.Token)}
+}
+
+// ConfigureLogging enables the strategy diagnostics only for development
+// environments. Keeping the check in the engine prevents strategy event logs
+// from being emitted by production deployments even when a logger is present.
+func (e *Engine) ConfigureLogging(log *zap.Logger, env string) {
+	e.log = log
+	env = strings.ToLower(strings.TrimSpace(env))
+	e.dev = env == "dev" || env == "development"
+}
+
+func (e *Engine) devInfo(message string, fields ...zap.Field) {
+	if e.dev && e.log != nil {
+		e.log.Info(message, fields...)
+	}
 }
 
 func (e *Engine) ConfigureTrading(t *chain.Trading, encryptionKey string) {
@@ -155,6 +173,15 @@ func (e *Engine) Run(ctx context.Context) {
 
 func (e *Engine) processDecoded(ctx context.Context, raw map[string]any) {
 	if ev, ok := decodeEvent(raw); ok {
+		e.devInfo("监听到交易事件",
+			zap.String("eventKey", ev.Key),
+			zap.String("side", strings.ToLower(ev.Side)),
+			zap.String("token", ev.TokenAddress),
+			zap.String("curve", ev.CurveAddress),
+			zap.String("pool", ev.PoolID),
+			zap.Float64("quoteUSD", ev.QuoteUSD),
+			zap.Float64("price", ev.Price),
+		)
 		if ev.UserID > 0 {
 			_ = e.Process(ctx, ev)
 		} else {
@@ -666,10 +693,19 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 	if ev.MarketCap > 0 && ev.MarketCap < cfg.MinMCP {
 		return nil
 	}
-	rule, ok := cfg.Rule(ev.MarketCap)
+	rule, ruleIndex, ok := cfg.RuleWithIndex(ev.MarketCap)
 	if !ok {
 		return nil
 	}
+	e.devInfo("交易匹配策略配置",
+		zap.Int64("userID", ev.UserID),
+		zap.String("configName", cfg.Name),
+		zap.Int("ruleIndex", ruleIndex),
+		zap.Float64("ruleMaxMCP", rule.MaxMCP),
+		zap.Float64("marketCap", ev.MarketCap),
+		zap.String("token", ev.TokenAddress),
+		zap.String("curve", ev.CurveAddress),
+	)
 	p, err := e.loadPosition(ctx, ev)
 	if err != nil {
 		return err
@@ -688,6 +724,15 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 		return nil
 	}
 	if action, amount, reason := evaluate(cfg, rule, ev, p); action != "" && amount > 0 {
+		e.devInfo("策略决定执行交易",
+			zap.Int64("userID", ev.UserID),
+			zap.String("configName", cfg.Name),
+			zap.String("action", action),
+			zap.String("reason", reason),
+			zap.Float64("amount", amount),
+			zap.String("token", ev.TokenAddress),
+			zap.String("curve", ev.CurveAddress),
+		)
 		if action == "sell" && reason == "external_buy_signal" && cfg.ExternalBuySell.BuyAmountRatio > 0 {
 			rawEventToken := ev.TokenAmountText
 			if rawEventToken == "" {
@@ -1176,6 +1221,14 @@ func (e *Engine) applyOwnFill(ctx context.Context, ev Event, p position, cfg Con
 		}
 		_, _ = e.Store.DB.Exec(ctx, `INSERT INTO monitor_records(user_id,token_address,curve_address,type,token_amount_raw,quote_amount_raw,remain_token_amount_raw,remain_quote_amount_raw,reason,source_event_key,transaction_hash,created_at) VALUES($1,$2,$3,'sell',$4,$5,$6,$5,$7,$8,$9,now()) ON CONFLICT(source_event_key) DO NOTHING`, ev.UserID, ev.TokenAddress, ev.CurveAddress, sellRaw.String(), quoteRawText, remainRawText, actionReason, ev.Key, txHash)
 	}
+	e.devInfo("交易成交回执已确认",
+		zap.Int64("userID", ev.UserID),
+		zap.String("side", strings.ToLower(ev.Side)),
+		zap.String("reason", actionReason),
+		zap.String("transactionHash", txHash),
+		zap.String("token", ev.TokenAddress),
+		zap.String("curve", ev.CurveAddress),
+	)
 	return e.savePosition(ctx, ev, p)
 }
 
@@ -1571,6 +1624,15 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 		if amount <= 0 {
 			continue
 		}
+		e.devInfo("定时卖出触发",
+			zap.Int64("userID", ev.UserID),
+			zap.String("configName", c.Name),
+			zap.String("action", "sell"),
+			zap.String("reason", "scheduled_sell"),
+			zap.Float64("amount", amount),
+			zap.String("token", ev.TokenAddress),
+			zap.String("curve", ev.CurveAddress),
+		)
 		var pendingScheduled bool
 		if err := e.Store.DB.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM strategy_pending_actions WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND side='sell' AND reason='scheduled_sell' AND status='pending')`, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&pendingScheduled); err == nil && pendingScheduled {
 			continue
