@@ -412,7 +412,7 @@ func rawTokenPriceFromUSD(usdPrice float64, t store.Token) float64 {
 	return usdPrice / (math.Pow10(tokenDecimals-quoteDecimals) * quoteUSD)
 }
 
-func v4PriceImpact(sqrt, quoteRaw, tokenRaw float64, tokenIsCurrency0 bool) float64 {
+func v4PriceImpact(sqrt string, quoteRaw, tokenRaw float64, tokenIsCurrency0 bool) float64 {
 	if quoteRaw <= 0 || tokenRaw <= 0 {
 		return 0
 	}
@@ -1397,8 +1397,8 @@ func (e *Engine) reconcilePending(ctx context.Context) {
 		for _, raw := range logs {
 			if log, ok := raw.(map[string]any); ok {
 				decoded := chain.DecodeChainEvent(log)
-				if _, good := decodeEvent(decoded); good {
-					_ = e.processForMonitors(ctx, decoded)
+				if ev, good := decodeEvent(decoded); good {
+					_ = e.processForMonitors(ctx, ev)
 				}
 			}
 		}
