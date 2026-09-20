@@ -161,10 +161,9 @@ func PoolID(d map[string]any) (string, error) {
 		}
 		args = append(args, abi.Argument{Type: t})
 	}
-	// ABI uint24/int24 values use the native Go widths used by the V4
-	// structs (uint32/int32). Passing uint64/int64 makes go-ethereum reject
-	// the value with "cannot use uint64 as type ptr as argument".
-	b, err := args.Pack(c0, c1, uint32(ToBig(d["fee"]).Uint64()), int32(ToBig(d["tickSpacing"]).Int64()), hooks)
+	// This go-ethereum ABI version represents integer arguments as *big.Int,
+	// including uint24/int24. Passing native integers is rejected by Pack.
+	b, err := args.Pack(c0, c1, ToBig(d["fee"]), ToBig(d["tickSpacing"]), hooks)
 	if err != nil {
 		return "", err
 	}
