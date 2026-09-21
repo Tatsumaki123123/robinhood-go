@@ -29,14 +29,14 @@ const (
 type V4PoolKey struct {
 	Currency0   common.Address
 	Currency1   common.Address
-	Fee         uint32
-	TickSpacing int32
+	Fee         *big.Int
+	TickSpacing *big.Int
 	Hooks       common.Address
 }
 type V4PathKey struct {
 	IntermediateCurrency common.Address
-	Fee                  uint32
-	TickSpacing          int32
+	Fee                  *big.Int
+	TickSpacing          *big.Int
 	Hooks                common.Address
 	HookData             []byte
 }
@@ -100,7 +100,7 @@ func encodeV4Single(d map[string]any) (map[string]any, error) {
 	if recipient == (common.Address{}) {
 		recipient = common.HexToAddress(NativeAddress)
 	}
-	pool := V4PoolKey{c0, c1, uint32(ToBig(d["fee"]).Uint64()), int32(ToBig(d["tickSpacing"]).Int64()), h}
+	pool := V4PoolKey{c0, c1, ToBig(d["fee"]), ToBig(d["tickSpacing"]), h}
 	single := V4ExactInputSingle{pool, tokenIn == c0, amount, min, big.NewInt(0), hookData}
 	swapInput, err := abi.Arguments{{Type: singleType}}.Pack(single)
 	if err != nil {
@@ -176,7 +176,7 @@ func encodeV4Route(d map[string]any) (map[string]any, error) {
 		if strings.ToLower(c1.Hex()) < strings.ToLower(c0.Hex()) {
 			c0, c1 = c1, c0
 		}
-		pool := V4PoolKey{c0, c1, uint32(ToBig(h["fee"]).Uint64()), int32(ToBig(h["tickSpacing"]).Int64()), common.HexToAddress(fmt.Sprint(h["hooks"]))}
+		pool := V4PoolKey{c0, c1, ToBig(h["fee"]), ToBig(h["tickSpacing"]), common.HexToAddress(fmt.Sprint(h["hooks"]))}
 		poolIDs = append(poolIDs, mustPoolID(pool))
 		path = append(path, V4PathKey{intermediate, pool.Fee, pool.TickSpacing, pool.Hooks, bytesValue(h["hookData"])})
 		current = intermediate
