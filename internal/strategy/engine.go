@@ -1240,6 +1240,14 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 		amountRaw := integerRaw(amount)
 		first := stringValue(route["sourceToken"])
 		destination := stringValue(route["destinationToken"])
+		currencyIn := first
+		if len(hops) > 0 {
+			if firstHop, ok := hops[0].(map[string]any); ok {
+				if hopInput := stringValue(firstHop["tokenIn"]); hopInput != "" {
+					currencyIn = hopInput
+				}
+			}
+		}
 		targetQuotePriceEth := stringValue(route["targetQuotePriceEth"])
 		if targetQuotePriceEth == "" {
 			targetQuotePriceEth = quotePriceEthFromToken(t, e.nativeUSDPrice(ctx))
@@ -1274,6 +1282,7 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 			}
 		}
 		path := make([]any, 0, len(hops))
+		currencyOut := destination
 		for _, raw := range hops {
 			h, ok := raw.(map[string]any)
 			if !ok {
@@ -1283,6 +1292,7 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 			if intermediate == nil {
 				intermediate = h["tokenOut"]
 			}
+			currencyOut = stringValue(intermediate)
 			path = append(path, map[string]any{"intermediateCurrency": intermediate, "fee": h["fee"], "tickSpacing": h["tickSpacing"], "hooks": h["hooks"], "hookData": h["hookData"]})
 		}
 		if amountRaw == "0" {
@@ -1306,13 +1316,14 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 		}
 		e.devInfo("交易执行参数",
 			zap.String("action", side),
+			zap.String("currencyIn", currencyIn),
 			zap.String("amountInRaw", amountRaw),
 			zap.String("amountOutMinimumRaw", minOut),
 			zap.String("targetQuotePriceEth", targetQuotePriceEth),
 			zap.Int("quoteDecimals", quoteDecimals),
 			zap.String("token", ev.TokenAddress),
 		)
-		req := map[string]any{"currencyIn": first, "path": path, "amountInRaw": amountRaw, "amountOutMinimumRaw": minOut, "recipient": u.WalletAddress, "customRecipient": false, "privateKey": key, "wrapNative": side == "buy" && strings.EqualFold(first, chain.NativeAddress), "unwrapNative": side == "sell" && strings.EqualFold(destination, chain.NativeAddress)}
+		req := map[string]any{"currencyIn": currencyIn, "path": path, "amountInRaw": amountRaw, "amountOutMinimumRaw": minOut, "recipient": u.WalletAddress, "customRecipient": false, "privateKey": key, "wrapNative": side == "buy" && strings.EqualFold(first, chain.NativeAddress) && strings.EqualFold(currencyIn, chain.WrappedNativeAddress), "unwrapNative": side == "sell" && strings.EqualFold(destination, chain.NativeAddress) && strings.EqualFold(currencyOut, chain.WrappedNativeAddress)}
 		opts := chain.BroadcastOptions{}
 		if side == "buy" {
 			var pendingNonce *int64
