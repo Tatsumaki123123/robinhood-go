@@ -72,7 +72,7 @@ type Engine struct {
 	dev   bool
 	locks sync.Map
 	// ExecuteAction is injected by the server when live strategy trading is
-	// enabled. It must return only after broadcast (or dry-run) and must not
+	// enabled. It must return only after broadcast and must not
 	// mutate strategy state; own-chain fill events call applyOwnFill after a
 	// successful receipt. Keeping this hook optional preserves deterministic
 	// replay/testing of the strategy engine.
@@ -678,22 +678,6 @@ func rawFloat(value string) float64 {
 	return f
 }
 
-func scaleRawText(raw string, numerator, denominator float64) string {
-	if raw == "" || numerator <= 0 || denominator <= 0 {
-		return "0"
-	}
-	n, ok := new(big.Float).SetString(integerText(raw))
-	if !ok {
-		return "0"
-	}
-	n.Mul(n, new(big.Float).Quo(new(big.Float).SetFloat64(numerator), new(big.Float).SetFloat64(denominator)))
-	out, _ := n.Int(nil)
-	if out == nil || out.Sign() <= 0 {
-		return "0"
-	}
-	return out.String()
-}
-
 func rawRatio(raw string, ratio float64) string {
 	if raw == "" || ratio <= 0 || ratio > 1 {
 		return "0"
@@ -945,9 +929,6 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 				)
 				return execErr
 			}
-			if mode := strings.ToLower(fmt.Sprint(result["mode"])); mode == "dry-run" || mode == "simulated" {
-				return e.recordAction(ctx, ev, action, amount, reason)
-			}
 		} else if e.Trading != nil {
 			var execErr error
 			result, execErr = e.executeLive(ctx, ev, action, amount, cfg)
@@ -1149,9 +1130,6 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 			}
 		}
 		req := map[string]any{"currencyIn": first, "path": path, "amountInRaw": amountRaw, "amountOutMinimumRaw": minOut, "recipient": u.WalletAddress, "privateKey": key, "wrapNative": side == "buy" && strings.EqualFold(first, chain.NativeAddress), "unwrapNative": side == "sell" && strings.EqualFold(fmt.Sprint(route["destinationToken"]), chain.NativeAddress)}
-		if e.Trading.DryRun {
-			return e.Trading.Swap(ctx, req)
-		}
 		opts := chain.BroadcastOptions{}
 		if side == "buy" {
 			var pendingNonce *int64
@@ -1510,31 +1488,6 @@ func evaluate(c Config, r TokenRule, ev Event, p position) (string, float64, str
 	return "", 0, ""
 }
 
-func (e *Engine) recordAction(ctx context.Context, ev Event, side string, amount float64, reason string) error {
-	if amount <= 0 {
-		return nil
-	}
-	key := fmt.Sprintf("%d:%s:%s", ev.UserID, ev.Key, reason)
-	tokenRaw, quoteRaw := "0", "0"
-	if side == "buy" {
-		if ev.Price > 0 {
-			tokenRaw = integerRaw(amount / ev.Price * math.Pow10(ev.TokenDecimals))
-		}
-		if ev.QuoteAmountText != "" && ev.QuoteUSD > 0 {
-			quoteRaw = scaleRawText(ev.QuoteAmountText, amount, ev.QuoteUSD)
-		} else if ev.PriceRaw > 0 {
-			quoteRaw = integerRaw(rawFloat(tokenRaw) * ev.PriceRaw)
-		}
-	} else if ev.PriceRaw > 0 {
-		tokenRaw = integerRaw(amount)
-		quoteRaw = integerRaw(amount * ev.PriceRaw)
-	} else {
-		tokenRaw = integerRaw(amount)
-	}
-	_, err := e.Store.DB.Exec(ctx, `INSERT INTO monitor_records(user_id,token_address,curve_address,type,token_amount_raw,quote_amount_raw,remain_token_amount_raw,remain_quote_amount_raw,reason,source_event_key,created_at) VALUES($1,$2,$3,$4,$5,$6,$5,$6,$7,$8,now()) ON CONFLICT(source_event_key) DO NOTHING`, ev.UserID, ev.TokenAddress, ev.CurveAddress, side, tokenRaw, quoteRaw, reason, key)
-	return err
-}
-
 func (e *Engine) savePendingAction(ctx context.Context, hash string, ev Event, side string, amount float64, reason string) error {
 	hash = strings.Split(hash, ":")[0]
 	var alreadyFilled bool
@@ -1834,20 +1787,10 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 				continue
 			}
 		}
-		mode := strings.ToLower(fmt.Sprint(result["mode"]))
-		confirmedOrSimulated := mode == "dry-run" || mode == "simulated"
-		if mode == "dry-run" || mode == "simulated" {
-			if e.recordAction(ctx, ev, "sell", amount, "scheduled_sell") != nil {
-				continue
-			}
-		} else if hash := firstString(result, "transactionHash", "hash"); hash != "" {
+		if hash := firstString(result, "transactionHash", "hash"); hash != "" {
 			if e.savePendingAction(ctx, hash, ev, "sell", amount, "scheduled_sell") != nil {
 				continue
 			}
-		}
-		if confirmedOrSimulated {
-			n := time.Now().Add(time.Duration(c.ScheduledSell.IntervalSecond) * time.Second)
-			p.NextScheduled = &n
 		}
 		_ = e.savePosition(ctx, ev, p)
 	}

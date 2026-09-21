@@ -35,8 +35,7 @@ func main() {
 	}
 	rpc := chain.New(cfg.RPCURL, cfg.RPCWSURL)
 	rd := redis.NewClient(&redis.Options{Addr: redisAddr(cfg.RedisURL)})
-	dryRun := os.Getenv("UNISWAP_V4_TRADING_DRY_RUN") == "true" || os.Getenv("PONS_V2_TRADING_DRY_RUN") == "true"
-	tr := &chain.Trading{RPC: rpc, ChainID: cfg.ChainID, DryRun: dryRun, Router: cfg.UniversalRouter, Permit2: cfg.Permit2}
+	tr := &chain.Trading{RPC: rpc, ChainID: cfg.ChainID, Router: cfg.UniversalRouter, Permit2: cfg.Permit2}
 	app := fiber.New(fiber.Config{AppName: "Robinhood Go", BodyLimit: 32 * 1024 * 1024, ErrorHandler: func(c *fiber.Ctx, e error) error {
 		return c.Status(500).JSON(map[string]any{"statusCode": 500, "message": e.Error()})
 	}})

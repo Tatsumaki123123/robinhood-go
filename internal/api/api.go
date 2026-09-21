@@ -1402,14 +1402,11 @@ func (a *API) ponsSwap(c *fiber.Ctx, buy bool) error {
 	if slip < 0 || slip > 5000 {
 		return httpx.Error(c, 400, "slippageBps must be between 0 and 5000")
 	}
-	var out, spent, refund *big.Int
-	clamped := false
+	var out *big.Int
 	if buy {
-		out, spent, refund, clamped = chain.PonsBuyQuote(state, in)
+		out, _, _, _ = chain.PonsBuyQuote(state, in)
 	} else {
 		out = chain.PonsSellQuote(state, in)
-		spent = in
-		refund = big.NewInt(0)
 	}
 	min := new(big.Int).Div(new(big.Int).Mul(out, new(big.Int).Sub(big.NewInt(10000), big.NewInt(slip))), big.NewInt(10000))
 	data, e := func() ([]byte, error) {
@@ -1421,16 +1418,13 @@ func (a *API) ponsSwap(c *fiber.Ctx, buy bool) error {
 	if e != nil {
 		return a.fail(c, e)
 	}
-	if key := str(d["privateKey"]); key != "" && !a.Trading.DryRun {
+	if key := str(d["privateKey"]); key != "" {
 		exec := map[string]any{"curveAddress": curve, "tokenAddress": token, "recipient": recipient, "privateKey": key, "amountRaw": in.String(), "slippageBps": slip}
 		v, te := a.Trading.PonsSwap(c.Context(), exec, buy)
 		if te != nil {
 			return a.fail(c, te)
 		}
 		return a.ok(c, v)
-	}
-	if a.Trading.DryRun {
-		return a.ok(c, map[string]any{"mode": "dry-run", "side": map[bool]string{true: "buy", false: "sell"}[buy], "wallet": strings.ToLower(recipient), "recipient": strings.ToLower(recipient), "curveAddress": strings.ToLower(curve), "tokenAddress": strings.ToLower(token), "pairToken": strings.ToLower(state.PairToken.Hex()), "quoteInRaw": map[bool]string{true: in.String(), false: ""}[buy], "tokensInRaw": map[bool]string{true: "", false: in.String()}[buy], "expectedTokensOutRaw": map[bool]string{true: out.String(), false: ""}[buy], "expectedQuoteOutRaw": map[bool]string{true: "", false: out.String()}[buy], "minimumAmountOutRaw": min.String(), "spentRaw": spent.String(), "refundRaw": refund.String(), "clamped": clamped, "transactionHash": nil, "to": curve, "data": "0x" + hex.EncodeToString(data)})
 	}
 	return a.ok(c, map[string]any{"mode": "calldata-preview", "side": map[bool]string{true: "buy", false: "sell"}[buy], "to": curve, "data": "0x" + hex.EncodeToString(data), "valueRaw": map[bool]string{true: in.String(), false: "0"}[buy], "amountOutMinimumRaw": min.String(), "expectedAmountOutRaw": out.String(), "recipient": strings.ToLower(recipient)})
 }

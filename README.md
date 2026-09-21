@@ -33,9 +33,8 @@ docker compose -f docker-compose.yml up -d --build
 `docker compose -f <compose-file> down -v`。
 
 The API is available at `http://localhost:3000/api/v1`. PostgreSQL migrations run when
-the application starts. Set `UNISWAP_V4_TRADING_DRY_RUN=true` while configuring routes or
-RPC credentials; set it to `false` only after the wallet, RPC and contract settings are
-ready. WebSocket chain events are available at `/ws`.
+the application starts. Configure the wallet, RPC and contract settings before enabling
+live trading. WebSocket chain events are available at `/ws`.
 
 AVE 请求优先读取数据库 `ave_configs`（`id=1`）的 `x_auth`，未保存时使用
 `AVE_X_AUTH`。token 为空、收到 HTTP 401/403 或 AVE 状态码 10000/10001 时，

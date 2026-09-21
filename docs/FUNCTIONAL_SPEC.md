@@ -54,7 +54,7 @@ RobinhoodGo 是原 NestJS/Prisma Robinhood 链上交易服务的 Go 后端替代
 
 Pons V2 的 `quote/buy/sell` 与 Uniswap V4 的 `quote/buy/sell/route/quote/route/swap`
 均已注册。V4 单跳和 1--3 跳 route 会生成 Universal Router `execute` calldata，支持
-wrap/unwrap ETH、custom recipient 和 Permit2/ERC-20 allowance；关闭 dry-run 后交易会
+wrap/unwrap ETH、custom recipient 和 Permit2/ERC-20 allowance；交易会
 签名、广播并等待 receipt。策略日志不会记录私钥；生产环境应由内部策略调用而不是把
 私钥暴露给公网。
 

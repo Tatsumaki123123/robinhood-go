@@ -261,8 +261,8 @@ func (t *Trading) PonsSwap(ctx context.Context, d map[string]any, buy bool) (map
 		return nil, err
 	}
 	keyText := strings.TrimPrefix(fmt.Sprint(d["privateKey"]), "0x")
-	if t.DryRun || keyText == "" {
-		return map[string]any{"mode": map[bool]string{true: "dry-run", false: "calldata-preview"}[t.DryRun], "side": map[bool]string{true: "buy", false: "sell"}[buy], "curveAddress": strings.ToLower(curve), "tokenAddress": strings.ToLower(fmt.Sprint(d["tokenAddress"])), "pairToken": strings.ToLower(state.PairToken.Hex()), "quoteInRaw": map[bool]string{true: amount.String(), false: ""}[buy], "tokensInRaw": map[bool]string{true: "", false: amount.String()}[buy], "expectedTokensOutRaw": map[bool]string{true: out.String(), false: ""}[buy], "expectedQuoteOutRaw": map[bool]string{true: "", false: out.String()}[buy], "minimumAmountOutRaw": min.String(), "spentRaw": spent.String(), "refundRaw": refund.String(), "clamped": clamped, "transactionHash": nil, "to": curve, "data": "0x" + hex.EncodeToString(data)}, nil
+	if keyText == "" {
+		return map[string]any{"mode": "calldata-preview", "side": map[bool]string{true: "buy", false: "sell"}[buy], "curveAddress": strings.ToLower(curve), "tokenAddress": strings.ToLower(fmt.Sprint(d["tokenAddress"])), "pairToken": strings.ToLower(state.PairToken.Hex()), "quoteInRaw": map[bool]string{true: amount.String(), false: ""}[buy], "tokensInRaw": map[bool]string{true: "", false: amount.String()}[buy], "expectedTokensOutRaw": map[bool]string{true: out.String(), false: ""}[buy], "expectedQuoteOutRaw": map[bool]string{true: "", false: out.String()}[buy], "minimumAmountOutRaw": min.String(), "spentRaw": spent.String(), "refundRaw": refund.String(), "clamped": clamped, "transactionHash": nil, "to": curve, "data": "0x" + hex.EncodeToString(data)}, nil
 	}
 	key, err := gethcrypto.HexToECDSA(keyText)
 	if err != nil {

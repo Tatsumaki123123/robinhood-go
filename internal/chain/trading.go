@@ -19,7 +19,6 @@ import (
 type Trading struct {
 	RPC     *RPC
 	ChainID int64
-	DryRun  bool
 	Router  string
 	Permit2 string
 }
@@ -98,7 +97,6 @@ func (t *Trading) Quote(ctx context.Context, d map[string]any) (map[string]any, 
 			if t.Router != "" {
 				prepared["router"] = t.Router
 			}
-			prepared["dryRun"] = t.DryRun
 			return prepared, nil
 		}
 		path, ok := d["path"].([]any)
@@ -122,7 +120,7 @@ func (t *Trading) Quote(ctx context.Context, d map[string]any) (map[string]any, 
 			}
 			d["currencyIn"] = h["intermediateCurrency"]
 		}
-		return map[string]any{"mode": "calldata-preview", "router": d["router"], "poolManager": d["poolManager"], "poolIds": poolIDs, "hopCount": len(poolIDs), "amountInRaw": ToBig(d["amountInRaw"]).String(), "amountOutMinimumRaw": ToBig(d["amountOutMinimumRaw"]).String(), "recipient": d["recipient"], "deadline": d["deadline"], "valueRaw": ToBig(d["valueRaw"]).String(), "calldata": d["calldata"], "approvals": d["approvals"], "dryRun": t.DryRun}, nil
+		return map[string]any{"mode": "calldata-preview", "router": d["router"], "poolManager": d["poolManager"], "poolIds": poolIDs, "hopCount": len(poolIDs), "amountInRaw": ToBig(d["amountInRaw"]).String(), "amountOutMinimumRaw": ToBig(d["amountOutMinimumRaw"]).String(), "recipient": d["recipient"], "deadline": d["deadline"], "valueRaw": ToBig(d["valueRaw"]).String(), "calldata": d["calldata"], "approvals": d["approvals"]}, nil
 	}
 	if d["tokenIn"] != nil && d["tokenOut"] != nil && d["currency0"] != nil {
 		prepared, err := encodeV4Single(d)
@@ -130,7 +128,6 @@ func (t *Trading) Quote(ctx context.Context, d map[string]any) (map[string]any, 
 			return nil, err
 		}
 		prepared["mode"] = "calldata-preview"
-		prepared["dryRun"] = t.DryRun
 		return prepared, nil
 	}
 	// Uniswap V4 quotes are deterministic calldata previews.  Compute the
@@ -143,7 +140,7 @@ func (t *Trading) Quote(ctx context.Context, d map[string]any) (map[string]any, 
 	}
 	amountIn := ToBig(d["amountInRaw"])
 	minOut := ToBig(d["amountOutMinimumRaw"])
-	return map[string]any{"mode": "calldata-preview", "router": d["router"], "poolManager": d["poolManager"], "poolId": poolID, "tokenIn": strings.ToLower(fmt.Sprint(d["tokenIn"])), "tokenOut": strings.ToLower(fmt.Sprint(d["tokenOut"])), "amountInRaw": amountIn.String(), "amountOutMinimumRaw": minOut.String(), "recipient": strings.ToLower(fmt.Sprint(d["recipient"])), "deadline": d["deadline"], "valueRaw": ToBig(d["valueRaw"]).String(), "calldata": d["calldata"], "approvals": d["approvals"], "dryRun": t.DryRun, "request": d, "quotedAt": time.Now().UTC()}, nil
+	return map[string]any{"mode": "calldata-preview", "router": d["router"], "poolManager": d["poolManager"], "poolId": poolID, "tokenIn": strings.ToLower(fmt.Sprint(d["tokenIn"])), "tokenOut": strings.ToLower(fmt.Sprint(d["tokenOut"])), "amountInRaw": amountIn.String(), "amountOutMinimumRaw": minOut.String(), "recipient": strings.ToLower(fmt.Sprint(d["recipient"])), "deadline": d["deadline"], "valueRaw": ToBig(d["valueRaw"]).String(), "calldata": d["calldata"], "approvals": d["approvals"], "request": d, "quotedAt": time.Now().UTC()}, nil
 }
 
 // PoolID implements keccak256(abi.encode(PoolKey)) for the V4 static PoolKey.
@@ -189,11 +186,6 @@ func (t *Trading) Swap(ctx context.Context, d map[string]any) (map[string]any, e
 		if t.Router != "" {
 			prepared["router"] = t.Router
 		}
-		if t.DryRun {
-			prepared["mode"] = "dry-run"
-			prepared["transactionHash"] = nil
-			return prepared, nil
-		}
 		if d["to"] == nil {
 			d["to"] = prepared["router"]
 		}
@@ -204,13 +196,10 @@ func (t *Trading) Swap(ctx context.Context, d map[string]any) (map[string]any, e
 			d["value"] = prepared["valueRaw"]
 		}
 	}
-	if t.DryRun {
-		return map[string]any{"status": "simulated", "dryRun": true, "request": d}, nil
-	}
 	to, _ := d["to"].(string)
 	keyText := strings.TrimPrefix(fmt.Sprint(d["privateKey"]), "0x")
 	if to == "" || keyText == "" {
-		return nil, fmt.Errorf("to and privateKey are required when dry-run is disabled")
+		return nil, fmt.Errorf("to and privateKey are required")
 	}
 	key, err := gethcrypto.HexToECDSA(keyText)
 	if err != nil {
@@ -302,9 +291,6 @@ func (t *Trading) Swap(ctx context.Context, d map[string]any) (map[string]any, e
 // WaitReceipt. This keeps the WSS event loop free while preserving the Node
 // service's pending replacement semantics.
 func (t *Trading) BroadcastV4(ctx context.Context, d map[string]any, opts BroadcastOptions) (BroadcastResult, error) {
-	if t.DryRun {
-		return BroadcastResult{}, fmt.Errorf("cannot broadcast in dry-run mode")
-	}
 	keyText := strings.TrimPrefix(fmt.Sprint(d["privateKey"]), "0x")
 	if keyText == "" {
 		return BroadcastResult{}, fmt.Errorf("privateKey is required")
