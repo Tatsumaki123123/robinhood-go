@@ -174,9 +174,24 @@ func (e *Engine) Run(ctx context.Context) {
 func (e *Engine) processDecoded(ctx context.Context, raw map[string]any) {
 	if ev, ok := decodeEvent(raw); ok {
 		if ev.UserID > 0 {
-			_ = e.Process(ctx, ev)
+			if err := e.Process(ctx, ev); err != nil {
+				e.devInfo("策略处理失败",
+					zap.Error(err),
+					zap.Int64("userID", ev.UserID),
+					zap.String("side", strings.ToLower(ev.Side)),
+					zap.String("token", ev.TokenAddress),
+					zap.String("curve", ev.CurveAddress),
+				)
+			}
 		} else {
-			_ = e.processForMonitors(ctx, ev)
+			if err := e.processForMonitors(ctx, ev); err != nil {
+				e.devInfo("策略监听处理失败",
+					zap.Error(err),
+					zap.String("side", strings.ToLower(ev.Side)),
+					zap.String("token", ev.TokenAddress),
+					zap.String("curve", ev.CurveAddress),
+				)
+			}
 		}
 	}
 }
@@ -890,8 +905,22 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 			// original one-shot transaction behavior even when the strategy flag
 			// is enabled.
 			accepted, pe := e.persistPendingBuy(ctx, ev, amount, cfg.ReplacePending && ev.PoolID != "")
-			if pe != nil || !accepted {
+			if pe != nil {
+				e.devInfo("交易未执行",
+					zap.Error(pe),
+					zap.String("reason", "persist_pending_buy_failed"),
+					zap.String("action", action),
+					zap.String("token", ev.TokenAddress),
+				)
 				return pe
+			}
+			if !accepted {
+				e.devInfo("交易未执行",
+					zap.String("reason", "pending_buy_not_accepted"),
+					zap.Bool("replacePending", cfg.ReplacePending),
+					zap.String("token", ev.TokenAddress),
+				)
+				return nil
 			}
 		}
 		if reason == "external_buy_signal" && cfg.ExternalBuySell.CooldownSecond > 0 {
@@ -908,6 +937,12 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 			if execErr != nil {
 				// Keep the pending buy row for reconciliation/replacement and do
 				// not claim a successful sell before its receipt is confirmed.
+				e.devInfo("交易执行失败",
+					zap.Error(execErr),
+					zap.String("action", action),
+					zap.String("reason", reason),
+					zap.String("token", ev.TokenAddress),
+				)
 				return execErr
 			}
 			if mode := strings.ToLower(fmt.Sprint(result["mode"])); mode == "dry-run" || mode == "simulated" {
@@ -917,9 +952,28 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 			var execErr error
 			result, execErr = e.executeLive(ctx, ev, action, amount, cfg)
 			if execErr != nil {
+				e.devInfo("交易执行失败",
+					zap.Error(execErr),
+					zap.String("action", action),
+					zap.String("reason", reason),
+					zap.String("token", ev.TokenAddress),
+				)
 				return execErr
 			}
+		} else {
+			e.devInfo("交易未执行",
+				zap.String("reason", "trading_not_configured"),
+				zap.String("action", action),
+				zap.String("token", ev.TokenAddress),
+			)
+			return nil
 		}
+		e.devInfo("交易执行结果",
+			zap.String("action", action),
+			zap.String("mode", strings.ToLower(fmt.Sprint(result["mode"]))),
+			zap.String("transactionHash", firstString(result, "transactionHash", "hash")),
+			zap.String("token", ev.TokenAddress),
+		)
 		// Live broadcasts are intents. The position and sell counters are
 		// updated only by applyOwnFill after a confirmed chain event.
 		if hash := firstString(result, "transactionHash", "hash"); hash != "" {
