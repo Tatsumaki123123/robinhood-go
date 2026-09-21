@@ -669,7 +669,7 @@ func (a *API) tokenAdd(c *fiber.Ctx) error {
 	}
 	quoteDecimals := intPtr(d["quoteDecimals"])
 	if quoteDecimals == nil && a.RPC != nil && !strings.EqualFold(quote, chain.NativeAddress) {
-		if decimals, de := a.RPC.ERC20Decimals(quote); de == nil {
+		if decimals, de := a.RPC.ERC20Decimals(c.Context(), quote); de == nil {
 			quoteDecimals = &decimals
 		}
 	}
