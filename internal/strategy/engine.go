@@ -1895,7 +1895,7 @@ func (e *Engine) applyOwnFill(ctx context.Context, ev Event, cfg Config) error {
 	current.QuoteSpentRaw = remainQuote.String()
 	current.CostUSDScaledRaw = remainCost.String()
 	if remainToken.Sign() > 0 {
-		current.AverageCost = scaledAverageUSD(remainCost, remainToken, ev.TokenDecimals)
+		current.AverageCost = scaledAverageUSD(&remainCost, &remainToken, ev.TokenDecimals)
 	} else {
 		current.AverageCost = 0
 	}
@@ -1903,7 +1903,7 @@ func (e *Engine) applyOwnFill(ctx context.Context, ev Event, cfg Config) error {
 	gasFeeNativeRaw := receiptGasFee(ev.GasUsedRaw, ev.EffectiveGasPriceRaw)
 
 	remainCostText := remainCost.String()
-	if _, err = tx.QueryRow(ctx, `INSERT INTO monitor_records(user_id,token_address,curve_address,type,token_amount_raw,quote_amount_raw,remain_token_amount_raw,remain_quote_amount_raw,remain_cost_usd_raw,average_cost_usd_raw,price_numerator,price_denominator,transaction_hash,reason,source_event_key,realized_quote_amount_raw,realized_pnl_quote_raw,gas_fee_native_raw,sell_count,profit_sell_level,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,now()) ON CONFLICT(source_event_key) DO NOTHING RETURNING id`, ev.UserID, ev.TokenAddress, ev.CurveAddress, strings.ToLower(ev.Side), tokenRaw.String(), quoteRaw.String(), remainToken.String(), remainQuote.String(), remainCostText, scaledUSDText(current.AverageCost), priceNumerator, priceDenominator, txHash, actionReason, ev.Key, func() string {
+	if err = tx.QueryRow(ctx, `INSERT INTO monitor_records(user_id,token_address,curve_address,type,token_amount_raw,quote_amount_raw,remain_token_amount_raw,remain_quote_amount_raw,remain_cost_usd_raw,average_cost_usd_raw,price_numerator,price_denominator,transaction_hash,reason,source_event_key,realized_quote_amount_raw,realized_pnl_quote_raw,gas_fee_native_raw,sell_count,profit_sell_level,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,now()) ON CONFLICT(source_event_key) DO NOTHING RETURNING id`, ev.UserID, ev.TokenAddress, ev.CurveAddress, strings.ToLower(ev.Side), tokenRaw.String(), quoteRaw.String(), remainToken.String(), remainQuote.String(), remainCostText, scaledUSDText(current.AverageCost), priceNumerator, priceDenominator, txHash, actionReason, ev.Key, func() string {
 		if strings.ToLower(ev.Side) == "sell" {
 			return quoteRaw.String()
 		}
@@ -2239,19 +2239,30 @@ func (e *Engine) reconcilePending(ctx context.Context) {
 	if e.RPC == nil || e.Store == nil {
 		return
 	}
-	rows, err := e.Store.DB.Query(ctx, `SELECT transaction_hash FROM strategy_pending_buys WHERE status IN ('pending','confirmed_pending_accounting') AND transaction_hash IS NOT NULL UNION SELECT transaction_hash FROM strategy_buy_attempts WHERE status='pending' UNION SELECT transaction_hash FROM strategy_pending_actions WHERE status='pending'`)
+	type pendingReceipt struct {
+		hash   string
+		userID int64
+		token  string
+		curve  string
+	}
+	rows, err := e.Store.DB.Query(ctx, `SELECT transaction_hash,user_id,token_address,curve_address FROM strategy_pending_buys WHERE status IN ('pending','confirmed_pending_accounting') AND transaction_hash IS NOT NULL UNION SELECT transaction_hash,user_id,token_address,curve_address FROM strategy_buy_attempts WHERE status='pending' UNION SELECT transaction_hash,user_id,token_address,curve_address FROM strategy_pending_actions WHERE status='pending'`)
 	if err != nil {
 		return
 	}
 	defer rows.Close()
-	hashes := map[string]struct{}{}
+	hashes := map[string]pendingReceipt{}
 	for rows.Next() {
-		var hash string
-		if rows.Scan(&hash) == nil && hash != "" {
-			hashes[hash] = struct{}{}
+		var item pendingReceipt
+		if rows.Scan(&item.hash, &item.userID, &item.token, &item.curve) == nil && item.hash != "" {
+			hashes[item.hash] = item
 		}
 	}
-	for hash := range hashes {
+	for hash, pending := range hashes {
+		// A pending row is durable proof that this transaction was broadcast by
+		// this strategy position. Cache that ownership before replaying receipt
+		// logs so a delayed/missing transaction `from` field cannot turn our fill
+		// into a market event and leave reconciliation retrying forever.
+		e.cacheOwnTransaction(hash, pending.userID, pending.token, pending.curve, 10*time.Minute)
 		receipt, re := e.RPC.Receipt(ctx, hash)
 		if re != nil || receipt == nil {
 			continue
