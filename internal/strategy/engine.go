@@ -79,7 +79,6 @@ type Engine struct {
 	ExecuteAction func(context.Context, Event, string, float64) (map[string]any, error)
 	Trading       *chain.Trading
 	EncryptionKey string
-	prices        sync.Map // pool/curve key -> last observed execution price
 	supplies      sync.Map // token address -> cached total supply raw
 	curveBlocks   sync.Map // curve address -> last polled block
 	pollMu        sync.Mutex
@@ -209,11 +208,6 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 		tokenSnapshot[uid] = append([]store.Token(nil), tokens...)
 	}
 	e.monitorMu.RUnlock()
-	// Compute the adjacent-event price change once per pool event.  Updating
-	// the shared price map inside every user's copy made the first monitored
-	// user see the drop while all later users saw zero change.
-	var eventPriceChange float64
-	var eventPriceReady bool
 	for _, u := range users {
 		tokens := tokenSnapshot[u.UserID]
 		for _, t := range tokens {
@@ -282,22 +276,7 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 						copy.PriceImpactRatio = v4PriceImpact(ev.SqrtPriceX96, copy.QuoteAmountRaw, copy.TokenAmountRaw, strings.EqualFold(t.Currency0, t.TokenAddress))
 						copy.Impact = copy.PriceImpactRatio
 					}
-					if copy.Price > 0 && !eventPriceReady {
-						priceKey := strings.ToLower(copy.PoolID)
-						if priceKey == "" {
-							priceKey = strings.ToLower(copy.CurveAddress)
-						}
-						if old, loaded := e.prices.LoadOrStore(priceKey, copy.Price); loaded {
-							if previous, ok := old.(float64); ok && previous > 0 {
-								eventPriceChange = copy.Price/previous - 1
-							}
-							e.prices.Store(priceKey, copy.Price)
-						}
-						eventPriceReady = true
-					}
-					if ev.PriceChangeRatio == 0 && eventPriceReady {
-						copy.PriceChangeRatio = eventPriceChange
-					}
+					copy.PriceChangeRatio = copy.PriceImpactRatio
 					_ = e.Process(ctx, copy)
 				} else {
 					if ev.SqrtPriceX96 != "" {
@@ -314,22 +293,7 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 					if marketCap := marketCapFromEvent(copy, t); marketCap > 0 {
 						copy.MarketCap = marketCap
 					}
-					if copy.Price > 0 && !eventPriceReady {
-						priceKey := strings.ToLower(copy.PoolID)
-						if priceKey == "" {
-							priceKey = strings.ToLower(copy.CurveAddress)
-						}
-						if old, loaded := e.prices.LoadOrStore(priceKey, copy.Price); loaded {
-							if previous, ok := old.(float64); ok && previous > 0 {
-								eventPriceChange = copy.Price/previous - 1
-							}
-							e.prices.Store(priceKey, copy.Price)
-						}
-						eventPriceReady = true
-					}
-					if ev.PriceChangeRatio == 0 && eventPriceReady {
-						copy.PriceChangeRatio = eventPriceChange
-					}
+					copy.PriceChangeRatio = copy.PriceImpactRatio
 					_ = e.Process(ctx, copy)
 				}
 			}
@@ -779,6 +743,9 @@ func firstFloat(m map[string]any, keys ...string) float64 {
 }
 
 func (e *Engine) Process(ctx context.Context, ev Event) error {
+	// Price change is the current swap's signed impact. It must not depend on
+	// a previous event observed by this process.
+	ev.PriceChangeRatio = ev.PriceImpactRatio
 	key := fmt.Sprintf("%d:%s:%s", ev.UserID, strings.ToLower(ev.TokenAddress), strings.ToLower(ev.CurveAddress))
 	muI, _ := e.locks.LoadOrStore(key, &sync.Mutex{})
 	mu := muI.(*sync.Mutex)
