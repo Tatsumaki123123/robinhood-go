@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
 	"robinhood-go/internal/chain"
 	secret "robinhood-go/internal/crypto"
@@ -23,32 +24,36 @@ import (
 // accepts both the legacy short names and the names emitted by the Node
 // listener (quoteAmountRaw, priceImpactRatio, blockNumber).
 type Event struct {
-	Key              string    `json:"sourceEventKey"`
-	UserID           int64     `json:"userId"`
-	TokenAddress     string    `json:"tokenAddress"`
-	CurveAddress     string    `json:"curveAddress"`
-	PoolID           string    `json:"poolId"`
-	Amount0Raw       string    `json:"amount0Raw"`
-	Amount1Raw       string    `json:"amount1Raw"`
-	Side             string    `json:"side"`
-	QuoteUSD         float64   `json:"quoteUSD"`
-	QuoteAmountRaw   float64   `json:"quoteAmountRaw"`
-	TokenAmountRaw   float64   `json:"tokenAmountRaw"`
-	QuoteAmountText  string    `json:"-"`
-	TokenAmountText  string    `json:"-"`
-	Impact           float64   `json:"impact"`
-	PriceImpactRatio float64   `json:"priceImpactRatio"`
-	PriceChangeRatio float64   `json:"priceChangeRatio"`
-	SqrtPriceX96     string    `json:"sqrtPriceX96"`
-	Price            float64   `json:"price"`
-	PriceRaw         float64   `json:"priceRaw"`
-	TokenDecimals    int       `json:"tokenDecimals"`
-	QuoteDecimals    int       `json:"quoteDecimals"`
-	MarketCap        float64   `json:"marketCap"`
-	Block            string    `json:"block"`
-	Own              bool      `json:"own"`
-	Sender           string    `json:"sender"`
-	ReceivedAt       time.Time `json:"receivedAt"`
+	Key                  string    `json:"sourceEventKey"`
+	UserID               int64     `json:"userId"`
+	TokenAddress         string    `json:"tokenAddress"`
+	CurveAddress         string    `json:"curveAddress"`
+	PoolID               string    `json:"poolId"`
+	Amount0Raw           string    `json:"amount0Raw"`
+	Amount1Raw           string    `json:"amount1Raw"`
+	Side                 string    `json:"side"`
+	QuoteUSD             float64   `json:"quoteUSD"`
+	QuoteAmountRaw       float64   `json:"quoteAmountRaw"`
+	TokenAmountRaw       float64   `json:"tokenAmountRaw"`
+	QuoteAmountText      string    `json:"-"`
+	TokenAmountText      string    `json:"-"`
+	QuoteUSDPrice        string    `json:"-"`
+	Impact               float64   `json:"impact"`
+	PriceImpactRatio     float64   `json:"priceImpactRatio"`
+	PriceChangeRatio     float64   `json:"priceChangeRatio"`
+	SqrtPriceX96         string    `json:"sqrtPriceX96"`
+	Price                float64   `json:"price"`
+	PriceRaw             float64   `json:"priceRaw"`
+	TokenDecimals        int       `json:"tokenDecimals"`
+	QuoteDecimals        int       `json:"quoteDecimals"`
+	MarketCap            float64   `json:"marketCap"`
+	Block                string    `json:"block"`
+	Own                  bool      `json:"own"`
+	Sender               string    `json:"sender"`
+	TransactionFrom      string    `json:"-"`
+	GasUsedRaw           string    `json:"-"`
+	EffectiveGasPriceRaw string    `json:"-"`
+	ReceivedAt           time.Time `json:"receivedAt"`
 	// ExecutionAmountRaw is an internal exact quantity hint for sell actions;
 	// it is never serialized as part of the public event contract.
 	ExecutionAmountRaw string `json:"-"`
@@ -60,6 +65,8 @@ type position struct {
 	// by the existing strategy arithmetic and API-compatible callbacks.
 	AmountRaw                                          string
 	Amount, AverageCost, FirstPrice, LastPrice         float64
+	QuoteSpentRaw                                      string
+	CostUSDScaledRaw                                   string
 	BuyCount, SellCount, ProfitLevel                   int
 	PendingSell                                        bool
 	FirstBought, NextScheduled, CooldownUntil, LastBuy *time.Time
@@ -88,6 +95,9 @@ type Engine struct {
 	monitorTokens  map[int64][]store.Token
 	monitorAt      time.Time
 	monitorLoadMu  sync.Mutex
+	ownCache       sync.Map // ownership key -> time.Time; positive results only
+	ownCacheMu     sync.Mutex
+	ownCacheSweep  time.Time
 }
 
 func New(s *store.Store, r *chain.RPC) *Engine {
@@ -118,7 +128,7 @@ func (e *Engine) ConfigureTrading(t *chain.Trading, encryptionKey string, native
 
 // InvalidateMonitorCache is called by the HTTP mutation handlers after a
 // user/token change so the next WSS event observes the new switch immediately
-// instead of waiting for the normal two-second refresh interval.
+// instead of waiting for the normal ten-second refresh interval.
 func (e *Engine) InvalidateMonitorCache() {
 	e.monitorMu.Lock()
 	e.monitorAt = time.Time{}
@@ -242,34 +252,48 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 				if t.QuoteDecimals != nil {
 					copy.QuoteDecimals = *t.QuoteDecimals
 				}
+				if t.QuoteUSDPrice != nil {
+					copy.QuoteUSDPrice = strings.TrimSpace(*t.QuoteUSDPrice)
+				}
+				if copy.QuoteUSDPrice == "" && t.QuoteTokenSymbol != nil {
+					switch strings.ToUpper(strings.TrimSpace(*t.QuoteTokenSymbol)) {
+					case "ETH", "WETH":
+						copy.QuoteUSDPrice = strings.TrimSpace(e.NativeUSDPrice)
+					}
+				}
+				if copy.QuoteUSDPrice != "" {
+					quotePrice := copy.QuoteUSDPrice
+					t.QuoteUSDPrice = &quotePrice
+				}
 				if copy.MarketCap == 0 && t.MarketCap != nil {
 					copy.MarketCap, _ = strconv.ParseFloat(*t.MarketCap, 64)
 				}
-				copy.Own = copy.Sender != "" && strings.EqualFold(copy.Sender, u.WalletAddress)
+				copy.Own = e.isOwnEvent(ctx, copy, u)
 				if ev.PoolID != "" && (ev.Amount0Raw != "" || ev.Amount1Raw != "") {
-					a0, _ := strconv.ParseFloat(ev.Amount0Raw, 64)
-					a1, _ := strconv.ParseFloat(ev.Amount1Raw, 64)
+					a0, ok0 := signedRaw(ev.Amount0Raw)
+					a1, ok1 := signedRaw(ev.Amount1Raw)
+					if !ok0 || !ok1 {
+						continue
+					}
 					// V4 Swap amounts use the swapper's perspective: a positive
 					// token delta means the token was paid out (buy), while a
 					// negative token delta means it was sold into the pool.
-					amt := a1
-					quote := a0
+					amt := new(big.Int).Set(a1)
+					quote := new(big.Int).Set(a0)
 					if strings.EqualFold(t.Currency0, t.TokenAddress) {
 						amt, quote = a0, a1
 					}
-					if amt > 0 {
+					if amt.Sign() > 0 {
 						copy.Side = "buy"
-					} else if amt < 0 {
+					} else if amt.Sign() < 0 {
 						copy.Side = "sell"
 					}
-					copy.QuoteAmountRaw = math.Abs(quote)
-					copy.TokenAmountRaw = math.Abs(amt)
-					copy.QuoteAmountText = absIntegerText(ev.Amount0Raw)
-					copy.TokenAmountText = absIntegerText(ev.Amount1Raw)
-					if strings.EqualFold(t.Currency0, t.TokenAddress) {
-						copy.QuoteAmountText = absIntegerText(ev.Amount1Raw)
-						copy.TokenAmountText = absIntegerText(ev.Amount0Raw)
-					}
+					quote.Abs(quote)
+					amt.Abs(amt)
+					copy.QuoteAmountText = quote.String()
+					copy.TokenAmountText = amt.String()
+					copy.QuoteAmountRaw = rawFloat(copy.QuoteAmountText)
+					copy.TokenAmountRaw = rawFloat(copy.TokenAmountText)
 					if ev.SqrtPriceX96 != "" {
 						if spot := v4SpotPrice(ev.SqrtPriceX96, strings.EqualFold(t.Currency0, t.TokenAddress)); spot > 0 {
 							copy.PriceRaw = spot
@@ -281,11 +305,11 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 					if copy.Price == 0 && copy.PriceRaw > 0 {
 						copy.Price = usdTokenPrice(copy.PriceRaw, t)
 					}
+					if copy.QuoteUSD == 0 && copy.QuoteAmountRaw > 0 {
+						copy.QuoteUSD = rawQuoteUSDWithPrice(copy.QuoteAmountRaw, t, copy.QuoteUSDPrice)
+					}
 					if marketCap := marketCapFromEvent(copy, t); marketCap > 0 {
 						copy.MarketCap = marketCap
-					}
-					if copy.QuoteUSD == 0 && copy.QuoteAmountRaw > 0 {
-						copy.QuoteUSD = rawQuoteUSD(copy.QuoteAmountRaw, t)
 					}
 					// Derive price impact from this swap's own execution price and
 					// the PoolManager post-swap sqrt price. This deliberately does
@@ -308,6 +332,9 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 					}
 					if copy.Price == 0 && copy.PriceRaw > 0 {
 						copy.Price = usdTokenPrice(copy.PriceRaw, t)
+					}
+					if copy.QuoteUSD == 0 && copy.QuoteAmountRaw > 0 {
+						copy.QuoteUSD = rawQuoteUSDWithPrice(copy.QuoteAmountRaw, t, copy.QuoteUSDPrice)
 					}
 					if marketCap := marketCapFromEvent(copy, t); marketCap > 0 {
 						copy.MarketCap = marketCap
@@ -349,7 +376,7 @@ func (e *Engine) refreshMonitorCache(ctx context.Context, force bool) error {
 	e.monitorLoadMu.Lock()
 	defer e.monitorLoadMu.Unlock()
 	e.monitorMu.RLock()
-	fresh := !e.monitorAt.IsZero() && time.Since(e.monitorAt) < 2*time.Second
+	fresh := !e.monitorAt.IsZero() && time.Since(e.monitorAt) < 10*time.Second
 	e.monitorMu.RUnlock()
 	if fresh && !force {
 		return nil
@@ -399,14 +426,20 @@ func (e *Engine) cachedTokenEnabled(ctx context.Context, userID int64, address, 
 }
 
 func rawQuoteUSD(raw float64, t store.Token) float64 {
+	price := ""
+	if t.QuoteUSDPrice != nil {
+		price = *t.QuoteUSDPrice
+	}
+	return rawQuoteUSDWithPrice(raw, t, price)
+}
+
+func rawQuoteUSDWithPrice(raw float64, t store.Token, priceText string) float64 {
 	decimals := 0
 	if t.QuoteDecimals != nil {
 		decimals = *t.QuoteDecimals
 	}
 	price := 0.0
-	if t.QuoteUSDPrice != nil {
-		price, _ = strconv.ParseFloat(*t.QuoteUSDPrice, 64)
-	}
+	price, _ = strconv.ParseFloat(strings.TrimSpace(priceText), 64)
 	if price == 0 {
 		return 0
 	}
@@ -587,6 +620,15 @@ func decodeEvent(raw map[string]any) (Event, bool) {
 	if ev.CurveAddress == "" {
 		ev.CurveAddress = firstString(raw, "curve", "curveAddress", "marketAddress")
 	}
+	if ev.TransactionFrom == "" {
+		ev.TransactionFrom = firstString(raw, "transactionFrom", "transactionSender", "from")
+	}
+	if ev.GasUsedRaw == "" {
+		ev.GasUsedRaw = firstString(raw, "gasUsedRaw", "gasUsed")
+	}
+	if ev.EffectiveGasPriceRaw == "" {
+		ev.EffectiveGasPriceRaw = firstString(raw, "effectiveGasPriceRaw", "effectiveGasPrice", "gasPrice")
+	}
 	if ev.Side == "" {
 		ev.Side = strings.ToLower(firstString(raw, "type", "side", "direction"))
 	}
@@ -633,6 +675,96 @@ func decodeEvent(raw map[string]any) (Event, bool) {
 	}
 	return ev, true
 }
+
+func eventTransactionHash(ev Event) string {
+	key := strings.TrimSpace(ev.Key)
+	if i := strings.IndexByte(key, ':'); i > 0 {
+		return key[:i]
+	}
+	return key
+}
+
+func (e *Engine) isOwnEvent(ctx context.Context, ev Event, user store.User) bool {
+	if ev.TransactionFrom != "" && strings.EqualFold(ev.TransactionFrom, user.WalletAddress) {
+		return true
+	}
+	if ev.Sender != "" && strings.EqualFold(ev.Sender, user.WalletAddress) {
+		return true
+	}
+	hash := eventTransactionHash(ev)
+	if hash == "" || e.Store == nil || e.Store.DB == nil {
+		return false
+	}
+	cacheKey := ownCacheKey(hash, user.UserID, ev.TokenAddress, ev.CurveAddress)
+	if cached, ok := e.ownCache.Load(cacheKey); ok {
+		if expires, ok := cached.(time.Time); ok && time.Now().Before(expires) {
+			return true
+		}
+		e.ownCache.Delete(cacheKey)
+	}
+	var pending bool
+	err := e.Store.DB.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM strategy_pending_actions WHERE lower(transaction_hash)=lower($1) AND user_id=$2 AND token_address=$3 AND curve_address=$4 AND status IN ('pending','confirmed_pending_accounting','confirmed')
+		UNION ALL
+		SELECT 1 FROM strategy_pending_buys WHERE lower(transaction_hash)=lower($1) AND user_id=$2 AND token_address=$3 AND curve_address=$4 AND status IN ('pending','confirmed_pending_accounting','confirmed')
+		UNION ALL
+		SELECT 1 FROM strategy_buy_attempts WHERE lower(transaction_hash)=lower($1) AND user_id=$2 AND token_address=$3 AND curve_address=$4 AND status IN ('pending','confirmed')
+	)`, hash, user.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&pending)
+	if err != nil || !pending {
+		return false
+	}
+	e.ownCache.Store(cacheKey, time.Now().Add(2*time.Minute))
+	e.sweepOwnCache()
+	return true
+}
+
+func ownCacheKey(hash string, userID int64, token, curve string) string {
+	return fmt.Sprintf("%s:%d:%s:%s", strings.ToLower(strings.TrimSpace(hash)), userID, strings.ToLower(token), strings.ToLower(curve))
+}
+
+func (e *Engine) cacheOwnTransaction(hash string, userID int64, token, curve string, ttl time.Duration) {
+	if strings.TrimSpace(hash) == "" || userID <= 0 || ttl <= 0 {
+		return
+	}
+	e.ownCache.Store(ownCacheKey(hash, userID, token, curve), time.Now().Add(ttl))
+}
+
+func (e *Engine) forgetOwnTransaction(hash string) {
+	hash = strings.ToLower(strings.TrimSpace(hash))
+	if hash == "" {
+		return
+	}
+	e.ownCache.Range(func(key, value any) bool {
+		keyText, ok := key.(string)
+		if ok && strings.HasPrefix(keyText, hash+":") {
+			e.ownCache.Delete(key)
+		}
+		return true
+	})
+}
+
+func (e *Engine) sweepOwnCache() {
+	now := time.Now()
+	e.ownCacheMu.Lock()
+	if !e.ownCacheSweep.IsZero() && now.Sub(e.ownCacheSweep) < time.Minute {
+		e.ownCacheMu.Unlock()
+		return
+	}
+	e.ownCacheSweep = now
+	e.ownCacheMu.Unlock()
+	e.ownCache.Range(func(key, value any) bool {
+		if expires, ok := value.(time.Time); !ok || !now.Before(expires) {
+			e.ownCache.Delete(key)
+		}
+		return true
+	})
+}
+
+func (e *Engine) ownFillRecorded(ctx context.Context, ev Event) bool {
+	var recorded bool
+	err := e.Store.DB.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM monitor_records WHERE source_event_key=$1 AND user_id=$2 AND token_address=$3 AND curve_address=$4)`, ev.Key, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&recorded)
+	return err == nil && recorded
+}
 func firstString(m map[string]any, keys ...string) string {
 	for _, k := range keys {
 		if v, ok := m[k]; ok && v != nil {
@@ -677,6 +809,25 @@ func absIntegerText(value string) string {
 	return n.Abs(n).String()
 }
 
+func signedRaw(value string) (*big.Int, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, false
+	}
+	if strings.HasPrefix(strings.ToLower(value), "0x") {
+		n := new(big.Int)
+		if _, ok := n.SetString(value[2:], 16); ok {
+			return n, true
+		}
+		return nil, false
+	}
+	n := new(big.Int)
+	if _, ok := n.SetString(value, 10); !ok {
+		return nil, false
+	}
+	return n, true
+}
+
 func integerText(value string) string {
 	if value := absIntegerText(value); value != "" {
 		return value
@@ -694,6 +845,80 @@ func rawFloat(value string) float64 {
 	}
 	f, _ := n.Float64()
 	return f
+}
+
+func usdCostScaled(price float64, tokenRaw *big.Int, tokenDecimals int) *big.Int {
+	if price <= 0 || tokenRaw == nil || tokenRaw.Sign() <= 0 || tokenDecimals < 0 {
+		return new(big.Int)
+	}
+	value := new(big.Float).SetPrec(256).SetFloat64(price)
+	value.Mul(value, new(big.Float).SetInt(tokenRaw))
+	value.Mul(value, new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(8)), nil)))
+	value.Quo(value, new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(tokenDecimals)), nil)))
+	out, _ := value.Int(nil)
+	if out == nil || out.Sign() < 0 {
+		return new(big.Int)
+	}
+	return out
+}
+
+func quoteCostUSDScaled(quoteRaw *big.Int, quoteDecimals int, quoteUSDPrice string, fallbackUSD float64) *big.Int {
+	if quoteRaw == nil || quoteRaw.Sign() <= 0 || quoteDecimals < 0 {
+		return new(big.Int)
+	}
+	priceScaled, ok := decimalScaled(strings.TrimSpace(quoteUSDPrice), 8)
+	if !ok || priceScaled.Sign() <= 0 {
+		if fallbackUSD <= 0 || math.IsNaN(fallbackUSD) || math.IsInf(fallbackUSD, 0) {
+			return new(big.Int)
+		}
+		fallback := new(big.Float).SetPrec(256).SetFloat64(fallbackUSD)
+		fallback.Mul(fallback, new(big.Float).SetInt(big.NewInt(100_000_000)))
+		priceScaled, _ = fallback.Int(nil)
+	}
+	if priceScaled == nil || priceScaled.Sign() <= 0 {
+		return new(big.Int)
+	}
+	result := new(big.Int).Mul(quoteRaw, priceScaled)
+	result.Quo(result, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(quoteDecimals)), nil))
+	return result
+}
+
+func receiptGasFee(gasUsedText, gasPriceText string) string {
+	gasUsed := new(big.Int)
+	gasPrice := new(big.Int)
+	if _, ok := gasUsed.SetString(integerText(gasUsedText), 10); !ok || gasUsed.Sign() <= 0 {
+		return "0"
+	}
+	if _, ok := gasPrice.SetString(integerText(gasPriceText), 10); !ok || gasPrice.Sign() <= 0 {
+		return "0"
+	}
+	return new(big.Int).Mul(gasUsed, gasPrice).String()
+}
+
+func scaledAverageUSD(costScaled, tokenRaw *big.Int, tokenDecimals int) float64 {
+	if costScaled == nil || tokenRaw == nil || costScaled.Sign() <= 0 || tokenRaw.Sign() <= 0 || tokenDecimals < 0 {
+		return 0
+	}
+	numerator := new(big.Float).SetPrec(256).SetInt(costScaled)
+	numerator.Mul(numerator, new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(tokenDecimals)), nil)))
+	denominator := new(big.Float).SetInt(tokenRaw)
+	denominator.Mul(denominator, new(big.Float).SetInt(new(big.Int).Exp(big.NewInt(10), big.NewInt(8), nil)))
+	numerator.Quo(numerator, denominator)
+	result, _ := numerator.Float64()
+	return result
+}
+
+func scaledUSDText(value float64) string {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return "0"
+	}
+	n := new(big.Float).SetPrec(256).SetFloat64(value)
+	n.Mul(n, new(big.Float).SetInt(big.NewInt(100_000_000)))
+	out, _ := n.Int(nil)
+	if out == nil || out.Sign() < 0 {
+		return "0"
+	}
+	return out.String()
 }
 
 func decimalScaled(value string, decimals int) (*big.Int, bool) {
@@ -906,6 +1131,16 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 		return err
 	}
 	cfg := Parse(u.Config)
+	if ev.Own {
+		e.devInfo("识别为自有交易，开始记账",
+			zap.Int64("userID", ev.UserID),
+			zap.String("transactionHash", eventTransactionHash(ev)),
+			zap.String("side", strings.ToLower(ev.Side)),
+			zap.String("token", ev.TokenAddress),
+			zap.String("curve", ev.CurveAddress),
+		)
+		return e.applyOwnFill(ctx, ev, cfg)
+	}
 	if !u.Enabled || !cfg.Enabled {
 		return nil
 	}
@@ -977,12 +1212,6 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 		zap.Int("buyCount", p.BuyCount),
 		zap.String("token", ev.TokenAddress),
 	)
-	if ev.Own {
-		if inserted, markErr := e.markStrategyEvent(ctx, ev); markErr != nil || !inserted {
-			return markErr
-		}
-		return e.applyOwnFill(ctx, ev, p, cfg)
-	}
 	// A position may receive several market events while a previous sell is
 	// still waiting for its receipt. loadPosition includes the durable pending
 	// flag in the same round trip, so a later event cannot broadcast a second
@@ -1031,6 +1260,9 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 					ev.ExecutionAmountRaw = balance.String()
 				}
 			}
+		}
+		if action == "sell" && ev.ExecutionAmountRaw == "" {
+			ev.ExecutionAmountRaw = exactSellAmountRaw(p, amount)
 		}
 		if inserted, markErr := e.markStrategyEvent(ctx, ev); markErr != nil || !inserted {
 			return markErr
@@ -1195,6 +1427,20 @@ func amountAtRawRatio(amount, quoteRaw, tokenRaw string, slippage float64, buy b
 		return "0"
 	}
 	return result.String()
+}
+
+func exactSellAmountRaw(p position, amount float64) string {
+	if p.AmountRaw == "" || p.Amount <= 0 || amount <= 0 {
+		return ""
+	}
+	if amount >= p.Amount {
+		return integerText(p.AmountRaw)
+	}
+	ratio := amount / p.Amount
+	if ratio <= 0 || ratio >= 1 {
+		return ""
+	}
+	return rawRatio(p.AmountRaw, ratio)
 }
 
 // executeLive is the default strategy executor. It deliberately broadcasts
@@ -1407,6 +1653,9 @@ func (e *Engine) UpdatePendingBroadcast(ctx context.Context, userID int64, token
 		return err
 	}
 	_, err := e.Store.DB.Exec(ctx, `INSERT INTO strategy_buy_attempts(user_id,token_address,curve_address,transaction_hash,nonce,quote_usd,source_event_key,amount_out_minimum_raw,status,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''),'pending',now()) ON CONFLICT(transaction_hash) DO UPDATE SET nonce=EXCLUDED.nonce,quote_usd=EXCLUDED.quote_usd,source_event_key=EXCLUDED.source_event_key,amount_out_minimum_raw=EXCLUDED.amount_out_minimum_raw,updated_at=now()`, userID, token, curve, hash, nonce, quoteUSD, sourceKey, amountOutMinimum)
+	if err == nil {
+		e.cacheOwnTransaction(hash, userID, token, curve, 10*time.Minute)
+	}
 	return err
 }
 
@@ -1425,7 +1674,7 @@ func (e *Engine) loadPosition(ctx context.Context, ev Event) (position, error) {
 	var p position
 	var amountRaw string
 	var first, next, cool, last *time.Time
-	err := e.Store.DB.QueryRow(ctx, `SELECT token_amount_raw::text,average_cost_usd::double precision,first_buy_price::double precision,last_buy_price::double precision,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at,EXISTS(SELECT 1 FROM strategy_pending_actions a WHERE a.user_id=strategy_positions.user_id AND a.token_address=strategy_positions.token_address AND a.curve_address=strategy_positions.curve_address AND a.side='sell' AND a.status IN ('pending','confirmed_pending_accounting')) FROM strategy_positions WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&amountRaw, &p.AverageCost, &p.FirstPrice, &p.LastPrice, &p.BuyCount, &p.SellCount, &p.ProfitLevel, &first, &next, &cool, &last, &p.PendingSell)
+	err := e.Store.DB.QueryRow(ctx, `SELECT token_amount_raw::text,quote_spent_raw,cost_usd_raw,average_cost_usd::double precision,first_buy_price::double precision,last_buy_price::double precision,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at,EXISTS(SELECT 1 FROM strategy_pending_actions a WHERE a.user_id=strategy_positions.user_id AND a.token_address=strategy_positions.token_address AND a.curve_address=strategy_positions.curve_address AND a.side='sell' AND a.status IN ('pending','confirmed_pending_accounting')) FROM strategy_positions WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&amountRaw, &p.QuoteSpentRaw, &p.CostUSDScaledRaw, &p.AverageCost, &p.FirstPrice, &p.LastPrice, &p.BuyCount, &p.SellCount, &p.ProfitLevel, &first, &next, &cool, &last, &p.PendingSell)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "no rows") {
 			return position{}, nil
@@ -1442,11 +1691,257 @@ func (e *Engine) savePosition(ctx context.Context, ev Event, p position) error {
 	if amountRaw == "" {
 		amountRaw = integerRaw(p.Amount)
 	}
-	_, err := e.Store.DB.Exec(ctx, `INSERT INTO strategy_positions(user_id,token_address,curve_address,token_amount_raw,average_cost_usd,first_buy_price,last_buy_price,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at,last_event_key,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now()) ON CONFLICT(user_id,token_address,curve_address) DO UPDATE SET token_amount_raw=EXCLUDED.token_amount_raw,average_cost_usd=EXCLUDED.average_cost_usd,first_buy_price=EXCLUDED.first_buy_price,last_buy_price=EXCLUDED.last_buy_price,buy_count=EXCLUDED.buy_count,sell_count=EXCLUDED.sell_count,profit_sell_level=EXCLUDED.profit_sell_level,first_bought_at=EXCLUDED.first_bought_at,next_scheduled_sell_at=EXCLUDED.next_scheduled_sell_at,external_cooldown_until=EXCLUDED.external_cooldown_until,last_buy_at=EXCLUDED.last_buy_at,last_event_key=EXCLUDED.last_event_key,updated_at=now()`, ev.UserID, ev.TokenAddress, ev.CurveAddress, amountRaw, p.AverageCost, p.FirstPrice, p.LastPrice, p.BuyCount, p.SellCount, p.ProfitLevel, p.FirstBought, p.NextScheduled, p.CooldownUntil, p.LastBuy, ev.Key)
+	_, err := e.Store.DB.Exec(ctx, `INSERT INTO strategy_positions(user_id,token_address,curve_address,token_amount_raw,quote_spent_raw,cost_usd_raw,average_cost_usd,first_buy_price,last_buy_price,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at,last_event_key,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,now()) ON CONFLICT(user_id,token_address,curve_address) DO UPDATE SET token_amount_raw=EXCLUDED.token_amount_raw,quote_spent_raw=EXCLUDED.quote_spent_raw,cost_usd_raw=EXCLUDED.cost_usd_raw,average_cost_usd=EXCLUDED.average_cost_usd,first_buy_price=EXCLUDED.first_buy_price,last_buy_price=EXCLUDED.last_buy_price,buy_count=EXCLUDED.buy_count,sell_count=EXCLUDED.sell_count,profit_sell_level=EXCLUDED.profit_sell_level,first_bought_at=EXCLUDED.first_bought_at,next_scheduled_sell_at=EXCLUDED.next_scheduled_sell_at,external_cooldown_until=EXCLUDED.external_cooldown_until,last_buy_at=EXCLUDED.last_buy_at,last_event_key=EXCLUDED.last_event_key,updated_at=now()`, ev.UserID, ev.TokenAddress, ev.CurveAddress, amountRaw, p.QuoteSpentRaw, p.CostUSDScaledRaw, p.AverageCost, p.FirstPrice, p.LastPrice, p.BuyCount, p.SellCount, p.ProfitLevel, p.FirstBought, p.NextScheduled, p.CooldownUntil, p.LastBuy, ev.Key)
 	return err
 }
 
-func (e *Engine) applyOwnFill(ctx context.Context, ev Event, p position, cfg Config) error {
+func (e *Engine) savePositionTx(ctx context.Context, tx pgx.Tx, ev Event, p position) error {
+	amountRaw := p.AmountRaw
+	if amountRaw == "" {
+		amountRaw = integerRaw(p.Amount)
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO strategy_positions(user_id,token_address,curve_address,token_amount_raw,quote_spent_raw,cost_usd_raw,average_cost_usd,first_buy_price,last_buy_price,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at,last_event_key,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,now()) ON CONFLICT(user_id,token_address,curve_address) DO UPDATE SET token_amount_raw=EXCLUDED.token_amount_raw,quote_spent_raw=EXCLUDED.quote_spent_raw,cost_usd_raw=EXCLUDED.cost_usd_raw,average_cost_usd=EXCLUDED.average_cost_usd,first_buy_price=EXCLUDED.first_buy_price,last_buy_price=EXCLUDED.last_buy_price,buy_count=EXCLUDED.buy_count,sell_count=EXCLUDED.sell_count,profit_sell_level=EXCLUDED.profit_sell_level,next_scheduled_sell_at=EXCLUDED.next_scheduled_sell_at,external_cooldown_until=EXCLUDED.external_cooldown_until,last_buy_at=EXCLUDED.last_buy_at,last_event_key=EXCLUDED.last_event_key,updated_at=now()`, ev.UserID, ev.TokenAddress, ev.CurveAddress, amountRaw, p.QuoteSpentRaw, p.CostUSDScaledRaw, p.AverageCost, p.FirstPrice, p.LastPrice, p.BuyCount, p.SellCount, p.ProfitLevel, p.FirstBought, p.NextScheduled, p.CooldownUntil, p.LastBuy, ev.Key)
+	return err
+}
+
+func reconstructQuoteSpent(ctx context.Context, tx pgx.Tx, userID int64, tokenAddress, curveAddress string) (*big.Int, error) {
+	rows, err := tx.Query(ctx, `SELECT type,token_amount_raw,quote_amount_raw FROM monitor_records WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 ORDER BY created_at,id`, userID, tokenAddress, curveAddress)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tokens := new(big.Int)
+	quote := new(big.Int)
+	for rows.Next() {
+		var side, tokenText, quoteText string
+		if err := rows.Scan(&side, &tokenText, &quoteText); err != nil {
+			return nil, err
+		}
+		amount := new(big.Int)
+		income := new(big.Int)
+		if _, ok := amount.SetString(integerText(tokenText), 10); !ok || amount.Sign() <= 0 {
+			continue
+		}
+		if _, ok := income.SetString(integerText(quoteText), 10); !ok || income.Sign() < 0 {
+			continue
+		}
+		if strings.EqualFold(side, "buy") {
+			tokens.Add(tokens, amount)
+			quote.Add(quote, income)
+			continue
+		}
+		if strings.EqualFold(side, "sell") && tokens.Sign() > 0 {
+			if amount.Cmp(tokens) > 0 {
+				amount.Set(tokens)
+			}
+			allocated := new(big.Int).Mul(quote, amount)
+			allocated.Quo(allocated, tokens)
+			tokens.Sub(tokens, amount)
+			quote.Sub(quote, allocated)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return quote, nil
+}
+
+func (e *Engine) applyOwnFill(ctx context.Context, ev Event, cfg Config) error {
+	if strings.ToLower(ev.Side) != "buy" && strings.ToLower(ev.Side) != "sell" {
+		return nil
+	}
+	tokenRawText := absIntegerText(ev.TokenAmountText)
+	if tokenRawText == "" || tokenRawText == "0" {
+		tokenRawText = integerRaw(ev.TokenAmountRaw)
+	}
+	quoteRawText := absIntegerText(ev.QuoteAmountText)
+	if quoteRawText == "" || quoteRawText == "0" {
+		quoteRawText = integerRaw(ev.QuoteAmountRaw)
+	}
+	tokenRaw := new(big.Int)
+	quoteRaw := new(big.Int)
+	if _, ok := tokenRaw.SetString(integerText(tokenRawText), 10); !ok || tokenRaw.Sign() <= 0 {
+		return nil
+	}
+	if _, ok := quoteRaw.SetString(integerText(quoteRawText), 10); !ok || quoteRaw.Sign() <= 0 {
+		return nil
+	}
+	tx, err := e.Store.DB.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// The source event key is the durable idempotency key. The insert happens
+	// before any position mutation so a duplicate receipt cannot double-count.
+	txHash := eventTransactionHash(ev)
+	var recordID int64
+	priceNumerator, priceDenominator := quoteRaw.String(), tokenRaw.String()
+	if strings.ToLower(ev.Side) == "sell" {
+		priceNumerator, priceDenominator = quoteRaw.String(), tokenRaw.String()
+	}
+	var actionReason string
+	if txHash != "" {
+		if scanErr := tx.QueryRow(ctx, `SELECT reason FROM strategy_pending_actions WHERE transaction_hash=$1 AND user_id=$2 AND token_address=$3 AND curve_address=$4 AND status='pending' FOR UPDATE`, txHash, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&actionReason); scanErr != nil && scanErr != pgx.ErrNoRows {
+			return scanErr
+		}
+	}
+	if actionReason == "" {
+		actionReason = "confirmed_fill"
+	}
+
+	var current position
+	var amountRaw string
+	var first, next, cool, last *time.Time
+	scanErr := tx.QueryRow(ctx, `SELECT token_amount_raw::text,quote_spent_raw,cost_usd_raw,average_cost_usd::double precision,first_buy_price::double precision,last_buy_price::double precision,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at FROM strategy_positions WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 FOR UPDATE`, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&amountRaw, &current.QuoteSpentRaw, &current.CostUSDScaledRaw, &current.AverageCost, &current.FirstPrice, &current.LastPrice, &current.BuyCount, &current.SellCount, &current.ProfitLevel, &first, &next, &cool, &last)
+	if scanErr == pgx.ErrNoRows {
+		current = position{QuoteSpentRaw: "0", CostUSDScaledRaw: "0"}
+	} else if scanErr != nil {
+		return scanErr
+	} else {
+		current.AmountRaw = integerText(amountRaw)
+		current.Amount = rawFloat(current.AmountRaw)
+		current.FirstBought, current.NextScheduled, current.CooldownUntil, current.LastBuy = first, next, cool, last
+	}
+	oldToken := new(big.Int)
+	oldToken.SetString(integerText(current.AmountRaw), 10)
+	if oldToken.Sign() < 0 {
+		oldToken.SetInt64(0)
+	}
+	oldQuote := new(big.Int)
+	oldQuote.SetString(integerText(current.QuoteSpentRaw), 10)
+	if oldQuote.Sign() < 0 {
+		oldQuote.SetInt64(0)
+	}
+	if oldQuote.Sign() == 0 && oldToken.Sign() > 0 {
+		reconstructed, reconstructErr := reconstructQuoteSpent(ctx, tx, ev.UserID, ev.TokenAddress, ev.CurveAddress)
+		if reconstructErr != nil {
+			return reconstructErr
+		}
+		oldQuote.Set(reconstructed)
+	}
+	oldCost := new(big.Int)
+	oldCost.SetString(integerText(current.CostUSDScaledRaw), 10)
+	if oldCost.Sign() < 0 {
+		oldCost.SetInt64(0)
+	}
+	if oldCost.Sign() == 0 && oldToken.Sign() > 0 && current.AverageCost > 0 {
+		oldCost.Set(usdCostScaled(current.AverageCost, oldToken, ev.TokenDecimals))
+	}
+
+	var remainToken, remainQuote, remainCost, realizedPnl big.Int
+	remainToken.Set(oldToken)
+	remainQuote.Set(oldQuote)
+	remainCost.Set(oldCost)
+	sellCount := current.SellCount
+	profitLevel := current.ProfitLevel
+	now := time.Now()
+	if strings.ToLower(ev.Side) == "buy" {
+		// Accounting uses the actual quote amount from the receipt. Pool spot
+		// price may differ from execution price because of slippage.
+		fillCost := quoteCostUSDScaled(quoteRaw, ev.QuoteDecimals, ev.QuoteUSDPrice, ev.QuoteUSD)
+		if fillCost.Sign() == 0 {
+			fillCost = usdCostScaled(ev.Price, tokenRaw, ev.TokenDecimals)
+		}
+		remainToken.Add(oldToken, tokenRaw)
+		remainQuote.Add(oldQuote, quoteRaw)
+		remainCost.Add(oldCost, fillCost)
+		current.BuyCount++
+		if current.FirstPrice <= 0 {
+			current.FirstPrice, current.FirstBought = ev.Price, &now
+		}
+		current.LastPrice, current.LastBuy = ev.Price, &now
+		if cfg.SellPolicy.ResetSellCountOnBuy {
+			sellCount = 0
+		}
+		if cfg.ProfitSell.ResetOnBuy {
+			profitLevel = 0
+		}
+		if cfg.ScheduledSell.Enabled && (cfg.ScheduledSell.ResetOnBuy || current.NextScheduled == nil) {
+			n := now.Add(time.Duration(cfg.ScheduledSell.IntervalSecond) * time.Second)
+			current.NextScheduled = &n
+		}
+	} else {
+		if oldToken.Sign() <= 0 {
+			return nil
+		}
+		if tokenRaw.Cmp(oldToken) > 0 {
+			tokenRaw.Set(oldToken)
+		}
+		allocated := new(big.Int).Mul(oldQuote, tokenRaw)
+		allocated.Quo(allocated, oldToken)
+		allocatedCost := new(big.Int).Mul(oldCost, tokenRaw)
+		allocatedCost.Quo(allocatedCost, oldToken)
+		remainToken.Sub(oldToken, tokenRaw)
+		remainQuote.Sub(oldQuote, allocated)
+		remainCost.Sub(oldCost, allocatedCost)
+		realizedPnl.Sub(quoteRaw, allocated)
+		sellCount++
+		if actionReason == "profit_sell" {
+			profitLevel++
+		}
+		if actionReason == "scheduled_sell" && cfg.ScheduledSell.Enabled && remainToken.Sign() > 0 {
+			n := now.Add(time.Duration(cfg.ScheduledSell.IntervalSecond) * time.Second)
+			current.NextScheduled = &n
+		}
+		if remainToken.Sign() == 0 {
+			current.FirstPrice, current.LastPrice = 0, 0
+			current.FirstBought, current.LastBuy = nil, nil
+			current.NextScheduled = nil
+		}
+	}
+	current.AmountRaw = remainToken.String()
+	current.Amount = rawFloat(current.AmountRaw)
+	current.QuoteSpentRaw = remainQuote.String()
+	current.CostUSDScaledRaw = remainCost.String()
+	if remainToken.Sign() > 0 {
+		current.AverageCost = scaledAverageUSD(remainCost, remainToken, ev.TokenDecimals)
+	} else {
+		current.AverageCost = 0
+	}
+	current.SellCount, current.ProfitLevel = sellCount, profitLevel
+	gasFeeNativeRaw := receiptGasFee(ev.GasUsedRaw, ev.EffectiveGasPriceRaw)
+
+	remainCostText := remainCost.String()
+	if _, err = tx.QueryRow(ctx, `INSERT INTO monitor_records(user_id,token_address,curve_address,type,token_amount_raw,quote_amount_raw,remain_token_amount_raw,remain_quote_amount_raw,remain_cost_usd_raw,average_cost_usd_raw,price_numerator,price_denominator,transaction_hash,reason,source_event_key,realized_quote_amount_raw,realized_pnl_quote_raw,gas_fee_native_raw,sell_count,profit_sell_level,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,now()) ON CONFLICT(source_event_key) DO NOTHING RETURNING id`, ev.UserID, ev.TokenAddress, ev.CurveAddress, strings.ToLower(ev.Side), tokenRaw.String(), quoteRaw.String(), remainToken.String(), remainQuote.String(), remainCostText, scaledUSDText(current.AverageCost), priceNumerator, priceDenominator, txHash, actionReason, ev.Key, func() string {
+		if strings.ToLower(ev.Side) == "sell" {
+			return quoteRaw.String()
+		}
+		return "0"
+	}(), realizedPnl.String(), gasFeeNativeRaw, sellCount, profitLevel).Scan(&recordID); err != nil {
+		if err == pgx.ErrNoRows {
+			if gasFeeNativeRaw != "0" {
+				if _, updateErr := tx.Exec(ctx, `UPDATE monitor_records SET gas_fee_native_raw=$1 WHERE source_event_key=$2 AND (gas_fee_native_raw IS NULL OR gas_fee_native_raw='0')`, gasFeeNativeRaw, ev.Key); updateErr != nil {
+					return updateErr
+				}
+			}
+			return tx.Commit(ctx)
+		}
+		return err
+	}
+	if txHash != "" {
+		if _, err = tx.Exec(ctx, `UPDATE strategy_pending_actions SET status='confirmed',updated_at=now() WHERE transaction_hash=$1 AND user_id=$2 AND token_address=$3 AND curve_address=$4 AND status='pending'`, txHash, ev.UserID, ev.TokenAddress, ev.CurveAddress); err != nil {
+			return err
+		}
+		if strings.ToLower(ev.Side) == "buy" {
+			if _, err = tx.Exec(ctx, `UPDATE strategy_pending_buys SET status='confirmed',winner_transaction_hash=$4,updated_at=now() WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND status IN ('pending','confirmed_pending_accounting')`, ev.UserID, ev.TokenAddress, ev.CurveAddress, txHash); err != nil {
+				return err
+			}
+			if _, err = tx.Exec(ctx, `UPDATE strategy_buy_attempts SET status=CASE WHEN transaction_hash=$4 THEN 'confirmed' ELSE 'replaced' END,updated_at=now() WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND status='pending'`, ev.UserID, ev.TokenAddress, ev.CurveAddress, txHash); err != nil {
+				return err
+			}
+		}
+	}
+	if err = e.savePositionTx(ctx, tx, ev, current); err != nil {
+		return err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (e *Engine) applyOwnFillLegacy(ctx context.Context, ev Event, p position, cfg Config) error {
 	if ev.Price <= 0 {
 		return nil
 	}
@@ -1628,7 +2123,9 @@ func evaluate(c Config, r TokenRule, ev Event, p position) (string, float64, str
 	if strings.ToLower(ev.Side) != "buy" || p.Amount <= 0 {
 		return "", 0, ""
 	}
-	force := c.SellPolicy.FullSellAfterSellCount > 0 && p.SellCount >= c.SellPolicy.FullSellAfterSellCount
+	// SellCount records confirmed sells. Include the sell being planned so the
+	// configured threshold makes that sell itself a full exit.
+	force := c.SellPolicy.FullSellAfterSellCount > 0 && p.SellCount+1 >= c.SellPolicy.FullSellAfterSellCount
 	if p.CooldownUntil != nil && time.Now().Before(*p.CooldownUntil) {
 		// An already reached public full-sell threshold has priority over the
 		// external-buy cooldown.  Other ladder/protection decisions are skipped
@@ -1710,6 +2207,9 @@ func (e *Engine) savePendingAction(ctx context.Context, hash string, ev Event, s
 		}
 	}
 	_, err := e.Store.DB.Exec(ctx, `INSERT INTO strategy_pending_actions(transaction_hash,user_id,token_address,curve_address,side,reason,amount,status,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,now()) ON CONFLICT(transaction_hash) DO UPDATE SET amount=EXCLUDED.amount,reason=EXCLUDED.reason,status=EXCLUDED.status,updated_at=now()`, hash, ev.UserID, ev.TokenAddress, ev.CurveAddress, side, reason, amount, status)
+	if err == nil && status == "pending" {
+		e.cacheOwnTransaction(hash, ev.UserID, ev.TokenAddress, ev.CurveAddress, 10*time.Minute)
+	}
 	return err
 }
 
@@ -1757,6 +2257,7 @@ func (e *Engine) reconcilePending(ctx context.Context) {
 			continue
 		}
 		if revertedReceipt(receipt) {
+			e.forgetOwnTransaction(hash)
 			_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_pending_buys SET status='reverted',updated_at=now() WHERE transaction_hash=$1 AND status='pending'`, hash)
 			_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_buy_attempts SET status='reverted',updated_at=now() WHERE transaction_hash=$1 AND status='pending'`, hash)
 			_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_pending_actions SET status='reverted',updated_at=now() WHERE transaction_hash=$1 AND status='pending'`, hash)
@@ -1767,6 +2268,12 @@ func (e *Engine) reconcilePending(ctx context.Context) {
 		if !ok {
 			continue
 		}
+		transactionFrom := firstString(m, "from")
+		if transactionFrom == "" {
+			transactionFrom, _ = e.RPC.TransactionFrom(ctx, hash)
+		}
+		gasUsed := firstString(m, "gasUsed")
+		effectiveGasPrice := firstString(m, "effectiveGasPrice", "gasPrice")
 		logs, ok := m["logs"].([]any)
 		if !ok {
 			continue
@@ -1774,6 +2281,15 @@ func (e *Engine) reconcilePending(ctx context.Context) {
 		for _, raw := range logs {
 			if log, ok := raw.(map[string]any); ok {
 				decoded := chain.DecodeChainEvent(log)
+				if transactionFrom != "" {
+					decoded["transactionFrom"] = transactionFrom
+				}
+				if gasUsed != "" {
+					decoded["gasUsedRaw"] = gasUsed
+				}
+				if effectiveGasPrice != "" {
+					decoded["effectiveGasPriceRaw"] = effectiveGasPrice
+				}
 				if ev, good := decodeEvent(decoded); good {
 					_ = e.processForMonitors(ctx, ev)
 				}
@@ -1901,7 +2417,7 @@ func hexNumber(s string) *big.Int {
 	return n
 }
 func (e *Engine) checkScheduled(ctx context.Context) {
-	rows, err := e.Store.DB.Query(ctx, `SELECT user_id,token_address,curve_address,token_amount_raw::text,average_cost_usd::double precision,first_buy_price::double precision,last_buy_price::double precision,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at FROM strategy_positions WHERE next_scheduled_sell_at IS NOT NULL AND next_scheduled_sell_at<=now() AND token_amount_raw>0`)
+	rows, err := e.Store.DB.Query(ctx, `SELECT user_id,token_address,curve_address,token_amount_raw::text,quote_spent_raw,cost_usd_raw,average_cost_usd::double precision,first_buy_price::double precision,last_buy_price::double precision,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at FROM strategy_positions WHERE next_scheduled_sell_at IS NOT NULL AND next_scheduled_sell_at<=now() AND token_amount_raw>0`)
 	if err != nil {
 		return
 	}
@@ -1909,7 +2425,7 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 	for rows.Next() {
 		var ev Event
 		var p position
-		if rows.Scan(&ev.UserID, &ev.TokenAddress, &ev.CurveAddress, &p.AmountRaw, &p.AverageCost, &p.FirstPrice, &p.LastPrice, &p.BuyCount, &p.SellCount, &p.ProfitLevel, &p.FirstBought, &p.NextScheduled, &p.CooldownUntil, &p.LastBuy) != nil {
+		if rows.Scan(&ev.UserID, &ev.TokenAddress, &ev.CurveAddress, &p.AmountRaw, &p.QuoteSpentRaw, &p.CostUSDScaledRaw, &p.AverageCost, &p.FirstPrice, &p.LastPrice, &p.BuyCount, &p.SellCount, &p.ProfitLevel, &p.FirstBought, &p.NextScheduled, &p.CooldownUntil, &p.LastBuy) != nil {
 			continue
 		}
 		p.AmountRaw = integerText(p.AmountRaw)
@@ -1934,7 +2450,9 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 		if token.Decimals != nil {
 			tokenDecimals = *token.Decimals
 		}
-		forceFull := c.SellPolicy.FullSellAfterSellCount > 0 && p.SellCount >= c.SellPolicy.FullSellAfterSellCount
+		// SellCount records confirmed sells. Include the scheduled sell being
+		// planned so the threshold applies to that sell itself.
+		forceFull := c.SellPolicy.FullSellAfterSellCount > 0 && p.SellCount+1 >= c.SellPolicy.FullSellAfterSellCount
 		amount := p.Amount
 		if !forceFull && c.ScheduledSell.SellRatio > 0 {
 			amount = p.Amount * c.ScheduledSell.SellRatio
@@ -1966,6 +2484,7 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 		ev.Price = price
 		ev.PriceRaw = rawTokenPriceFromUSD(price, token)
 		ev.TokenDecimals = tokenDecimals
+		ev.ExecutionAmountRaw = exactSellAmountRaw(p, amount)
 		if token.QuoteDecimals != nil {
 			ev.QuoteDecimals = *token.QuoteDecimals
 		}

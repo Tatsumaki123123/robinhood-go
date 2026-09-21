@@ -218,6 +218,21 @@ func (r *RPC) Tx(ctx context.Context, hash string) (any, error) {
 	}
 	return map[string]any{"transaction": tx, "receipt": receipt}, nil
 }
+
+func (r *RPC) TransactionFrom(ctx context.Context, hash string) (string, error) {
+	v, e := r.Call(ctx, "eth_getTransactionByHash", []any{hash})
+	if e != nil {
+		return "", e
+	}
+	var tx struct {
+		From string `json:"from"`
+	}
+	if e = json.Unmarshal(v, &tx); e != nil {
+		return "", e
+	}
+	return strings.TrimSpace(tx.From), nil
+}
+
 func (r *RPC) Receipt(ctx context.Context, hash string) (any, error) {
 	v, e := r.Call(ctx, "eth_getTransactionReceipt", []any{hash})
 	if e != nil {
