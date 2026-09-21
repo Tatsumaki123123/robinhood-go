@@ -1029,7 +1029,7 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 			// Pending replacement is a V4-only path. Legacy Pons buys keep the
 			// original one-shot transaction behavior even when the strategy flag
 			// is enabled.
-			accepted, pe := e.persistPendingBuy(ctx, ev, amount, cfg.ReplacePending && ev.PoolID != "")
+			accepted, pe := e.persistPendingBuy(ctx, ev, amount, cfg.ReplacePending && ev.PoolID != "", cfg.PendingBuyTimeoutSecond)
 			if pe != nil {
 				e.devInfo("交易未执行",
 					zap.Error(pe),
@@ -1043,6 +1043,7 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 				e.devInfo("交易未执行",
 					zap.String("reason", "pending_buy_not_accepted"),
 					zap.Bool("replacePending", cfg.ReplacePending),
+					zap.Int("pendingBuyTimeoutSecond", cfg.PendingBuyTimeoutSecond),
 					zap.String("token", ev.TokenAddress),
 				)
 				return nil
@@ -1352,16 +1353,19 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 	return e.Trading.PonsSwap(ctx, map[string]any{"curveAddress": t.CurveAddress, "tokenAddress": t.TokenAddress, "recipient": u.WalletAddress, "privateKey": key, "amountRaw": amountRaw, "slippageBps": integerRaw(cfg.Slippage * 10000)}, side == "buy")
 }
 
-func (e *Engine) persistPendingBuy(ctx context.Context, ev Event, amount float64, replace bool) (bool, error) {
+// persistPendingBuy accepts an existing pending buy for fee-bumped replacement
+// after the configured timeout. The original hash remains in buy_attempts so
+// receipt reconciliation can still classify it if it eventually lands.
+func (e *Engine) persistPendingBuy(ctx context.Context, ev Event, amount float64, replace bool, timeoutSecond int) (bool, error) {
 	var accepted bool
 	if replace {
-		err := e.Store.DB.QueryRow(ctx, `INSERT INTO strategy_pending_buys(user_id,token_address,curve_address,quote_usd,source_event_key,replacement_count,status) VALUES($1,$2,$3,$4,$5,0,'pending') ON CONFLICT(user_id,token_address,curve_address) DO UPDATE SET quote_usd=EXCLUDED.quote_usd,source_event_key=EXCLUDED.source_event_key,replacement_count=strategy_pending_buys.replacement_count+1,updated_at=now() WHERE strategy_pending_buys.status='pending' RETURNING true`, ev.UserID, ev.TokenAddress, ev.CurveAddress, amount, ev.Key).Scan(&accepted)
+		err := e.Store.DB.QueryRow(ctx, `INSERT INTO strategy_pending_buys(user_id,token_address,curve_address,quote_usd,source_event_key,replacement_count,status) VALUES($1,$2,$3,$4,$5,0,'pending') ON CONFLICT(user_id,token_address,curve_address) DO UPDATE SET quote_usd=EXCLUDED.quote_usd,source_event_key=EXCLUDED.source_event_key,transaction_hash=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.transaction_hash ELSE NULL END,nonce=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.nonce ELSE NULL END,max_fee_per_gas=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.max_fee_per_gas ELSE NULL END,max_priority_fee_per_gas=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.max_priority_fee_per_gas ELSE NULL END,amount_out_minimum_raw=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.amount_out_minimum_raw ELSE NULL END,winner_transaction_hash=NULL,replacement_count=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.replacement_count+1 ELSE 0 END,status='pending',updated_at=now() WHERE strategy_pending_buys.status IN ('reverted','failed','expired') OR (strategy_pending_buys.status='pending' AND $6 > 0 AND strategy_pending_buys.updated_at < now() - ($6 * interval '1 second')) RETURNING true`, ev.UserID, ev.TokenAddress, ev.CurveAddress, amount, ev.Key, timeoutSecond).Scan(&accepted)
 		if err != nil && strings.Contains(strings.ToLower(err.Error()), "no rows") {
 			return false, nil
 		}
 		return accepted, err
 	}
-	err := e.Store.DB.QueryRow(ctx, `INSERT INTO strategy_pending_buys(user_id,token_address,curve_address,quote_usd,source_event_key,status) VALUES($1,$2,$3,$4,$5,'pending') ON CONFLICT(user_id,token_address,curve_address) DO NOTHING RETURNING true`, ev.UserID, ev.TokenAddress, ev.CurveAddress, amount, ev.Key).Scan(&accepted)
+	err := e.Store.DB.QueryRow(ctx, `INSERT INTO strategy_pending_buys(user_id,token_address,curve_address,quote_usd,source_event_key,status) VALUES($1,$2,$3,$4,$5,'pending') ON CONFLICT(user_id,token_address,curve_address) DO UPDATE SET quote_usd=EXCLUDED.quote_usd,source_event_key=EXCLUDED.source_event_key,transaction_hash=NULL,nonce=NULL,max_fee_per_gas=NULL,max_priority_fee_per_gas=NULL,amount_out_minimum_raw=NULL,winner_transaction_hash=NULL,replacement_count=0,status='pending',updated_at=now() WHERE strategy_pending_buys.status IN ('reverted','failed','expired') OR (strategy_pending_buys.status='pending' AND $6 > 0 AND strategy_pending_buys.updated_at < now() - ($6 * interval '1 second')) RETURNING true`, ev.UserID, ev.TokenAddress, ev.CurveAddress, amount, ev.Key, timeoutSecond).Scan(&accepted)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "no rows") {
 		return false, nil
 	}

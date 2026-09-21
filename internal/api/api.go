@@ -349,7 +349,7 @@ func (a *API) userUpdate(c *fiber.Ctx) error {
 			cfg[k] = v
 		}
 	}
-	for _, k := range []string{"enabled", "minMcp", "slippage", "diffBuySecond", "autoSellSecond", "autoProfitRatio", "autoLossRatio", "maxLossBuyTimes", "minLossBuyRatio", "onceSellMinRatio", "replacePending", "tokenConfig", "sellPolicy", "scheduledSell", "externalBuySell", "profitSell", "lossSell", "listConfig"} {
+	for _, k := range []string{"enabled", "minMcp", "slippage", "diffBuySecond", "autoSellSecond", "autoProfitRatio", "autoLossRatio", "maxLossBuyTimes", "minLossBuyRatio", "onceSellMinRatio", "replacePending", "pendingBuyTimeoutSecond", "tokenConfig", "sellPolicy", "scheduledSell", "externalBuySell", "profitSell", "lossSell", "listConfig"} {
 		if v, ok := d[k]; ok {
 			cfg[k] = v
 		}
@@ -454,20 +454,21 @@ type apiListConfigView struct {
 // apiConfigView is deliberately a struct: encoding a map cannot guarantee
 // the field order required by the existing frontend response contract.
 type apiConfigView struct {
-	Name            string                 `json:"name"`
-	MinMCP          float64                `json:"minMcp"`
-	Slippage        float64                `json:"slippage"`
-	DiffBuySecond   int                    `json:"diffBuySecond"`
-	MaxLossBuyTimes int                    `json:"maxLossBuyTimes"`
-	MinLossBuyRatio float64                `json:"minLossBuyRatio"`
-	ReplacePending  bool                   `json:"replacePending"`
-	SellPolicy      apiSellPolicyView      `json:"sellPolicy"`
-	ScheduledSell   apiScheduledSellView   `json:"scheduledSell"`
-	ExternalBuySell apiExternalBuySellView `json:"externalBuySell"`
-	ProfitSell      apiProfitSellView      `json:"profitSell"`
-	LossSell        apiLossSellView        `json:"lossSell"`
-	TokenConfig     []apiTokenRuleView     `json:"tokenConfig"`
-	ListConfig      apiListConfigView      `json:"listConfig"`
+	Name                    string                 `json:"name"`
+	MinMCP                  float64                `json:"minMcp"`
+	Slippage                float64                `json:"slippage"`
+	DiffBuySecond           int                    `json:"diffBuySecond"`
+	MaxLossBuyTimes         int                    `json:"maxLossBuyTimes"`
+	MinLossBuyRatio         float64                `json:"minLossBuyRatio"`
+	ReplacePending          bool                   `json:"replacePending"`
+	PendingBuyTimeoutSecond int                    `json:"pendingBuyTimeoutSecond"`
+	SellPolicy              apiSellPolicyView      `json:"sellPolicy"`
+	ScheduledSell           apiScheduledSellView   `json:"scheduledSell"`
+	ExternalBuySell         apiExternalBuySellView `json:"externalBuySell"`
+	ProfitSell              apiProfitSellView      `json:"profitSell"`
+	LossSell                apiLossSellView        `json:"lossSell"`
+	TokenConfig             []apiTokenRuleView     `json:"tokenConfig"`
+	ListConfig              apiListConfigView      `json:"listConfig"`
 }
 
 // userView mirrors the Node service's public monitor-user DTO. Database
@@ -491,7 +492,7 @@ func (a *API) userView(u store.User, withBalance bool) map[string]any {
 	public := apiConfigView{
 		Name: name, MinMCP: cfg.MinMCP, Slippage: cfg.Slippage,
 		DiffBuySecond: cfg.DiffBuySecond, MaxLossBuyTimes: cfg.MaxLossBuyTimes,
-		MinLossBuyRatio: cfg.MinLossBuyRatio, ReplacePending: cfg.ReplacePending,
+		MinLossBuyRatio: cfg.MinLossBuyRatio, ReplacePending: cfg.ReplacePending, PendingBuyTimeoutSecond: cfg.PendingBuyTimeoutSecond,
 		SellPolicy:      apiSellPolicyView{FullSellAfterSellCount: cfg.SellPolicy.FullSellAfterSellCount, ResetSellCountOnBuy: cfg.SellPolicy.ResetSellCountOnBuy},
 		ScheduledSell:   apiScheduledSellView{Enabled: cfg.ScheduledSell.Enabled, IntervalSecond: cfg.ScheduledSell.IntervalSecond, SellRatio: cfg.ScheduledSell.SellRatio, BaseUSD: cfg.ScheduledSell.BaseUSD, ResetOnBuy: cfg.ScheduledSell.ResetOnBuy},
 		ExternalBuySell: apiExternalBuySellView{Enabled: cfg.ExternalBuySell.Enabled, MinBuyUSD: cfg.ExternalBuySell.MinBuyUSD, BuyImpactRatio: cfg.ExternalBuySell.BuyImpactRatio, NeedProfit: cfg.ExternalBuySell.NeedProfit, ProfitRatio: cfg.ExternalBuySell.ProfitRatio, SellRatio: cfg.ExternalBuySell.SellRatio, BuyAmountRatio: cfg.ExternalBuySell.BuyAmountRatio, CooldownSecond: cfg.ExternalBuySell.CooldownSecond},

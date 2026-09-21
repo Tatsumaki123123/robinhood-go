@@ -53,24 +53,25 @@ type LossSell struct {
 	SellAll      bool    `json:"sellAll"`
 }
 type Config struct {
-	Name            string          `json:"name"`
-	Enabled         bool            `json:"enabled"`
-	MinMCP          float64         `json:"minMcp"`
-	Slippage        float64         `json:"slippage"`
-	DiffBuySecond   int             `json:"diffBuySecond"`
-	AutoSellSecond  int             `json:"autoSellSecond"`
-	AutoProfitRatio float64         `json:"autoProfitRatio"`
-	AutoLossRatio   float64         `json:"autoLossRatio"`
-	MaxLossBuyTimes int             `json:"maxLossBuyTimes"`
-	MinLossBuyRatio float64         `json:"minLossBuyRatio"`
-	ReplacePending  bool            `json:"replacePending"`
-	TokenConfig     []TokenRule     `json:"tokenConfig"`
-	SellPolicy      SellPolicy      `json:"sellPolicy"`
-	ScheduledSell   ScheduledSell   `json:"scheduledSell"`
-	ExternalBuySell ExternalBuySell `json:"externalBuySell"`
-	ProfitSell      ProfitSell      `json:"profitSell"`
-	LossSell        LossSell        `json:"lossSell"`
-	ListConfig      ListConfig      `json:"listConfig"`
+	Name                    string          `json:"name"`
+	Enabled                 bool            `json:"enabled"`
+	MinMCP                  float64         `json:"minMcp"`
+	Slippage                float64         `json:"slippage"`
+	DiffBuySecond           int             `json:"diffBuySecond"`
+	AutoSellSecond          int             `json:"autoSellSecond"`
+	AutoProfitRatio         float64         `json:"autoProfitRatio"`
+	AutoLossRatio           float64         `json:"autoLossRatio"`
+	MaxLossBuyTimes         int             `json:"maxLossBuyTimes"`
+	MinLossBuyRatio         float64         `json:"minLossBuyRatio"`
+	ReplacePending          bool            `json:"replacePending"`
+	PendingBuyTimeoutSecond int             `json:"pendingBuyTimeoutSecond"`
+	TokenConfig             []TokenRule     `json:"tokenConfig"`
+	SellPolicy              SellPolicy      `json:"sellPolicy"`
+	ScheduledSell           ScheduledSell   `json:"scheduledSell"`
+	ExternalBuySell         ExternalBuySell `json:"externalBuySell"`
+	ProfitSell              ProfitSell      `json:"profitSell"`
+	LossSell                LossSell        `json:"lossSell"`
+	ListConfig              ListConfig      `json:"listConfig"`
 }
 
 type ListConfig struct {
@@ -91,7 +92,7 @@ func Parse(v map[string]any) Config {
 	// behavior (an omitted nested switch is disabled).
 	c := Config{
 		Name: "strategy", Enabled: true, MinMCP: 100000, Slippage: 0.2,
-		ReplacePending:  true,
+		ReplacePending: true, PendingBuyTimeoutSecond: 2,
 		SellPolicy:      SellPolicy{FullSellAfterSellCount: 3, ResetSellCountOnBuy: true},
 		ScheduledSell:   ScheduledSell{Enabled: true, IntervalSecond: 1250, SellRatio: 0.2, BaseUSD: 150, ResetOnBuy: false},
 		ExternalBuySell: ExternalBuySell{Enabled: true, MinBuyUSD: 100, BuyImpactRatio: 0.03, NeedProfit: true, ProfitRatio: 0.05, SellRatio: 0.2, BuyAmountRatio: 0, CooldownSecond: 30},
