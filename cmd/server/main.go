@@ -52,7 +52,7 @@ func main() {
 		rpc.Subscribe(ctx, map[string]any{"address": []string{"0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e"}})
 	}
 	engine := strategy.New(st, rpc)
-	engine.ConfigureTrading(tr, cfg.EncryptionKey)
+	engine.ConfigureTrading(tr, cfg.EncryptionKey, cfg.NativeUSDPrice)
 	engine.ConfigureLogging(log, cfg.Env)
 	service.SetMonitorCacheInvalidator(engine.InvalidateMonitorCache)
 	go engine.Run(ctx)

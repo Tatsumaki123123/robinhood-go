@@ -76,17 +76,18 @@ type Engine struct {
 	// mutate strategy state; own-chain fill events call applyOwnFill after a
 	// successful receipt. Keeping this hook optional preserves deterministic
 	// replay/testing of the strategy engine.
-	ExecuteAction func(context.Context, Event, string, float64) (map[string]any, error)
-	Trading       *chain.Trading
-	EncryptionKey string
-	supplies      sync.Map // token address -> cached total supply raw
-	curveBlocks   sync.Map // curve address -> last polled block
-	pollMu        sync.Mutex
-	monitorMu     sync.RWMutex
-	monitorUsers  map[int64]store.User
-	monitorTokens map[int64][]store.Token
-	monitorAt     time.Time
-	monitorLoadMu sync.Mutex
+	ExecuteAction  func(context.Context, Event, string, float64) (map[string]any, error)
+	Trading        *chain.Trading
+	EncryptionKey  string
+	NativeUSDPrice string
+	supplies       sync.Map // token address -> cached total supply raw
+	curveBlocks    sync.Map // curve address -> last polled block
+	pollMu         sync.Mutex
+	monitorMu      sync.RWMutex
+	monitorUsers   map[int64]store.User
+	monitorTokens  map[int64][]store.Token
+	monitorAt      time.Time
+	monitorLoadMu  sync.Mutex
 }
 
 func New(s *store.Store, r *chain.RPC) *Engine {
@@ -108,8 +109,11 @@ func (e *Engine) devInfo(message string, fields ...zap.Field) {
 	}
 }
 
-func (e *Engine) ConfigureTrading(t *chain.Trading, encryptionKey string) {
+func (e *Engine) ConfigureTrading(t *chain.Trading, encryptionKey string, nativeUSDPrice ...string) {
 	e.Trading, e.EncryptionKey = t, encryptionKey
+	if len(nativeUSDPrice) > 0 {
+		e.NativeUSDPrice = strings.TrimSpace(nativeUSDPrice[0])
+	}
 }
 
 // InvalidateMonitorCache is called by the HTTP mutation handlers after a
@@ -632,13 +636,27 @@ func decodeEvent(raw map[string]any) (Event, bool) {
 func firstString(m map[string]any, keys ...string) string {
 	for _, k := range keys {
 		if v, ok := m[k]; ok && v != nil {
-			s := fmt.Sprint(v)
+			s := stringValue(v)
 			if s != "" && s != "<nil>" {
 				return s
 			}
 		}
 	}
 	return ""
+}
+
+func stringValue(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case *string:
+		if x != nil {
+			return *x
+		}
+		return ""
+	default:
+		return fmt.Sprint(v)
+	}
 }
 
 func absIntegerText(value string) string {
@@ -676,6 +694,129 @@ func rawFloat(value string) float64 {
 	}
 	f, _ := n.Float64()
 	return f
+}
+
+func decimalScaled(value string, decimals int) (*big.Int, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" || decimals < 0 {
+		return nil, false
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) > 2 || parts[0] == "" {
+		return nil, false
+	}
+	whole := new(big.Int)
+	if _, ok := whole.SetString(parts[0], 10); !ok || whole.Sign() < 0 {
+		return nil, false
+	}
+	fraction := ""
+	if len(parts) == 2 {
+		fraction = parts[1]
+	}
+	if len(fraction) > decimals {
+		fraction = fraction[:decimals]
+	}
+	fraction = fraction + strings.Repeat("0", decimals-len(fraction))
+	frac := new(big.Int)
+	if fraction != "" {
+		if _, ok := frac.SetString(fraction, 10); !ok {
+			return nil, false
+		}
+	}
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
+	return new(big.Int).Add(new(big.Int).Mul(whole, scale), frac), true
+}
+
+func quoteToNativeRaw(quoteRaw string, quoteDecimals int, quotePriceEth string) string {
+	quote := new(big.Int)
+	if _, ok := quote.SetString(integerText(quoteRaw), 10); !ok || quote.Sign() <= 0 {
+		return "0"
+	}
+	price, ok := decimalScaled(quotePriceEth, 18)
+	if !ok || price.Sign() <= 0 {
+		return "0"
+	}
+	quoteScale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(quoteDecimals)), nil)
+	return new(big.Int).Quo(new(big.Int).Mul(quote, price), quoteScale).String()
+}
+
+func quotePriceEthFromToken(t store.Token, nativeUSDPrice string) string {
+	quote := strings.ToLower(strings.TrimSpace(t.QuoteTokenAddress))
+	if quote == chain.NativeAddress || quote == chain.WrappedNativeAddress {
+		return "1"
+	}
+	quoteUSD := 0.0
+	if t.QuoteUSDPrice != nil {
+		quoteUSD, _ = strconv.ParseFloat(strings.TrimSpace(*t.QuoteUSDPrice), 64)
+	}
+	if quoteUSD <= 0 && t.QuoteTokenSymbol != nil {
+		switch strings.ToUpper(strings.TrimSpace(*t.QuoteTokenSymbol)) {
+		case "USDG", "USDC", "USDT", "DAI":
+			quoteUSD = 1
+		}
+	}
+	if quoteUSD > 0 && t.TokenPriceEth != nil && t.TokenPriceUsd != nil {
+		tokenPriceEth, _ := strconv.ParseFloat(strings.TrimSpace(*t.TokenPriceEth), 64)
+		tokenPriceUSD, _ := strconv.ParseFloat(strings.TrimSpace(*t.TokenPriceUsd), 64)
+		if tokenPriceEth > 0 && tokenPriceUSD > 0 {
+			return strconv.FormatFloat((tokenPriceEth/tokenPriceUSD)*quoteUSD, 'f', -1, 64)
+		}
+	}
+	nativeUSD, _ := strconv.ParseFloat(strings.TrimSpace(nativeUSDPrice), 64)
+	if quoteUSD <= 0 || nativeUSD <= 0 {
+		return ""
+	}
+	return strconv.FormatFloat(quoteUSD/nativeUSD, 'f', -1, 64)
+}
+
+func nativeRouteMinimumOutput(ev Event, amountRaw string, quoteDecimals int, quotePriceEth string, slippage float64, hops []any) string {
+	amount := new(big.Int)
+	if _, ok := amount.SetString(integerText(amountRaw), 10); !ok || amount.Sign() <= 0 {
+		return "0"
+	}
+	priceEth, ok := decimalScaled(quotePriceEth, 18)
+	if !ok || priceEth.Sign() <= 0 || ev.QuoteAmountText == "" || ev.TokenAmountText == "" {
+		return "0"
+	}
+	quoteScale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(quoteDecimals)), nil)
+	quoteRaw := new(big.Int).Quo(new(big.Int).Mul(amount, quoteScale), priceEth)
+	quoteEvent := new(big.Int)
+	tokenEvent := new(big.Int)
+	if _, ok := quoteEvent.SetString(integerText(ev.QuoteAmountText), 10); !ok || quoteEvent.Sign() <= 0 {
+		return "0"
+	}
+	if _, ok := tokenEvent.SetString(integerText(ev.TokenAmountText), 10); !ok || tokenEvent.Sign() <= 0 {
+		return "0"
+	}
+	expected := new(big.Int).Quo(new(big.Int).Mul(quoteRaw, tokenEvent), quoteEvent)
+	for _, raw := range hops {
+		h, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		fee := ToBig(h["fee"])
+		if fee.Sign() < 0 || fee.Cmp(big.NewInt(1_000_000)) >= 0 {
+			return "0"
+		}
+		expected.Mul(expected, new(big.Int).Sub(big.NewInt(1_000_000), fee))
+		expected.Quo(expected, big.NewInt(1_000_000))
+	}
+	if expected.Sign() <= 0 {
+		return "0"
+	}
+	slipBps := int64(math.Round(slippage * 10_000))
+	if slipBps < 0 {
+		slipBps = 0
+	}
+	if slipBps > 10_000 {
+		slipBps = 10_000
+	}
+	minimum := new(big.Int).Mul(expected, big.NewInt(10_000-slipBps))
+	minimum.Quo(minimum, big.NewInt(10_000))
+	if minimum.Sign() <= 0 {
+		return "1"
+	}
+	return minimum.String()
 }
 
 func rawRatio(raw string, ratio float64) string {
@@ -1072,13 +1213,13 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 	}
 	direction := strings.ToLower(side)
 	for _, route := range routes {
-		if !strings.EqualFold(fmt.Sprint(route["direction"]), direction) {
+		if !strings.EqualFold(stringValue(route["direction"]), direction) {
 			continue
 		}
-		if target := fmt.Sprint(route["targetToken"]); target != "" && !strings.EqualFold(target, ev.TokenAddress) {
+		if target := stringValue(route["targetToken"]); target != "" && !strings.EqualFold(target, ev.TokenAddress) {
 			continue
 		}
-		if ev.PoolID != "" && fmt.Sprint(route["targetPoolId"]) != "" && !strings.EqualFold(fmt.Sprint(route["targetPoolId"]), ev.PoolID) {
+		if ev.PoolID != "" && stringValue(route["targetPoolId"]) != "" && !strings.EqualFold(stringValue(route["targetPoolId"]), ev.PoolID) {
 			continue
 		}
 		hops, ok := route["hops"].([]any)
@@ -1086,23 +1227,42 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 			continue
 		}
 		amountRaw := integerRaw(amount)
+		first := stringValue(route["sourceToken"])
+		destination := stringValue(route["destinationToken"])
+		targetQuotePriceEth := stringValue(route["targetQuotePriceEth"])
+		if targetQuotePriceEth == "" {
+			targetQuotePriceEth = quotePriceEthFromToken(t, e.NativeUSDPrice)
+		}
+		quoteDecimals := 18
+		if t.QuoteDecimals != nil && *t.QuoteDecimals >= 0 {
+			quoteDecimals = *t.QuoteDecimals
+		}
 		if side == "sell" && ev.ExecutionAmountRaw != "" {
 			amountRaw = integerText(ev.ExecutionAmountRaw)
 		}
 		if side == "buy" {
 			usdPerRaw := 0.0
-			if ev.QuoteUSD > 0 && ev.QuoteAmountRaw > 0 {
-				usdPerRaw = ev.QuoteUSD / ev.QuoteAmountRaw
-			} else if t.QuoteUSDPrice != nil && t.QuoteDecimals != nil {
+			if t.QuoteUSDPrice != nil && t.QuoteDecimals != nil {
 				usdPerRaw, _ = strconv.ParseFloat(*t.QuoteUSDPrice, 64)
 				usdPerRaw /= math.Pow10(*t.QuoteDecimals)
+			} else if ev.QuoteUSD > 0 && ev.QuoteAmountRaw > 0 {
+				usdPerRaw = ev.QuoteUSD / ev.QuoteAmountRaw
 			}
 			if usdPerRaw > 0 {
 				amountRaw = integerRaw(amount / usdPerRaw)
 			}
+			quoteIsNative := strings.EqualFold(destination, chain.NativeAddress) || strings.EqualFold(destination, chain.WrappedNativeAddress)
+			if strings.EqualFold(first, chain.NativeAddress) && !quoteIsNative {
+				if targetQuotePriceEth == "" {
+					return nil, fmt.Errorf("route target quote ETH price is missing")
+				}
+				amountRaw = quoteToNativeRaw(amountRaw, quoteDecimals, targetQuotePriceEth)
+				if amountRaw == "0" {
+					return nil, fmt.Errorf("route target quote ETH price is invalid")
+				}
+			}
 		}
 		path := make([]any, 0, len(hops))
-		first := fmt.Sprint(route["sourceToken"])
 		for _, raw := range hops {
 			h, ok := raw.(map[string]any)
 			if !ok {
@@ -1122,14 +1282,26 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 		if rawPrice <= 0 && ev.QuoteAmountRaw > 0 && ev.TokenAmountRaw > 0 {
 			rawPrice = ev.QuoteAmountRaw / ev.TokenAmountRaw
 		}
-		if side == "buy" && rawPrice > 0 && cfg.Slippage >= 0 && cfg.Slippage < 1 {
-			if ev.QuoteAmountText != "" && ev.TokenAmountText != "" {
+		if side == "buy" && cfg.Slippage >= 0 && cfg.Slippage < 1 {
+			quoteIsNative := strings.EqualFold(destination, chain.NativeAddress) || strings.EqualFold(destination, chain.WrappedNativeAddress)
+			if strings.EqualFold(first, chain.NativeAddress) && !quoteIsNative && targetQuotePriceEth != "" {
+				minOut = nativeRouteMinimumOutput(ev, amountRaw, quoteDecimals, targetQuotePriceEth, cfg.Slippage, hops)
+			}
+			if minOut == "0" && (quoteIsNative || targetQuotePriceEth == "") && rawPrice > 0 && ev.QuoteAmountText != "" && ev.TokenAmountText != "" {
 				minOut = amountAtRawRatio(amountRaw, ev.QuoteAmountText, ev.TokenAmountText, cfg.Slippage, true)
-			} else {
+			} else if minOut == "0" && (quoteIsNative || targetQuotePriceEth == "") && rawPrice > 0 {
 				minOut = amountAtRawPrice(amountRaw, rawPrice, cfg.Slippage, true)
 			}
 		}
-		req := map[string]any{"currencyIn": first, "path": path, "amountInRaw": amountRaw, "amountOutMinimumRaw": minOut, "recipient": u.WalletAddress, "privateKey": key, "wrapNative": side == "buy" && strings.EqualFold(first, chain.NativeAddress), "unwrapNative": side == "sell" && strings.EqualFold(fmt.Sprint(route["destinationToken"]), chain.NativeAddress)}
+		e.devInfo("交易执行参数",
+			zap.String("action", side),
+			zap.String("amountInRaw", amountRaw),
+			zap.String("amountOutMinimumRaw", minOut),
+			zap.String("targetQuotePriceEth", targetQuotePriceEth),
+			zap.Int("quoteDecimals", quoteDecimals),
+			zap.String("token", ev.TokenAddress),
+		)
+		req := map[string]any{"currencyIn": first, "path": path, "amountInRaw": amountRaw, "amountOutMinimumRaw": minOut, "recipient": u.WalletAddress, "customRecipient": false, "privateKey": key, "wrapNative": side == "buy" && strings.EqualFold(first, chain.NativeAddress), "unwrapNative": side == "sell" && strings.EqualFold(destination, chain.NativeAddress)}
 		opts := chain.BroadcastOptions{}
 		if side == "buy" {
 			var pendingNonce *int64

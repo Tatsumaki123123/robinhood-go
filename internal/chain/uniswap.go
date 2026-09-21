@@ -15,6 +15,7 @@ const (
 	UniversalRouterAddress = "0x8876789976decbfcbbbe364623c63652db8c0904"
 	AddressThis            = "0x0000000000000000000000000000000000000002"
 	NativeAddress          = "0x0000000000000000000000000000000000000000"
+	WrappedNativeAddress   = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
 	V4SwapCommand          = byte(0x10)
 	WrapETHCommand         = byte(0x0b)
 	UnwrapWETHCommand      = byte(0x0c)
@@ -189,7 +190,12 @@ func encodeV4Route(d map[string]any) (map[string]any, error) {
 	wrap := boolValue(d["wrapNative"])
 	unwrap := boolValue(d["unwrapNative"])
 	recipient := common.HexToAddress(fmt.Sprint(d["recipient"]))
-	custom := d["recipient"] != nil && strings.TrimSpace(fmt.Sprint(d["recipient"])) != ""
+	custom := false
+	if _, supplied := d["customRecipient"]; supplied {
+		custom = boolValue(d["customRecipient"])
+	} else {
+		custom = d["recipient"] != nil && strings.TrimSpace(fmt.Sprint(d["recipient"])) != ""
+	}
 	if recipient == (common.Address{}) {
 		recipient = common.HexToAddress(NativeAddress)
 	}

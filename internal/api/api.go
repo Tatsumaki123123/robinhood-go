@@ -1331,7 +1331,16 @@ func (a *API) routeSave(c *fiber.Ctx) error {
 	if current != target || !strings.EqualFold(str(normalized[len(normalized)-1].(map[string]any)["poolId"]), targetPool) {
 		return httpx.Error(c, 400, "the final route output or targetPoolId is invalid")
 	}
-	v, e := a.Store.SaveRoute(c.Context(), userID, targetPool, source, target, "buy", normalized, target)
+	targetQuotePriceEth := strings.TrimSpace(str(d["targetQuotePriceEth"]))
+	var e error
+	if targetQuotePriceEth == "" {
+		finalHop := normalized[len(normalized)-1].(map[string]any)
+		targetQuotePriceEth, e = a.targetQuotePriceEth(c.Context(), userID, target, targetPool, low(str(finalHop["tokenIn"])))
+		if e != nil {
+			return a.fail(c, e)
+		}
+	}
+	v, e := a.Store.SaveRoute(c.Context(), userID, targetPool, source, target, "buy", normalized, target, targetQuotePriceEth)
 	var sellValue map[string]any
 	if e == nil {
 		reversed := make([]any, len(normalized))
@@ -1339,7 +1348,7 @@ func (a *API) routeSave(c *fiber.Ctx) error {
 			h := normalized[len(normalized)-1-i].(map[string]any)
 			reversed[i] = map[string]any{"poolId": h["poolId"], "currency0": h["currency0"], "currency1": h["currency1"], "fee": h["fee"], "tickSpacing": h["tickSpacing"], "hooks": h["hooks"], "tokenIn": h["tokenOut"], "tokenOut": h["tokenIn"], "hookData": h["hookData"]}
 		}
-		sellValue, e = a.Store.SaveRoute(c.Context(), userID, targetPool, target, source, "sell", reversed, target)
+		sellValue, e = a.Store.SaveRoute(c.Context(), userID, targetPool, target, source, "sell", reversed, target, targetQuotePriceEth)
 	}
 	if e != nil {
 		return a.fail(c, e)

@@ -283,6 +283,60 @@ func reverseRoute(hops []routeHop) []routeHop {
 	return out
 }
 
+// targetQuotePriceEth returns the price of the target pool's quote asset in
+// native ETH. V4 native routes use this value to convert the strategy's USD
+// budget into the native amount sent as msg.value.
+func (a *API) targetQuotePriceEth(ctx context.Context, userID int64, targetToken, targetPool, quote string) (string, error) {
+	quote = normalizeAddress(quote)
+	if quote == nativeAddress || quote == wethAddress {
+		return "1", nil
+	}
+	quoteUSD := ""
+	tokenPriceEth, tokenPriceUSD := 0.0, 0.0
+	tokens, err := a.Store.Tokens(ctx, userID, nil)
+	if err != nil {
+		return "", err
+	}
+	for _, token := range tokens {
+		if !strings.EqualFold(token.TokenAddress, targetToken) || !strings.EqualFold(token.PoolID, targetPool) {
+			continue
+		}
+		if token.QuoteUSDPrice != nil {
+			quoteUSD = strings.TrimSpace(*token.QuoteUSDPrice)
+		}
+		if token.TokenPriceEth != nil {
+			tokenPriceEth, _ = strconv.ParseFloat(strings.TrimSpace(*token.TokenPriceEth), 64)
+		}
+		if token.TokenPriceUsd != nil {
+			tokenPriceUSD, _ = strconv.ParseFloat(strings.TrimSpace(*token.TokenPriceUsd), 64)
+		}
+		if quoteUSD == "" && token.QuoteTokenSymbol != nil {
+			switch strings.ToUpper(strings.TrimSpace(*token.QuoteTokenSymbol)) {
+			case "USDG", "USDC", "USDT", "DAI":
+				quoteUSD = "1"
+			}
+		}
+		break
+	}
+	if quote == usdgAddress {
+		if value, parseErr := strconv.ParseFloat(quoteUSD, 64); parseErr != nil || value <= 0 {
+			quoteUSD = "1"
+		}
+	}
+	quoteUSDValue, quoteErr := strconv.ParseFloat(quoteUSD, 64)
+	if quoteErr != nil || quoteUSDValue <= 0 {
+		return "", fmt.Errorf("target quote USD price is missing; cannot price route quote in ETH")
+	}
+	if tokenPriceEth > 0 && tokenPriceUSD > 0 {
+		return strconv.FormatFloat((tokenPriceEth/tokenPriceUSD)*quoteUSDValue, 'f', -1, 64), nil
+	}
+	nativeUSD, nativeErr := strconv.ParseFloat(strings.TrimSpace(a.Cfg.NativeUSDPrice), 64)
+	if nativeErr != nil || nativeUSD <= 0 {
+		return "", fmt.Errorf("native USD price is missing; cannot price route quote in ETH")
+	}
+	return strconv.FormatFloat(quoteUSDValue/nativeUSD, 'f', -1, 64), nil
+}
+
 func (a *API) persistDiscoveredRoute(ctx context.Context, userID int64, targetToken, targetPool string, hops []routeHop) error {
 	buy := make([]any, len(hops))
 	for i, hop := range hops {
@@ -293,9 +347,16 @@ func (a *API) persistDiscoveredRoute(ctx context.Context, userID int64, targetTo
 	for i, hop := range sellHops {
 		sell[i] = hop.mapValue()
 	}
-	if _, err := a.Store.SaveRoute(ctx, userID, targetPool, nativeAddress, targetToken, "buy", buy, targetToken); err != nil {
+	if len(hops) == 0 {
+		return fmt.Errorf("discovered route is empty")
+	}
+	targetQuotePriceEth, err := a.targetQuotePriceEth(ctx, userID, targetToken, targetPool, hops[len(hops)-1].TokenIn)
+	if err != nil {
 		return err
 	}
-	_, err := a.Store.SaveRoute(ctx, userID, targetPool, targetToken, nativeAddress, "sell", sell, targetToken)
+	if _, err := a.Store.SaveRoute(ctx, userID, targetPool, nativeAddress, targetToken, "buy", buy, targetToken, targetQuotePriceEth); err != nil {
+		return err
+	}
+	_, err = a.Store.SaveRoute(ctx, userID, targetPool, targetToken, nativeAddress, "sell", sell, targetToken, targetQuotePriceEth)
 	return err
 }

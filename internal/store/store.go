@@ -178,7 +178,7 @@ func (s *Store) DeleteToken(ctx context.Context, user int64, address string) err
 	}
 	return e
 }
-func (s *Store) SaveRoute(ctx context.Context, user int64, targetPool, source, dest, direction string, hops any, target string) (map[string]any, error) {
+func (s *Store) SaveRoute(ctx context.Context, user int64, targetPool, source, dest, direction string, hops any, target, targetQuotePriceEth string) (map[string]any, error) {
 	b, _ := json.Marshal(hops)
 	var sourceDecimals *int
 	if strings.EqualFold(source, "0x0000000000000000000000000000000000000000") {
@@ -191,8 +191,13 @@ func (s *Store) SaveRoute(ctx context.Context, user int64, targetPool, source, d
 		}
 	}
 	var id int64
-	err := s.DB.QueryRow(ctx, `INSERT INTO monitor_routes(user_id,target_token,target_pool_id,source_token,destination_token,direction,hops,source_token_decimals,last_verified_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,now()) ON CONFLICT(user_id,target_pool_id,source_token,destination_token,direction) DO UPDATE SET hops=EXCLUDED.hops,source_token_decimals=EXCLUDED.source_token_decimals,enabled=true,last_verified_at=now(),updated_at=now() RETURNING id`, user, target, targetPool, source, dest, direction, b, sourceDecimals).Scan(&id)
-	return map[string]any{"id": id, "userId": user, "targetToken": target, "targetPoolId": targetPool, "sourceToken": source, "destinationToken": dest, "direction": direction, "hops": hops, "sourceTokenDecimals": sourceDecimals, "enabled": true}, err
+	err := s.DB.QueryRow(ctx, `INSERT INTO monitor_routes(user_id,target_token,target_pool_id,source_token,destination_token,direction,hops,source_token_decimals,target_quote_price_eth,last_verified_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9,''),now()) ON CONFLICT(user_id,target_pool_id,source_token,destination_token,direction) DO UPDATE SET hops=EXCLUDED.hops,source_token_decimals=EXCLUDED.source_token_decimals,target_quote_price_eth=COALESCE(EXCLUDED.target_quote_price_eth,monitor_routes.target_quote_price_eth),enabled=true,last_verified_at=now(),updated_at=now() RETURNING id`, user, target, targetPool, source, dest, direction, b, sourceDecimals, strings.TrimSpace(targetQuotePriceEth)).Scan(&id)
+	var quotePrice *string
+	if strings.TrimSpace(targetQuotePriceEth) != "" {
+		value := strings.TrimSpace(targetQuotePriceEth)
+		quotePrice = &value
+	}
+	return map[string]any{"id": id, "userId": user, "targetToken": target, "targetPoolId": targetPool, "sourceToken": source, "destinationToken": dest, "direction": direction, "hops": hops, "sourceTokenDecimals": sourceDecimals, "targetQuotePriceEth": quotePrice, "enabled": true}, err
 }
 func (s *Store) Routes(ctx context.Context, user int64) ([]map[string]any, error) {
 	rows, e := s.DB.Query(ctx, "SELECT id,target_token,target_pool_id,source_token,destination_token,direction,hops,source_token_decimals,target_quote_price_eth,enabled,last_verified_at FROM monitor_routes WHERE user_id=$1 AND enabled=true ORDER BY id", user)
