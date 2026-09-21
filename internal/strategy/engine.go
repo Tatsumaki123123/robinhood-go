@@ -794,7 +794,7 @@ func nativeRouteMinimumOutput(ev Event, amountRaw string, quoteDecimals int, quo
 		if !ok {
 			continue
 		}
-		fee := ToBig(h["fee"])
+		fee := chain.ToBig(h["fee"])
 		if fee.Sign() < 0 || fee.Cmp(big.NewInt(1_000_000)) >= 0 {
 			return "0"
 		}
