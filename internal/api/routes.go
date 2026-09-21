@@ -327,11 +327,17 @@ func (a *API) targetQuotePriceEth(ctx context.Context, userID int64, targetToken
 	if quoteErr != nil || quoteUSDValue <= 0 {
 		return "", fmt.Errorf("target quote USD price is missing; cannot price route quote in ETH")
 	}
-	if tokenPriceEth > 0 && tokenPriceUSD > 0 {
-		return strconv.FormatFloat((tokenPriceEth/tokenPriceUSD)*quoteUSDValue, 'f', -1, 64), nil
-	}
 	nativeUSD, nativeErr := strconv.ParseFloat(strings.TrimSpace(a.Cfg.NativeUSDPrice), 64)
 	if nativeErr != nil || nativeUSD <= 0 {
+		var cached *string
+		if err := a.Store.DB.QueryRow(ctx, "SELECT eth_usd_price::text FROM ave_configs WHERE id=1 AND eth_usd_price IS NOT NULL AND eth_usd_price > 0").Scan(&cached); err == nil && cached != nil {
+			nativeUSD, nativeErr = strconv.ParseFloat(strings.TrimSpace(*cached), 64)
+		}
+	}
+	if nativeErr != nil || nativeUSD <= 0 {
+		if tokenPriceEth > 0 && tokenPriceUSD > 0 {
+			return strconv.FormatFloat((tokenPriceEth/tokenPriceUSD)*quoteUSDValue, 'f', -1, 64), nil
+		}
 		return "", fmt.Errorf("native USD price is missing; cannot price route quote in ETH")
 	}
 	return strconv.FormatFloat(quoteUSDValue/nativeUSD, 'f', -1, 64), nil

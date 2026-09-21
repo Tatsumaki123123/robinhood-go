@@ -755,6 +755,10 @@ func quotePriceEthFromToken(t store.Token, nativeUSDPrice string) string {
 			quoteUSD = 1
 		}
 	}
+	nativeUSD, _ := strconv.ParseFloat(strings.TrimSpace(nativeUSDPrice), 64)
+	if quoteUSD > 0 && nativeUSD > 0 {
+		return strconv.FormatFloat(quoteUSD/nativeUSD, 'f', -1, 64)
+	}
 	if quoteUSD > 0 && t.TokenPriceEth != nil && t.TokenPriceUsd != nil {
 		tokenPriceEth, _ := strconv.ParseFloat(strings.TrimSpace(*t.TokenPriceEth), 64)
 		tokenPriceUSD, _ := strconv.ParseFloat(strings.TrimSpace(*t.TokenPriceUsd), 64)
@@ -762,11 +766,17 @@ func quotePriceEthFromToken(t store.Token, nativeUSDPrice string) string {
 			return strconv.FormatFloat((tokenPriceEth/tokenPriceUSD)*quoteUSD, 'f', -1, 64)
 		}
 	}
-	nativeUSD, _ := strconv.ParseFloat(strings.TrimSpace(nativeUSDPrice), 64)
-	if quoteUSD <= 0 || nativeUSD <= 0 {
-		return ""
+	return ""
+}
+
+func (e *Engine) nativeUSDPrice(ctx context.Context) string {
+	if e.Store != nil && e.Store.DB != nil {
+		var price *string
+		if err := e.Store.DB.QueryRow(ctx, "SELECT eth_usd_price::text FROM ave_configs WHERE id=1 AND eth_usd_price IS NOT NULL AND eth_usd_price > 0").Scan(&price); err == nil && price != nil && strings.TrimSpace(*price) != "" {
+			return strings.TrimSpace(*price)
+		}
 	}
-	return strconv.FormatFloat(quoteUSD/nativeUSD, 'f', -1, 64)
+	return strings.TrimSpace(e.NativeUSDPrice)
 }
 
 func nativeRouteMinimumOutput(ev Event, amountRaw string, quoteDecimals int, quotePriceEth string, slippage float64, hops []any) string {
@@ -1232,7 +1242,7 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 		destination := stringValue(route["destinationToken"])
 		targetQuotePriceEth := stringValue(route["targetQuotePriceEth"])
 		if targetQuotePriceEth == "" {
-			targetQuotePriceEth = quotePriceEthFromToken(t, e.NativeUSDPrice)
+			targetQuotePriceEth = quotePriceEthFromToken(t, e.nativeUSDPrice(ctx))
 		}
 		quoteDecimals := 18
 		if t.QuoteDecimals != nil && *t.QuoteDecimals >= 0 {

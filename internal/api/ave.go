@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,62 @@ import (
 const avePublicKey = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp7rxCs+UF5QjAZWY63Ow1rNY4prtorIRawALlqGcWrDP2TKqC6XLybJCwOZ8HCGYzzHdQJFBLb8wlbaAJxg2/G+glwN/Hp1xNuYw6uJ7LTFMZCFsU5ReLxZ83uVs/uG80vyrpaiN+eU58B9j12+w4VbIv4dd0a5ILAQMLjJQiUgiGfD4JI9ic8qCNwOo2su3wdKthMeg5WYhYXtKJyUBJMn5odKd7XOQO7KmsuHy+dEbutSPuC2kTY+y2bzHUdTYeUp6U/GUZCjHirZCUCQyCBPE8nWoCRjhP9+ewSKSRPaTOG/uicrN1cUZC5Oal9PPigGAJ8gkKTPDgZHFPXTKuQIDAQAB"
 
 var errAveAuthExpired = errors.New("AVE x-auth expired or rejected")
+
+const aveWETHAddress = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
+
+// StartAvePriceRefresh mirrors the Node service's one-minute ETH/USD refresh.
+// The value is persisted so the strategy engine can use it without depending
+// on the API handler's in-memory state.
+func (a *API) StartAvePriceRefresh(ctx context.Context) {
+	refresh := func() {
+		_, _ = a.refreshAveEthUSDPrice(ctx)
+	}
+	go refresh()
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				refresh()
+			}
+		}
+	}()
+}
+
+func (a *API) refreshAveEthUSDPrice(ctx context.Context) (string, error) {
+	tokenID := aveWETHAddress + "-robinhood"
+	auth, err := a.aveAuth(ctx)
+	if err != nil {
+		return "", err
+	}
+	body := map[string]any{"token_ids": []string{tokenID}}
+	out, err := a.aveDoJSON(ctx, http.MethodPost, "/v1api/v2/tokens/price4h5", nil, body, auth)
+	if errors.Is(err, errAveAuthExpired) {
+		auth, err = a.refreshAveAuth(ctx, auth)
+		if err != nil {
+			return "", err
+		}
+		out, err = a.aveDoJSON(ctx, http.MethodPost, "/v1api/v2/tokens/price4h5", nil, body, auth)
+	}
+	if err != nil {
+		return "", err
+	}
+	quote, _ := out[tokenID].(map[string]any)
+	price, err := strconv.ParseFloat(strings.TrimSpace(str(quote["current_price_usd"])), 64)
+	if err != nil || price <= 0 {
+		return "", fmt.Errorf("AVE returned an invalid ETH/USD price")
+	}
+	priceText := strconv.FormatFloat(price, 'f', -1, 64)
+	_, err = a.Store.DB.Exec(ctx, `INSERT INTO ave_configs(id,x_auth,eth_usd_price,eth_usd_price_updated_at) VALUES(1,$1,$2,now()) ON CONFLICT(id) DO UPDATE SET x_auth=EXCLUDED.x_auth,eth_usd_price=EXCLUDED.eth_usd_price,eth_usd_price_updated_at=EXCLUDED.eth_usd_price_updated_at,updated_at=now()`, auth, priceText)
+	if err != nil {
+		return "", err
+	}
+	a.Cfg.NativeUSDPrice = priceText
+	return priceText, nil
+}
 
 func (a *API) aveAuth(ctx context.Context) (string, error) {
 	if a.Store == nil || a.Store.DB == nil {
