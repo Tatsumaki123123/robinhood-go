@@ -498,7 +498,11 @@ func marketCapFromEvent(ev Event, t store.Token) float64 {
 		quoteUSD, _ = strconv.ParseFloat(strings.TrimSpace(*t.QuoteUSDPrice), 64)
 	}
 	if quoteUSD <= 0 {
-		switch strings.ToUpper(strings.TrimSpace(t.QuoteTokenSymbol)) {
+		quoteSymbol := ""
+		if t.QuoteTokenSymbol != nil {
+			quoteSymbol = strings.TrimSpace(*t.QuoteTokenSymbol)
+		}
+		switch strings.ToUpper(quoteSymbol) {
 		case "USDG", "USDC", "USDT", "DAI":
 			quoteUSD = 1
 		}
