@@ -372,6 +372,12 @@ func (t *Trading) BroadcastV4(ctx context.Context, d map[string]any, opts Broadc
 		}
 		base, tip = mul(base), mul(tip)
 	}
+	if currentBase, baseErr := t.RPC.BaseFee(ctx); baseErr == nil && currentBase.Sign() > 0 {
+		minimumFee := new(big.Int).Add(currentBase, tip)
+		if base.Cmp(minimumFee) < 0 {
+			base = minimumFee
+		}
+	}
 	chainID := big.NewInt(t.ChainID)
 	tx := types.NewTx(&types.DynamicFeeTx{ChainID: chainID, Nonce: nonce, To: ptrAddress(to), Value: value, Gas: gas, GasFeeCap: base, GasTipCap: tip, Data: data})
 	signed, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), key)

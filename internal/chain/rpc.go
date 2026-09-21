@@ -263,6 +263,28 @@ func (r *RPC) GasPrice(ctx context.Context) (*big.Int, error) {
 	}
 	return n, nil
 }
+
+func (r *RPC) BaseFee(ctx context.Context) (*big.Int, error) {
+	v, e := r.Call(ctx, "eth_getBlockByNumber", []any{"latest", false})
+	if e != nil {
+		return nil, e
+	}
+	var block struct {
+		BaseFeePerGas string `json:"baseFeePerGas"`
+	}
+	if e := json.Unmarshal(v, &block); e != nil {
+		return nil, e
+	}
+	if block.BaseFeePerGas == "" {
+		return big.NewInt(0), nil
+	}
+	n := new(big.Int)
+	if _, ok := n.SetString(strings.TrimPrefix(block.BaseFeePerGas, "0x"), 16); !ok {
+		return nil, fmt.Errorf("invalid base fee")
+	}
+	return n, nil
+}
+
 func (r *RPC) Subscribe(ctx context.Context, params map[string]any) {
 	if r.WS == "" {
 		return
