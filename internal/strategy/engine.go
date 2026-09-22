@@ -101,6 +101,8 @@ type Engine struct {
 	ownCacheSweep  time.Time
 }
 
+const pendingSellTimeout = 5 * time.Second
+
 func New(s *store.Store, r *chain.RPC) *Engine {
 	return &Engine{Store: s, RPC: r, monitorUsers: make(map[int64]store.User), monitorTokens: make(map[int64][]store.Token)}
 }
@@ -2319,9 +2321,64 @@ func (e *Engine) Tick(ctx context.Context) {
 			return
 		case <-t.C:
 			_ = e.refreshMonitorCache(ctx, false)
+			e.expirePendingSells(ctx)
 			e.checkScheduled(ctx)
 			e.pollCurves(ctx)
 		}
+	}
+}
+
+// CleanupExpiredPendingSells runs the startup reconciliation once before the
+// regular strategy ticker begins.
+func (e *Engine) CleanupExpiredPendingSells(ctx context.Context) {
+	e.expirePendingSells(ctx)
+}
+
+// expirePendingSells releases sell actions that were accepted by the RPC but
+// never produced a fill event. Expired rows are deleted so they no longer
+// appear in pending-actions queries or block a later strategy decision.
+func (e *Engine) expirePendingSells(ctx context.Context) {
+	if e.Store == nil {
+		return
+	}
+	rows, err := e.Store.DB.Query(ctx, `
+		SELECT transaction_hash,user_id,token_address,curve_address,reason
+		FROM strategy_pending_actions
+		WHERE side='sell'
+		  AND status IN ('pending','confirmed_pending_accounting')
+		  AND updated_at < now() - $1::interval
+		ORDER BY updated_at
+		LIMIT 100`, pendingSellTimeout.String())
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var hash, token, curve, reason string
+		var userID int64
+		if err := rows.Scan(&hash, &userID, &token, &curve, &reason); err != nil {
+			continue
+		}
+		var deleted bool
+		if err := e.Store.DB.QueryRow(ctx, `
+			DELETE FROM strategy_pending_actions
+			WHERE transaction_hash=$1
+			  AND side='sell'
+			  AND status IN ('pending','confirmed_pending_accounting')
+			  AND updated_at < now() - $2::interval
+			RETURNING true`, hash, pendingSellTimeout.String()).Scan(&deleted); err != nil || !deleted {
+			continue
+		}
+		e.devInfo("卖出待处理已超时清理",
+			zap.Int64("userID", userID),
+			zap.String("transactionHash", hash),
+			zap.String("reason", reason),
+			zap.String("status", "deleted"),
+			zap.String("token", token),
+			zap.String("curve", curve),
+			zap.Duration("timeout", pendingSellTimeout),
+		)
+		e.reconcileFailedSell(ctx, userID, token, curve, reason, fmt.Errorf("pending sell timeout: %s", hash))
 	}
 }
 

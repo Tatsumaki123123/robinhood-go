@@ -50,6 +50,11 @@ AVE 请求优先读取数据库 `ave_configs`（`id=1`）的 `x_auth`，未保�
 修改环境文件后用 `docker compose -f docker-compose.dev.yml up -d --force-recreate app`
 重建开发容器以加载新配置。
 
+服务启动后会参考 Node.js 服务执行两项后台同步：每小时从 AVE 刷新已启用
+`monitorToken` 的行情和池数据；每分钟读取启用监控用户的钱包持仓，并将匹配的
+AVE 持仓数量、平均成本和剩余持仓写回 `strategy_positions` 及最近一条
+`monitor_records`。这些请求在后台执行，不会阻塞链上交易事件处理。
+
 策略引擎会在监控用户和代币均启用且存在私钥时使用已缓存的 V4 路由广播买卖；V4 买入的
 nonce、费用上限和替换次数写入 `strategy_pending_buys`，只有 own fill 事件才会更新持仓。
 未配置可执行路由时会回退到 Pons V2 曲线交易。

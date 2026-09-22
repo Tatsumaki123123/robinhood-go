@@ -39,6 +39,7 @@ type API struct {
 	clients                map[*websocket.Conn]struct{}
 	clientsMu              sync.RWMutex
 	aveAuthMu              sync.Mutex
+	aveRefreshMu           sync.Mutex
 	eventsMu               sync.RWMutex
 	deployments            []map[string]any
 	swaps                  []map[string]any
@@ -940,59 +941,10 @@ func (a *API) syncTokens(c *fiber.Ctx) error {
 	if a.Cfg.AveBaseURL == "" {
 		return httpx.Error(c, 503, "AVE service is unavailable")
 	}
+	a.aveRefreshMu.Lock()
+	defer a.aveRefreshMu.Unlock()
 	for _, token := range ts {
-		detail, detailErr := a.aveJSON(c.Context(), "/v2api/token_info/v1/token/detail", map[string]string{"token_id": strings.ToLower(token.TokenAddress) + "-robinhood", "cache_use": "false"})
-		if detailErr != nil {
-			continue
-		}
-		data, _ := detail["data"].(map[string]any)
-		pairs, _ := data["pairs"].([]any)
-		for _, raw := range pairs {
-			pair, ok := raw.(map[string]any)
-			if !ok || !strings.EqualFold(pairAddress(pair, "token0_address", "token0Address"), token.TokenAddress) && !strings.EqualFold(pairAddress(pair, "token1_address", "token1Address"), token.TokenAddress) {
-				continue
-			}
-			if token.QuoteTokenAddress != "" && !pairMatches(pair, token.TokenAddress, token.QuoteTokenAddress) && !strings.EqualFold(token.QuoteTokenAddress, chain.NativeAddress) {
-				continue
-			}
-			if value := pairValue(pair, "market_cap"); value != nil {
-				s := str(value)
-				token.MarketCap = &s
-			}
-			priceKey := "token1_price_usd"
-			if strings.EqualFold(str(pairValue(pair, "token0_address")), token.TokenAddress) {
-				priceKey = "token0_price_usd"
-			}
-			if value := pairValue(pair, priceKey); value != nil {
-				s := str(value)
-				token.TokenPriceUsd = &s
-			}
-			if value := pairValue(pair, "buy_count_5m", "buys_tx_5m_count"); value != nil {
-				v := id(value)
-				token.BuyCount5m = &v
-			}
-			if value := pairValue(pair, "sell_count_5m", "sells_tx_5m_count"); value != nil {
-				v := id(value)
-				token.SellCount5m = &v
-			}
-			if value := pairValue(pair, "price_change_5m"); value != nil {
-				s := str(value)
-				token.PriceChange5m = &s
-			}
-			if value := pairValue(pair, "price_change_1h"); value != nil {
-				s := str(value)
-				token.PriceChange1h = &s
-			}
-			break
-		}
-		if (token.MarketCap == nil || strings.TrimSpace(*token.MarketCap) == "") && token.TotalSupplyRaw != nil && token.Decimals != nil && token.TokenPriceUsd != nil {
-			if marketCap := derivedMarketCapFromSupply(*token.TotalSupplyRaw, *token.Decimals, *token.TokenPriceUsd); marketCap != nil {
-				token.MarketCap = marketCap
-			}
-		}
-		if _, upsertErr := a.Store.UpsertToken(c.Context(), token); upsertErr == nil {
-			// Continue refreshing other tokens if one AVE item is malformed.
-		}
+		_ = a.syncMonitorToken(c.Context(), token)
 	}
 	a.invalidateCache()
 	updated, _ := a.Store.Tokens(c.Context(), userID, &enabledOnly)

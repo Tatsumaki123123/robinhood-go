@@ -49,6 +49,7 @@ func main() {
 	service := api.New(cfg, st, rpc, tr, rd, log)
 	service.Register(app)
 	service.StartAvePriceRefresh(ctx)
+	service.StartAveDataRefresh(ctx)
 	service.StartEventBridge()
 	if cfg.SwapListener {
 		rpc.Subscribe(ctx, map[string]any{"address": []string{cfg.PoolManager}, "topics": []string{"0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f"}})
@@ -60,6 +61,7 @@ func main() {
 	engine.ConfigureTrading(tr, cfg.EncryptionKey, cfg.NativeUSDPrice)
 	engine.ConfigureLogging(log, cfg.Env)
 	service.SetMonitorCacheInvalidator(engine.InvalidateMonitorCache)
+	engine.CleanupExpiredPendingSells(ctx)
 	go engine.Run(ctx)
 	go engine.Tick(ctx)
 	go func() { <-ctx.Done(); _ = app.Shutdown() }()
