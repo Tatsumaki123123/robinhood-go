@@ -616,6 +616,32 @@ func (a *API) strategyData(c *fiber.Ctx) error {
 	}
 	where := strings.Join(filters, " AND ")
 
+	// Raw amounts are stored per token/curve, so fetch the decimals once and
+	// use them to add display values without converting large integers to float.
+	decimalsByKey := make(map[string]strategyAmountDecimals)
+	decimalRows, err := a.Store.DB.Query(c.Context(), `SELECT token_address,curve_address,decimals,quote_decimals,quote_token_address FROM monitor_tokens WHERE `+where, args...)
+	if err != nil {
+		return a.fail(c, err)
+	}
+	for decimalRows.Next() {
+		var token, curve, quoteToken string
+		var tokenDecimals, quoteDecimals *int
+		if err := decimalRows.Scan(&token, &curve, &tokenDecimals, &quoteDecimals, &quoteToken); err != nil {
+			decimalRows.Close()
+			return a.fail(c, err)
+		}
+		if quoteDecimals == nil && strings.EqualFold(quoteToken, chain.NativeAddress) {
+			value := 18
+			quoteDecimals = &value
+		}
+		decimalsByKey[strategyAmountKey(token, curve)] = strategyAmountDecimals{token: tokenDecimals, quote: quoteDecimals}
+	}
+	if err := decimalRows.Err(); err != nil {
+		decimalRows.Close()
+		return a.fail(c, err)
+	}
+	decimalRows.Close()
+
 	positionsRows, err := a.Store.DB.Query(c.Context(), `SELECT token_address,curve_address,token_amount_raw::text,quote_spent_raw,cost_usd_raw,average_cost_usd::double precision,first_buy_price::double precision,last_buy_price::double precision,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at,updated_at FROM strategy_positions WHERE `+where+` AND token_amount_raw>0 ORDER BY updated_at DESC`, args...)
 	if err != nil {
 		return a.fail(c, err)
@@ -630,9 +656,13 @@ func (a *API) strategyData(c *fiber.Ctx) error {
 			positionsRows.Close()
 			return a.fail(c, err)
 		}
+		decimals := decimalsByKey[strategyAmountKey(token, curve)]
 		positions = append(positions, map[string]any{
 			"tokenAddress": token, "curveAddress": curve, "tokenAmountRaw": amountRaw,
 			"quoteSpentRaw": quoteSpentRaw, "costUSDScaledRaw": costUSDScaledRaw,
+			"tokenDecimals": decimalsValue(decimals.token), "quoteDecimals": decimalsValue(decimals.quote),
+			"tokenAmount":    scaledRawAmountValue(amountRaw, decimals.token),
+			"quoteSpent":     scaledRawAmountValue(quoteSpentRaw, decimals.quote),
 			"averageCostUSD": averageCost, "firstBuyPrice": firstPrice, "lastBuyPrice": lastPrice,
 			"buyCount": buyCount, "sellCount": sellCount, "profitSellLevel": profitLevel,
 			"firstBoughtAt": firstBought, "nextScheduledSellAt": nextScheduled,
@@ -662,12 +692,20 @@ func (a *API) strategyData(c *fiber.Ctx) error {
 			tradesRows.Close()
 			return a.fail(c, err)
 		}
+		decimals := decimalsByKey[strategyAmountKey(token, curve)]
 		trades = append(trades, map[string]any{
 			"id": recordID, "type": side, "tokenAddress": token, "curveAddress": curve,
 			"tokenAmountRaw": tokenAmountRaw, "quoteAmountRaw": quoteAmountRaw,
 			"remainTokenAmountRaw": remainTokenRaw, "remainQuoteAmountRaw": remainQuoteRaw,
 			"realizedQuoteAmountRaw": realizedQuoteRaw, "realizedPnlQuoteRaw": realizedPnlRaw,
-			"gasFeeNativeRaw": gasFeeRaw, "transactionHash": txHash, "reason": reason,
+			"tokenDecimals": decimalsValue(decimals.token), "quoteDecimals": decimalsValue(decimals.quote),
+			"tokenAmount":         scaledRawAmountValue(tokenAmountRaw, decimals.token),
+			"quoteAmount":         scaledRawAmountValue(quoteAmountRaw, decimals.quote),
+			"remainTokenAmount":   scaledRawAmountValue(remainTokenRaw, decimals.token),
+			"remainQuoteAmount":   scaledRawAmountValue(remainQuoteRaw, decimals.quote),
+			"realizedQuoteAmount": scaledRawAmountValue(realizedQuoteRaw, decimals.quote),
+			"realizedPnlQuote":    scaledRawAmountValue(realizedPnlRaw, decimals.quote),
+			"gasFeeNativeRaw":     gasFeeRaw, "transactionHash": txHash, "reason": reason,
 			"sourceEventKey": sourceEventKey, "sellCount": sellCount, "profitSellLevel": profitLevel,
 			"createdAt": createdAt,
 		})
@@ -708,6 +746,7 @@ func (a *API) strategyData(c *fiber.Ctx) error {
 	if err := a.Store.DB.QueryRow(c.Context(), `SELECT COALESCE(SUM(realized_quote_amount_raw::numeric),0)::text,COALESCE(SUM(realized_pnl_quote_raw::numeric),0)::text,COUNT(*) FILTER (WHERE type='buy'),COUNT(*) FILTER (WHERE type='sell') FROM monitor_records WHERE `+where, summaryArgs...).Scan(&realizedQuoteRaw, &realizedPnlRaw, &buyCount, &sellCount); err != nil {
 		return a.fail(c, err)
 	}
+	commonQuoteDecimals := commonStrategyQuoteDecimals(decimalsByKey)
 
 	return a.ok(c, map[string]any{
 		"userId":       userID,
@@ -718,6 +757,9 @@ func (a *API) strategyData(c *fiber.Ctx) error {
 		"summary": map[string]any{
 			"realizedQuoteAmountRaw": realizedQuoteRaw,
 			"realizedPnlQuoteRaw":    realizedPnlRaw,
+			"quoteDecimals":          decimalsValue(commonQuoteDecimals),
+			"realizedQuoteAmount":    scaledRawAmountValue(realizedQuoteRaw, commonQuoteDecimals),
+			"realizedPnlQuote":       scaledRawAmountValue(realizedPnlRaw, commonQuoteDecimals),
 			"buyCount":               buyCount,
 			"sellCount":              sellCount,
 		},
@@ -1139,6 +1181,81 @@ func decimalRat(value any) (*big.Rat, bool) {
 	}
 	r, _ := f.Rat(nil)
 	return r, r != nil
+}
+
+func strategyAmountKey(token, curve string) string {
+	return strings.ToLower(strings.TrimSpace(token)) + "\x00" + strings.ToLower(strings.TrimSpace(curve))
+}
+
+func decimalsValue(value *int) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func scaledRawAmountValue(raw string, decimals *int) any {
+	if decimals == nil {
+		return nil
+	}
+	value, ok := scaledRawAmount(raw, *decimals)
+	if !ok {
+		return nil
+	}
+	return value
+}
+
+func scaledRawAmount(raw string, decimals int) (string, bool) {
+	if decimals < 0 || decimals > 255 {
+		return "", false
+	}
+	n, ok := new(big.Int).SetString(strings.TrimSpace(raw), 10)
+	if !ok {
+		return "", false
+	}
+	if decimals == 0 {
+		return n.String(), true
+	}
+	sign := ""
+	if n.Sign() < 0 {
+		sign = "-"
+		n.Abs(n)
+	}
+	scale := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
+	whole := new(big.Int)
+	fraction := new(big.Int)
+	whole.QuoRem(n, scale, fraction)
+	if fraction.Sign() == 0 {
+		return sign + whole.String(), true
+	}
+	fractionText := fraction.String()
+	if padding := decimals - len(fractionText); padding > 0 {
+		fractionText = strings.Repeat("0", padding) + fractionText
+	}
+	fractionText = strings.TrimRight(fractionText, "0")
+	return sign + whole.String() + "." + fractionText, true
+}
+
+type strategyAmountDecimals struct {
+	token, quote *int
+}
+
+func commonStrategyQuoteDecimals(values map[string]strategyAmountDecimals) *int {
+	var common *int
+	for _, value := range values {
+		if value.quote == nil {
+			return nil
+		}
+		if common == nil {
+			v := *value.quote
+			common = &v
+			continue
+		}
+		if *common != *value.quote {
+			return nil
+		}
+	}
+	return common
 }
 
 func formatDecimalRat(value *big.Rat) string {

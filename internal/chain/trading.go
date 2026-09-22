@@ -21,6 +21,9 @@ type Trading struct {
 	ChainID int64
 	Router  string
 	Permit2 string
+	// FixedGasPrice is an optional EIP-1559 max fee / legacy gas price in wei.
+	// When set, transaction submission skips the gasPrice and base-fee reads.
+	FixedGasPrice *big.Int
 }
 
 // BroadcastOptions controls a transaction that is submitted but whose receipt
@@ -211,8 +214,8 @@ func (t *Trading) Swap(ctx context.Context, d map[string]any) (map[string]any, e
 	if preparedToken == "" || preparedToken == "<nil>" {
 		preparedToken = fmt.Sprint(d["currencyIn"])
 	}
-	if preparedToken != "" && preparedToken != "<nil>" && !strings.EqualFold(preparedToken, NativeAddress) && !boolValue(d["wrapNative"]) {
-		if hashes, ae := t.ensureV4Approvals(ctx, key, from, preparedToken, ToBig(d["amountInRaw"])); ae != nil {
+	if preparedToken != "" && preparedToken != "<nil>" && !strings.EqualFold(preparedToken, NativeAddress) && !boolValue(d["wrapNative"]) && !strings.EqualFold(fmt.Sprint(d["side"]), "sell") {
+		if hashes, ae := t.approveV4Max(ctx, key, preparedToken); ae != nil {
 			return nil, ae
 		} else {
 			approvalHashes = hashes
@@ -261,7 +264,7 @@ func (t *Trading) Swap(ctx context.Context, d map[string]any) (map[string]any, e
 	}
 	gasPrice := ToBig(d["gasPrice"])
 	if gasPrice.Sign() == 0 {
-		if gp, ge := t.RPC.GasPrice(ctx); ge == nil {
+		if gp, ge := t.gasPrice(ctx); ge == nil {
 			gasPrice = gp
 		}
 	}
@@ -304,8 +307,8 @@ func (t *Trading) BroadcastV4(ctx context.Context, d map[string]any, opts Broadc
 	if inputToken == "" || inputToken == "<nil>" {
 		inputToken = fmt.Sprint(d["currencyIn"])
 	}
-	if inputToken != "" && inputToken != "<nil>" && !strings.EqualFold(inputToken, NativeAddress) && !boolValue(d["wrapNative"]) {
-		if _, err = t.ensureV4Approvals(ctx, key, from, inputToken, ToBig(d["amountInRaw"])); err != nil {
+	if inputToken != "" && inputToken != "<nil>" && !strings.EqualFold(inputToken, NativeAddress) && !boolValue(d["wrapNative"]) && !strings.EqualFold(fmt.Sprint(d["side"]), "sell") {
+		if _, err = t.approveV4Max(ctx, key, inputToken); err != nil {
 			return BroadcastResult{}, err
 		}
 	}
@@ -355,16 +358,26 @@ func (t *Trading) BroadcastV4(ctx context.Context, d map[string]any, opts Broadc
 	if gas == 0 {
 		gas = 700000
 	}
+	fixedFee := opts.MaxFeePerGas == nil && t.FixedGasPrice != nil && t.FixedGasPrice.Sign() > 0
 	base := opts.MaxFeePerGas
 	if base == nil {
-		base, err = t.RPC.GasPrice(ctx)
-		if err != nil {
-			return BroadcastResult{}, err
+		if fixedFee {
+			base = new(big.Int).Set(t.FixedGasPrice)
+		} else {
+			base, err = t.RPC.GasPrice(ctx)
+			if err != nil {
+				return BroadcastResult{}, err
+			}
 		}
 	}
+	base = new(big.Int).Set(base)
 	tip := opts.TipPerGas
 	if tip == nil {
 		tip = new(big.Int).Div(new(big.Int).Set(base), big.NewInt(10))
+	}
+	tip = new(big.Int).Set(tip)
+	if tip.Sign() <= 0 {
+		tip.SetInt64(1)
 	}
 	if opts.FeeBumpBps > 0 {
 		mul := func(x *big.Int) *big.Int {
@@ -372,8 +385,21 @@ func (t *Trading) BroadcastV4(ctx context.Context, d map[string]any, opts Broadc
 		}
 		base, tip = mul(base), mul(tip)
 	}
-	if currentBase, baseErr := t.RPC.BaseFee(ctx); baseErr == nil && currentBase.Sign() > 0 {
-		minimumFee := new(big.Int).Add(currentBase, tip)
+	// eth_gasPrice and eth_getBlockByNumber are separate RPC reads. The base
+	// fee can advance between those reads and eth_sendRawTransaction, so leave
+	// room above the latest observed base fee instead of setting the cap exactly
+	// at baseFee+tip. This also handles RPCs whose gasPrice is only the base fee.
+	if !fixedFee {
+		feeBase := new(big.Int).Set(base)
+		if currentBase, baseErr := t.RPC.BaseFee(ctx); baseErr == nil && currentBase.Sign() > 0 && currentBase.Cmp(feeBase) > 0 {
+			feeBase.Set(currentBase)
+		}
+		safety := new(big.Int).Div(new(big.Int).Set(feeBase), big.NewInt(8))
+		if safety.Cmp(tip) < 0 {
+			safety.Set(tip)
+		}
+		minimumFee := new(big.Int).Add(feeBase, tip)
+		minimumFee.Add(minimumFee, safety)
 		if base.Cmp(minimumFee) < 0 {
 			base = minimumFee
 		}
@@ -392,7 +418,7 @@ func (t *Trading) BroadcastV4(ctx context.Context, d map[string]any, opts Broadc
 	return BroadcastResult{TransactionHash: hash, Nonce: nonce, From: from, MaxFeePerGas: new(big.Int).Set(base), TipPerGas: new(big.Int).Set(tip)}, nil
 }
 
-func (t *Trading) ensureV4Approvals(ctx context.Context, key *ecdsa.PrivateKey, owner, token string, amount *big.Int) ([]string, error) {
+func (t *Trading) approveV4Max(ctx context.Context, key *ecdsa.PrivateKey, token string) ([]string, error) {
 	permit2Address := Permit2Address
 	if t.Permit2 != "" {
 		permit2Address = t.Permit2
@@ -403,57 +429,52 @@ func (t *Trading) ensureV4Approvals(ctx context.Context, key *ecdsa.PrivateKey, 
 	}
 	permit2 := common.HexToAddress(permit2Address)
 	tokenAddr := common.HexToAddress(token)
-	ownerAddr := common.HexToAddress(owner)
 	router := common.HexToAddress(routerAddress)
 	hashes := []string{}
-	allowData, _ := erc20ABI.Pack("allowance", ownerAddr, permit2)
-	raw, e := t.RPC.Call(ctx, "eth_call", []any{map[string]any{"to": tokenAddr.Hex(), "data": "0x" + fmt.Sprintf("%x", allowData)}, "latest"})
+	max256 := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+	data, _ := erc20ABI.Pack("approve", permit2, max256)
+	h, e := t.sendContract(ctx, key, tokenAddr, data, big.NewInt(0))
 	if e != nil {
 		return nil, e
 	}
-	allowance := unpackBig(raw)
-	if allowance.Cmp(amount) < 0 {
-		data, _ := erc20ABI.Pack("approve", permit2, new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1)))
-		h, e := t.sendContract(ctx, key, tokenAddr, data, big.NewInt(0))
-		if e != nil {
-			return nil, e
-		}
-		hashes = append(hashes, h)
-		if _, e = t.waitReceipt(ctx, h); e != nil {
-			return nil, e
-		}
+	hashes = append(hashes, h)
+	if _, e = t.waitReceipt(ctx, h); e != nil {
+		return nil, e
 	}
-	permitData, _ := permit2ABI.Pack("allowance", ownerAddr, tokenAddr, router)
-	raw, e = t.RPC.Call(ctx, "eth_call", []any{map[string]any{"to": permit2.Hex(), "data": "0x" + fmt.Sprintf("%x", permitData)}, "latest"})
+	max160 := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 160), big.NewInt(1))
+	max48 := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 48), big.NewInt(1))
+	permitData, _ := permit2ABI.Pack("approve", tokenAddr, router, max160, max48)
+	h, e = t.sendContract(ctx, key, permit2, permitData, big.NewInt(0))
 	if e != nil {
 		return nil, e
 	}
-	permitAllowance := unpackBig(raw)
-	if permitAllowance.Cmp(amount) < 0 {
-		max160 := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 160), big.NewInt(1))
-		max48 := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 48), big.NewInt(1))
-		data, _ := permit2ABI.Pack("approve", tokenAddr, router, max160, max48)
-		h, e := t.sendContract(ctx, key, permit2, data, big.NewInt(0))
-		if e != nil {
-			return nil, e
-		}
-		hashes = append(hashes, h)
-		if _, e = t.waitReceipt(ctx, h); e != nil {
-			return nil, e
-		}
+	hashes = append(hashes, h)
+	if _, e = t.waitReceipt(ctx, h); e != nil {
+		return nil, e
 	}
 	return hashes, nil
 }
-func unpackBig(raw json.RawMessage) *big.Int {
-	s := strings.TrimPrefix(strings.Trim(string(raw), `"`), "0x")
-	if len(s) > 64 {
-		s = s[:64]
+
+// PrepareV4SellApproval pre-authorizes the token for Permit2 and the V4
+// router after a confirmed buy.
+func (t *Trading) PrepareV4SellApproval(ctx context.Context, privateKey, token string) error {
+	keyText := strings.TrimPrefix(strings.TrimSpace(privateKey), "0x")
+	if keyText == "" {
+		return fmt.Errorf("privateKey is required")
 	}
-	n := new(big.Int)
-	if _, ok := n.SetString(s, 16); !ok {
-		return big.NewInt(0)
+	key, err := gethcrypto.HexToECDSA(keyText)
+	if err != nil {
+		return fmt.Errorf("invalid privateKey: %w", err)
 	}
-	return n
+	_, err = t.approveV4Max(ctx, key, token)
+	return err
+}
+
+func (t *Trading) gasPrice(ctx context.Context) (*big.Int, error) {
+	if t.FixedGasPrice != nil && t.FixedGasPrice.Sign() > 0 {
+		return new(big.Int).Set(t.FixedGasPrice), nil
+	}
+	return t.RPC.GasPrice(ctx)
 }
 func (t *Trading) sendContract(ctx context.Context, key *ecdsa.PrivateKey, to common.Address, data []byte, value *big.Int) (string, error) {
 	from := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
@@ -461,7 +482,7 @@ func (t *Trading) sendContract(ctx context.Context, key *ecdsa.PrivateKey, to co
 	if e != nil {
 		return "", e
 	}
-	gasPrice, e := t.RPC.GasPrice(ctx)
+	gasPrice, e := t.gasPrice(ctx)
 	if e != nil {
 		gasPrice = big.NewInt(1)
 	}

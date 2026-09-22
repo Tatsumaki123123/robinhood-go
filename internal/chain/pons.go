@@ -2,6 +2,7 @@ package chain
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"encoding/hex"
 	"fmt"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -268,33 +269,12 @@ func (t *Trading) PonsSwap(ctx context.Context, d map[string]any, buy bool) (map
 	if err != nil {
 		return nil, err
 	}
-	// Curve sells pull the pair token from the wallet. Approve the curve only
-	// when the current allowance is insufficient.
-	var approval string
-	if !buy && state.PairToken != (common.Address{}) {
-		owner := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
-		allowanceData, _ := erc20ABI.Pack("allowance", common.HexToAddress(owner), common.HexToAddress(curve))
-		raw, ae := t.RPC.Call(ctx, "eth_call", []any{map[string]any{"to": state.PairToken.Hex(), "data": "0x" + hex.EncodeToString(allowanceData)}, "latest"})
-		if ae != nil {
-			return nil, ae
-		}
-		if unpackBig(raw).Cmp(amount) < 0 {
-			approveData, _ := erc20ABI.Pack("approve", common.HexToAddress(curve), new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1)))
-			approval, err = t.sendContract(ctx, key, state.PairToken, approveData, big.NewInt(0))
-			if err != nil {
-				return nil, err
-			}
-			if _, err = t.waitReceipt(ctx, approval); err != nil {
-				return nil, err
-			}
-		}
-	}
 	from := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
 	nonce, err := t.RPC.Nonce(ctx, from)
 	if err != nil {
 		return nil, err
 	}
-	gasPrice, err := t.RPC.GasPrice(ctx)
+	gasPrice, err := t.gasPrice(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -316,7 +296,7 @@ func (t *Trading) PonsSwap(ctx context.Context, d map[string]any, buy bool) (map
 	if err != nil {
 		return nil, err
 	}
-	result := map[string]any{"mode": "live", "status": "confirmed", "side": map[bool]string{true: "buy", false: "sell"}[buy], "curveAddress": strings.ToLower(curve), "tokenAddress": strings.ToLower(fmt.Sprint(d["tokenAddress"])), "pairToken": strings.ToLower(state.PairToken.Hex()), "transactionHash": hash, "hash": hash, "from": from, "nonce": nonce, "expectedAmountOutRaw": out.String(), "minimumAmountOutRaw": min.String(), "receipt": receipt, "approvalTransactionHash": approval}
+	result := map[string]any{"mode": "live", "status": "confirmed", "side": map[bool]string{true: "buy", false: "sell"}[buy], "curveAddress": strings.ToLower(curve), "tokenAddress": strings.ToLower(fmt.Sprint(d["tokenAddress"])), "pairToken": strings.ToLower(state.PairToken.Hex()), "transactionHash": hash, "hash": hash, "from": from, "nonce": nonce, "expectedAmountOutRaw": out.String(), "minimumAmountOutRaw": min.String(), "receipt": receipt}
 	if fill := ponsReceiptFill(receipt, curve, buy); fill != nil {
 		result["actualAmountOutRaw"] = fill["actualAmountOutRaw"]
 		result["actualQuoteAmountRaw"] = fill["quoteAmountRaw"]
@@ -327,6 +307,40 @@ func (t *Trading) PonsSwap(ctx context.Context, d map[string]any, buy bool) (map
 		result["effectiveGasPrice"] = m["effectiveGasPrice"]
 	}
 	return result, nil
+}
+
+// PreparePonsSellApproval pre-authorizes the curve's pair token after a
+// confirmed buy.
+func (t *Trading) PreparePonsSellApproval(ctx context.Context, privateKey, owner, curve string) error {
+	keyText := strings.TrimPrefix(strings.TrimSpace(privateKey), "0x")
+	if keyText == "" {
+		return fmt.Errorf("privateKey is required")
+	}
+	key, err := gethcrypto.HexToECDSA(keyText)
+	if err != nil {
+		return fmt.Errorf("invalid privateKey: %w", err)
+	}
+	state, err := t.RPC.PonsState(ctx, curve, owner)
+	if err != nil {
+		return err
+	}
+	if state.PairToken == (common.Address{}) {
+		return fmt.Errorf("pons pair token is missing")
+	}
+	_, err = t.approvePonsMax(ctx, key, curve, state.PairToken)
+	return err
+}
+
+func (t *Trading) approvePonsMax(ctx context.Context, key *ecdsa.PrivateKey, curve string, pairToken common.Address) (string, error) {
+	approveData, _ := erc20ABI.Pack("approve", common.HexToAddress(curve), new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1)))
+	approval, err := t.sendContract(ctx, key, pairToken, approveData, big.NewInt(0))
+	if err != nil {
+		return "", err
+	}
+	if _, err = t.waitReceipt(ctx, approval); err != nil {
+		return "", err
+	}
+	return approval, nil
 }
 
 // ponsReceiptFill extracts the event amounts from a confirmed curve receipt.

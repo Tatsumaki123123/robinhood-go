@@ -1569,7 +1569,7 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 			zap.Int("quoteDecimals", quoteDecimals),
 			zap.String("token", ev.TokenAddress),
 		)
-		req := map[string]any{"currencyIn": currencyIn, "path": path, "amountInRaw": amountRaw, "amountOutMinimumRaw": minOut, "recipient": u.WalletAddress, "customRecipient": false, "privateKey": key, "wrapNative": side == "buy" && strings.EqualFold(first, chain.NativeAddress) && strings.EqualFold(currencyIn, chain.WrappedNativeAddress), "unwrapNative": side == "sell" && strings.EqualFold(destination, chain.NativeAddress) && strings.EqualFold(currencyOut, chain.WrappedNativeAddress)}
+		req := map[string]any{"currencyIn": currencyIn, "path": path, "amountInRaw": amountRaw, "amountOutMinimumRaw": minOut, "recipient": u.WalletAddress, "customRecipient": false, "privateKey": key, "side": side, "wrapNative": side == "buy" && strings.EqualFold(first, chain.NativeAddress) && strings.EqualFold(currencyIn, chain.WrappedNativeAddress), "unwrapNative": side == "sell" && strings.EqualFold(destination, chain.NativeAddress) && strings.EqualFold(currencyOut, chain.WrappedNativeAddress)}
 		opts := chain.BroadcastOptions{}
 		if side == "buy" {
 			var pendingNonce *int64
@@ -1938,7 +1938,58 @@ func (e *Engine) applyOwnFill(ctx context.Context, ev Event, cfg Config) error {
 	if err = tx.Commit(ctx); err != nil {
 		return err
 	}
+	if strings.EqualFold(ev.Side, "buy") {
+		e.queueSellApproval(ev)
+	}
 	return nil
+}
+
+// queueSellApproval submits the maximum sell allowance after a confirmed buy.
+// The buy is already accounted for when this runs, so the sell path itself can
+// submit the swap without querying allowance.
+func (e *Engine) queueSellApproval(ev Event) {
+	if e.Trading == nil || e.Store == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		routes, err := e.Store.Routes(ctx, ev.UserID)
+		if err != nil {
+			e.devInfo("买入后预授权查询路由失败", zap.Error(err), zap.String("token", ev.TokenAddress))
+			return
+		}
+		v4SellRoute := false
+		for _, route := range routes {
+			if strings.EqualFold(stringValue(route["direction"]), "sell") && strings.EqualFold(stringValue(route["targetToken"]), ev.TokenAddress) {
+				v4SellRoute = true
+				break
+			}
+		}
+		u, err := e.Store.User(ctx, ev.UserID)
+		if err != nil || u.PrivateKeyEncrypted == nil {
+			if err != nil {
+				e.devInfo("买入后预授权读取用户失败", zap.Error(err), zap.String("token", ev.TokenAddress))
+			}
+			return
+		}
+		key, err := secret.Decrypt(*u.PrivateKeyEncrypted, e.EncryptionKey)
+		if err != nil {
+			e.devInfo("买入后预授权解密私钥失败", zap.Error(err), zap.String("token", ev.TokenAddress))
+			return
+		}
+		var approvalErr error
+		if v4SellRoute {
+			approvalErr = e.Trading.PrepareV4SellApproval(ctx, key, ev.TokenAddress)
+		} else {
+			approvalErr = e.Trading.PreparePonsSellApproval(ctx, key, u.WalletAddress, ev.CurveAddress)
+		}
+		if approvalErr != nil {
+			e.devInfo("买入后预授权失败", zap.Error(approvalErr), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
+			return
+		}
+		e.devInfo("买入后卖出授权已准备", zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
+	}()
 }
 
 func (e *Engine) applyOwnFillLegacy(ctx context.Context, ev Event, p position, cfg Config) error {
@@ -2077,7 +2128,13 @@ func (e *Engine) applyOwnFillLegacy(ctx context.Context, ev Event, p position, c
 		zap.String("token", ev.TokenAddress),
 		zap.String("curve", ev.CurveAddress),
 	)
-	return e.savePosition(ctx, ev, p)
+	if err := e.savePosition(ctx, ev, p); err != nil {
+		return err
+	}
+	if strings.EqualFold(ev.Side, "buy") {
+		e.queueSellApproval(ev)
+	}
+	return nil
 }
 
 func evaluate(c Config, r TokenRule, ev Event, p position) (string, float64, string) {
@@ -2224,103 +2281,8 @@ func (e *Engine) Tick(ctx context.Context) {
 			_ = e.refreshMonitorCache(ctx, false)
 			e.checkScheduled(ctx)
 			e.pollCurves(ctx)
-			if time.Now().Unix()%5 == 0 {
-				e.reconcilePending(ctx)
-			}
 		}
 	}
-}
-
-// reconcilePending makes accepted broadcasts survive a service restart. A
-// receipt is never treated as a fill by itself: its decoded logs are replayed
-// through the normal monitor path, where own-address matching, idempotency and
-// position accounting remain centralized.
-func (e *Engine) reconcilePending(ctx context.Context) {
-	if e.RPC == nil || e.Store == nil {
-		return
-	}
-	type pendingReceipt struct {
-		hash   string
-		userID int64
-		token  string
-		curve  string
-	}
-	rows, err := e.Store.DB.Query(ctx, `SELECT transaction_hash,user_id,token_address,curve_address FROM strategy_pending_buys WHERE status IN ('pending','confirmed_pending_accounting') AND transaction_hash IS NOT NULL UNION SELECT transaction_hash,user_id,token_address,curve_address FROM strategy_buy_attempts WHERE status='pending' UNION SELECT transaction_hash,user_id,token_address,curve_address FROM strategy_pending_actions WHERE status='pending'`)
-	if err != nil {
-		return
-	}
-	defer rows.Close()
-	hashes := map[string]pendingReceipt{}
-	for rows.Next() {
-		var item pendingReceipt
-		if rows.Scan(&item.hash, &item.userID, &item.token, &item.curve) == nil && item.hash != "" {
-			hashes[item.hash] = item
-		}
-	}
-	for hash, pending := range hashes {
-		// A pending row is durable proof that this transaction was broadcast by
-		// this strategy position. Cache that ownership before replaying receipt
-		// logs so a delayed/missing transaction `from` field cannot turn our fill
-		// into a market event and leave reconciliation retrying forever.
-		e.cacheOwnTransaction(hash, pending.userID, pending.token, pending.curve, 10*time.Minute)
-		receipt, re := e.RPC.Receipt(ctx, hash)
-		if re != nil || receipt == nil {
-			continue
-		}
-		if revertedReceipt(receipt) {
-			e.forgetOwnTransaction(hash)
-			_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_pending_buys SET status='reverted',updated_at=now() WHERE transaction_hash=$1 AND status='pending'`, hash)
-			_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_buy_attempts SET status='reverted',updated_at=now() WHERE transaction_hash=$1 AND status='pending'`, hash)
-			_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_pending_actions SET status='reverted',updated_at=now() WHERE transaction_hash=$1 AND status='pending'`, hash)
-			continue
-		}
-		_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_pending_buys SET status='confirmed_pending_accounting',updated_at=now() WHERE transaction_hash=$1 AND status='pending'`, hash)
-		m, ok := receipt.(map[string]any)
-		if !ok {
-			continue
-		}
-		transactionFrom := firstString(m, "from")
-		if transactionFrom == "" {
-			transactionFrom, _ = e.RPC.TransactionFrom(ctx, hash)
-		}
-		gasUsed := firstString(m, "gasUsed")
-		effectiveGasPrice := firstString(m, "effectiveGasPrice", "gasPrice")
-		logs, ok := m["logs"].([]any)
-		if !ok {
-			continue
-		}
-		for _, raw := range logs {
-			if log, ok := raw.(map[string]any); ok {
-				decoded := chain.DecodeChainEvent(log)
-				if transactionFrom != "" {
-					decoded["transactionFrom"] = transactionFrom
-				}
-				if gasUsed != "" {
-					decoded["gasUsedRaw"] = gasUsed
-				}
-				if effectiveGasPrice != "" {
-					decoded["effectiveGasPriceRaw"] = effectiveGasPrice
-				}
-				if ev, good := decodeEvent(decoded); good {
-					_ = e.processForMonitors(ctx, ev)
-				}
-			}
-		}
-	}
-}
-
-func revertedReceipt(receipt any) bool {
-	m, ok := receipt.(map[string]any)
-	if !ok {
-		return false
-	}
-	switch v := m["status"].(type) {
-	case string:
-		return v == "0x0" || v == "0x00" || v == "0"
-	case float64:
-		return v == 0
-	}
-	return false
 }
 
 func (e *Engine) pollCurves(ctx context.Context) {

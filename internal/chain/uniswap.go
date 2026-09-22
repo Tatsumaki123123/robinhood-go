@@ -58,8 +58,8 @@ type V4ExactInput struct {
 }
 
 var universalRouterABI = mustABI(`[ {"type":"function","name":"execute","stateMutability":"payable","inputs":[{"type":"bytes"},{"type":"bytes[]"},{"type":"uint256"}],"outputs":[]} ]`)
-var erc20ABI = mustABI(`[ {"type":"function","name":"allowance","stateMutability":"view","inputs":[{"type":"address"},{"type":"address"}],"outputs":[{"type":"uint256"}]}, {"type":"function","name":"approve","stateMutability":"nonpayable","inputs":[{"type":"address"},{"type":"uint256"}],"outputs":[{"type":"bool"}]} ]`)
-var permit2ABI = mustABI(`[ {"type":"function","name":"allowance","stateMutability":"view","inputs":[{"type":"address"},{"type":"address"},{"type":"address"}],"outputs":[{"type":"uint160"},{"type":"uint48"},{"type":"uint48"}]}, {"type":"function","name":"approve","stateMutability":"nonpayable","inputs":[{"type":"address"},{"type":"address"},{"type":"uint160"},{"type":"uint48"}],"outputs":[]} ]`)
+var erc20ABI = mustABI(`[ {"type":"function","name":"approve","stateMutability":"nonpayable","inputs":[{"type":"address"},{"type":"uint256"}],"outputs":[{"type":"bool"}]} ]`)
+var permit2ABI = mustABI(`[ {"type":"function","name":"approve","stateMutability":"nonpayable","inputs":[{"type":"address"},{"type":"address"},{"type":"uint160"},{"type":"uint48"}],"outputs":[]} ]`)
 
 const Permit2Address = "0x000000000022d473030f116ddee9f6b43ac78ba3"
 
