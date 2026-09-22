@@ -1313,6 +1313,9 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 					zap.String("reason", reason),
 					zap.String("token", ev.TokenAddress),
 				)
+				if action == "sell" {
+					e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, execErr)
+				}
 				return execErr
 			}
 		} else if e.Trading != nil {
@@ -1325,6 +1328,9 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 					zap.String("reason", reason),
 					zap.String("token", ev.TokenAddress),
 				)
+				if action == "sell" {
+					e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, execErr)
+				}
 				return execErr
 			}
 		} else {
@@ -1345,8 +1351,13 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 		// updated only by applyOwnFill after a confirmed chain event.
 		if hash := firstString(result, "transactionHash", "hash"); hash != "" {
 			if err := e.savePendingAction(ctx, hash, ev, action, amount, reason); err != nil {
+				if action == "sell" {
+					e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, err)
+				}
 				return err
 			}
+		} else if action == "sell" {
+			e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, fmt.Errorf("empty transaction hash"))
 		}
 		return nil
 	}
@@ -2479,7 +2490,9 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 			  )
 			RETURNING true`, ev.UserID, ev.TokenAddress, ev.CurveAddress, nextScheduled).Scan(&claimed)
 		if claimErr != nil {
-			e.devInfo("定时卖出抢占失败", zap.Error(claimErr), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
+			if claimErr != pgx.ErrNoRows {
+				e.devInfo("定时卖出抢占失败", zap.Error(claimErr), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
+			}
 			continue
 		}
 		if !claimed {
@@ -2511,6 +2524,7 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 			result, ee = e.ExecuteAction(ctx, ev, "sell", amount)
 			if ee != nil {
 				e.devInfo("定时卖出执行失败", zap.Error(ee), zap.String("action", "sell"), zap.String("reason", "scheduled_sell"), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
+				e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, "scheduled_sell", ee)
 				continue
 			}
 		} else if e.Trading != nil {
@@ -2518,19 +2532,65 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 			result, ee = e.executeLive(ctx, ev, "sell", amount, c)
 			if ee != nil {
 				e.devInfo("定时卖出执行失败", zap.Error(ee), zap.String("action", "sell"), zap.String("reason", "scheduled_sell"), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
+				e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, "scheduled_sell", ee)
 				continue
 			}
 		}
 		hash := firstString(result, "transactionHash", "hash")
 		if hash == "" {
 			e.devInfo("定时卖出未返回交易哈希", zap.String("action", "sell"), zap.String("reason", "scheduled_sell"), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
+			e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, "scheduled_sell", fmt.Errorf("empty transaction hash"))
 		} else {
 			e.devInfo("定时卖出已广播", zap.String("action", "sell"), zap.String("reason", "scheduled_sell"), zap.String("transactionHash", hash), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
 			if err := e.savePendingAction(ctx, hash, ev, "sell", amount, "scheduled_sell"); err != nil {
 				e.devInfo("定时卖出持久化失败", zap.Error(err), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
+				e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, "scheduled_sell", err)
 				continue
 			}
 		}
 		_ = e.savePosition(ctx, ev, p)
 	}
+}
+
+// reconcileFailedSell checks the wallet after a sell failure. A zero token
+// balance means the tracked position is stale (for example, tokens were
+// transferred or sold outside this process), so clear all sell scheduling and
+// pending sell state. RPC failures and positive balances leave the position
+// intact for a later retry.
+func (e *Engine) reconcileFailedSell(ctx context.Context, userID int64, token, curve, reason string, sellErr error) {
+	if e.RPC == nil || e.Store == nil {
+		return
+	}
+	u, err := e.cachedUser(ctx, userID)
+	if err != nil {
+		e.devInfo("卖出失败后读取用户失败", zap.Error(err), zap.String("reason", reason), zap.String("token", token), zap.String("curve", curve))
+		return
+	}
+	if strings.TrimSpace(u.WalletAddress) == "" {
+		e.devInfo("卖出失败后用户钱包地址为空", zap.String("reason", reason), zap.String("token", token), zap.String("curve", curve))
+		return
+	}
+	balance, err := e.RPC.ERC20Balance(ctx, token, u.WalletAddress)
+	if err != nil {
+		e.devInfo("卖出失败后查询 token 余额失败", zap.Error(err), zap.String("reason", reason), zap.String("token", token), zap.String("curve", curve))
+		return
+	}
+	if balance.Sign() > 0 {
+		e.devInfo("卖出失败后仍有 token 余额，保留持仓", zap.Error(sellErr), zap.String("reason", reason), zap.String("token", token), zap.String("curve", curve), zap.String("balanceRaw", balance.String()))
+		return
+	}
+	_, err = e.Store.DB.Exec(ctx, `
+		UPDATE strategy_positions
+		SET token_amount_raw='0', quote_spent_raw='0', cost_usd_raw='0',
+			average_cost_usd=0, first_buy_price=0, last_buy_price=0,
+			buy_count=0, sell_count=0, profit_sell_level=0,
+			first_bought_at=NULL, next_scheduled_sell_at=NULL,
+			external_cooldown_until=NULL, last_buy_at=NULL, updated_at=now()
+		WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, userID, token, curve)
+	if err != nil {
+		e.devInfo("卖出失败后重置持仓失败", zap.Error(err), zap.String("reason", reason), zap.String("token", token), zap.String("curve", curve))
+		return
+	}
+	_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_pending_actions SET status='reverted',updated_at=now() WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND side='sell' AND status IN ('pending','confirmed_pending_accounting')`, userID, token, curve)
+	e.devInfo("卖出失败后余额为零，已重置持仓", zap.Error(sellErr), zap.String("reason", reason), zap.String("token", token), zap.String("curve", curve))
 }
