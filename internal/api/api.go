@@ -88,6 +88,7 @@ func (a *API) Register(app *fiber.App) {
 	b.Post("/monitorUser/getPrivateKey", a.userPrivate)
 	b.Post("/monitorUser/getUserHolders", a.positions)
 	b.Post("/monitorUser/getAvePositions", a.positions)
+	b.Post("/monitorUser/getStrategyData", a.strategyData)
 	b.Post("/monitorToken/getList", a.tokenList)
 	b.Post("/monitorToken/getDisabledList", a.tokenDisabled)
 	b.Post("/monitorToken/addToken", a.tokenAdd)
@@ -579,6 +580,149 @@ func (a *API) positions(c *fiber.Ctx) error {
 		items = filtered
 	}
 	return a.ok(c, items)
+}
+
+// strategyData returns the strategy's durable database state rather than the
+// wallet snapshot supplied by AVE. It is intentionally read-only so it can be
+// used by monitoring tools without affecting strategy execution.
+func (a *API) strategyData(c *fiber.Ctx) error {
+	d := body(c)
+	userID := id(d["userId"])
+	if userID <= 0 {
+		return httpx.Error(c, 400, "userId is required")
+	}
+	if _, err := a.Store.User(c.Context(), userID); err != nil {
+		return httpx.Error(c, 404, "user not found")
+	}
+	tokenAddress := low(str(d["tokenAddress"]))
+	curveAddress := low(str(d["curveAddress"]))
+	limit := int(id(d["limit"]))
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+
+	filters := []string{"user_id=$1"}
+	args := []any{userID}
+	if tokenAddress != "" {
+		filters = append(filters, fmt.Sprintf("lower(token_address)=lower($%d)", len(args)+1))
+		args = append(args, tokenAddress)
+	}
+	if curveAddress != "" {
+		filters = append(filters, fmt.Sprintf("lower(curve_address)=lower($%d)", len(args)+1))
+		args = append(args, curveAddress)
+	}
+	where := strings.Join(filters, " AND ")
+
+	positionsRows, err := a.Store.DB.Query(c.Context(), `SELECT token_address,curve_address,token_amount_raw::text,quote_spent_raw,cost_usd_raw,average_cost_usd::double precision,first_buy_price::double precision,last_buy_price::double precision,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at,updated_at FROM strategy_positions WHERE `+where+` AND token_amount_raw>0 ORDER BY updated_at DESC`, args...)
+	if err != nil {
+		return a.fail(c, err)
+	}
+	positions := make([]map[string]any, 0)
+	for positionsRows.Next() {
+		var token, curve, amountRaw, quoteSpentRaw, costUSDScaledRaw string
+		var averageCost, firstPrice, lastPrice float64
+		var buyCount, sellCount, profitLevel int
+		var firstBought, nextScheduled, cooldownUntil, lastBuy, updatedAt *time.Time
+		if err := positionsRows.Scan(&token, &curve, &amountRaw, &quoteSpentRaw, &costUSDScaledRaw, &averageCost, &firstPrice, &lastPrice, &buyCount, &sellCount, &profitLevel, &firstBought, &nextScheduled, &cooldownUntil, &lastBuy, &updatedAt); err != nil {
+			positionsRows.Close()
+			return a.fail(c, err)
+		}
+		positions = append(positions, map[string]any{
+			"tokenAddress": token, "curveAddress": curve, "tokenAmountRaw": amountRaw,
+			"quoteSpentRaw": quoteSpentRaw, "costUSDScaledRaw": costUSDScaledRaw,
+			"averageCostUSD": averageCost, "firstBuyPrice": firstPrice, "lastBuyPrice": lastPrice,
+			"buyCount": buyCount, "sellCount": sellCount, "profitSellLevel": profitLevel,
+			"firstBoughtAt": firstBought, "nextScheduledSellAt": nextScheduled,
+			"externalCooldownUntil": cooldownUntil, "lastBuyAt": lastBuy, "updatedAt": updatedAt,
+		})
+	}
+	if err := positionsRows.Err(); err != nil {
+		positionsRows.Close()
+		return a.fail(c, err)
+	}
+	positionsRows.Close()
+
+	tradeArgs := append([]any{}, args...)
+	tradeArgs = append(tradeArgs, limit)
+	tradesRows, err := a.Store.DB.Query(c.Context(), `SELECT id,type,token_address,curve_address,token_amount_raw,quote_amount_raw,remain_token_amount_raw,remain_quote_amount_raw,realized_quote_amount_raw,realized_pnl_quote_raw,gas_fee_native_raw,transaction_hash,reason,source_event_key,sell_count,profit_sell_level,created_at FROM monitor_records WHERE `+where+` ORDER BY created_at DESC,id DESC LIMIT $`+strconv.Itoa(len(tradeArgs)), tradeArgs...)
+	if err != nil {
+		return a.fail(c, err)
+	}
+	trades := make([]map[string]any, 0)
+	for tradesRows.Next() {
+		var recordID int64
+		var side, token, curve, tokenAmountRaw, quoteAmountRaw, remainTokenRaw, remainQuoteRaw, realizedQuoteRaw, realizedPnlRaw, gasFeeRaw string
+		var txHash, reason, sourceEventKey *string
+		var sellCount, profitLevel int
+		var createdAt time.Time
+		if err := tradesRows.Scan(&recordID, &side, &token, &curve, &tokenAmountRaw, &quoteAmountRaw, &remainTokenRaw, &remainQuoteRaw, &realizedQuoteRaw, &realizedPnlRaw, &gasFeeRaw, &txHash, &reason, &sourceEventKey, &sellCount, &profitLevel, &createdAt); err != nil {
+			tradesRows.Close()
+			return a.fail(c, err)
+		}
+		trades = append(trades, map[string]any{
+			"id": recordID, "type": side, "tokenAddress": token, "curveAddress": curve,
+			"tokenAmountRaw": tokenAmountRaw, "quoteAmountRaw": quoteAmountRaw,
+			"remainTokenAmountRaw": remainTokenRaw, "remainQuoteAmountRaw": remainQuoteRaw,
+			"realizedQuoteAmountRaw": realizedQuoteRaw, "realizedPnlQuoteRaw": realizedPnlRaw,
+			"gasFeeNativeRaw": gasFeeRaw, "transactionHash": txHash, "reason": reason,
+			"sourceEventKey": sourceEventKey, "sellCount": sellCount, "profitSellLevel": profitLevel,
+			"createdAt": createdAt,
+		})
+	}
+	if err := tradesRows.Err(); err != nil {
+		tradesRows.Close()
+		return a.fail(c, err)
+	}
+	tradesRows.Close()
+
+	pendingRows, err := a.Store.DB.Query(c.Context(), `SELECT transaction_hash,token_address,curve_address,side,reason,amount::text,status,created_at,updated_at FROM strategy_pending_actions WHERE `+where+` AND status IN ('pending','confirmed_pending_accounting') ORDER BY created_at DESC`, args...)
+	if err != nil {
+		return a.fail(c, err)
+	}
+	pending := make([]map[string]any, 0)
+	for pendingRows.Next() {
+		var hash, token, curve, side, reason, amount, status string
+		var createdAt, updatedAt time.Time
+		if err := pendingRows.Scan(&hash, &token, &curve, &side, &reason, &amount, &status, &createdAt, &updatedAt); err != nil {
+			pendingRows.Close()
+			return a.fail(c, err)
+		}
+		pending = append(pending, map[string]any{
+			"transactionHash": hash, "tokenAddress": token, "curveAddress": curve,
+			"side": side, "reason": reason, "amount": amount, "status": status,
+			"createdAt": createdAt, "updatedAt": updatedAt,
+		})
+	}
+	if err := pendingRows.Err(); err != nil {
+		pendingRows.Close()
+		return a.fail(c, err)
+	}
+	pendingRows.Close()
+
+	var realizedQuoteRaw, realizedPnlRaw string
+	var buyCount, sellCount int
+	summaryArgs := append([]any{}, args...)
+	if err := a.Store.DB.QueryRow(c.Context(), `SELECT COALESCE(SUM(realized_quote_amount_raw::numeric),0)::text,COALESCE(SUM(realized_pnl_quote_raw::numeric),0)::text,COUNT(*) FILTER (WHERE type='buy'),COUNT(*) FILTER (WHERE type='sell') FROM monitor_records WHERE `+where, summaryArgs...).Scan(&realizedQuoteRaw, &realizedPnlRaw, &buyCount, &sellCount); err != nil {
+		return a.fail(c, err)
+	}
+
+	return a.ok(c, map[string]any{
+		"userId":       userID,
+		"tokenAddress": tokenAddress,
+		"curveAddress": curveAddress,
+		"positions":    positions,
+		"trades":       trades,
+		"summary": map[string]any{
+			"realizedQuoteAmountRaw": realizedQuoteRaw,
+			"realizedPnlQuoteRaw":    realizedPnlRaw,
+			"buyCount":               buyCount,
+			"sellCount":              sellCount,
+		},
+		"pendingActions": pending,
+	})
 }
 
 func (a *API) aveWalletTokens(ctx context.Context, wallet string) ([]map[string]any, error) {
