@@ -63,13 +63,14 @@ type position struct {
 	// AmountRaw is kept as an integer string because ERC-20 quantities commonly
 	// exceed float64's 53-bit exact range. Amount remains a derived value used
 	// by the existing strategy arithmetic and API-compatible callbacks.
-	AmountRaw                                          string
-	Amount, AverageCost, FirstPrice, LastPrice         float64
-	QuoteSpentRaw                                      string
-	CostUSDScaledRaw                                   string
-	BuyCount, SellCount, ProfitLevel                   int
-	PendingSell                                        bool
-	FirstBought, NextScheduled, CooldownUntil, LastBuy *time.Time
+	AmountRaw                                             string
+	Amount, AverageCost, FirstPrice, LastPrice            float64
+	QuoteSpentRaw                                         string
+	CostUSDScaledRaw                                      string
+	BuyCount, SellCount, ProfitLevel                      int
+	PendingSell                                           bool
+	PendingSellHash, PendingSellReason, PendingSellStatus string
+	FirstBought, NextScheduled, CooldownUntil, LastBuy    *time.Time
 }
 
 type Engine struct {
@@ -1219,6 +1220,16 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 	// flag in the same round trip, so a later event cannot broadcast a second
 	// sell without adding another database latency hop to the WSS path.
 	if p.PendingSell {
+		e.devInfo("策略跳过交易",
+			zap.Int64("userID", ev.UserID),
+			zap.String("reason", "pending_sell"),
+			zap.String("pendingTransactionHash", p.PendingSellHash),
+			zap.String("pendingSellReason", p.PendingSellReason),
+			zap.String("pendingSellStatus", p.PendingSellStatus),
+			zap.String("side", strings.ToLower(ev.Side)),
+			zap.String("token", ev.TokenAddress),
+			zap.String("curve", ev.CurveAddress),
+		)
 		return nil
 	}
 	action, amount, reason := evaluate(cfg, rule, ev, p)
@@ -1687,7 +1698,12 @@ func (e *Engine) loadPosition(ctx context.Context, ev Event) (position, error) {
 	var p position
 	var amountRaw string
 	var first, next, cool, last *time.Time
-	err := e.Store.DB.QueryRow(ctx, `SELECT token_amount_raw::text,quote_spent_raw,cost_usd_raw,average_cost_usd::double precision,first_buy_price::double precision,last_buy_price::double precision,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at,EXISTS(SELECT 1 FROM strategy_pending_actions a WHERE a.user_id=strategy_positions.user_id AND a.token_address=strategy_positions.token_address AND a.curve_address=strategy_positions.curve_address AND a.side='sell' AND a.status IN ('pending','confirmed_pending_accounting')) FROM strategy_positions WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&amountRaw, &p.QuoteSpentRaw, &p.CostUSDScaledRaw, &p.AverageCost, &p.FirstPrice, &p.LastPrice, &p.BuyCount, &p.SellCount, &p.ProfitLevel, &first, &next, &cool, &last, &p.PendingSell)
+	err := e.Store.DB.QueryRow(ctx, `SELECT token_amount_raw::text,quote_spent_raw,cost_usd_raw,average_cost_usd::double precision,first_buy_price::double precision,last_buy_price::double precision,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at,
+		EXISTS(SELECT 1 FROM strategy_pending_actions a WHERE a.user_id=strategy_positions.user_id AND a.token_address=strategy_positions.token_address AND a.curve_address=strategy_positions.curve_address AND a.side='sell' AND a.status IN ('pending','confirmed_pending_accounting')),
+		COALESCE((SELECT a.transaction_hash FROM strategy_pending_actions a WHERE a.user_id=strategy_positions.user_id AND a.token_address=strategy_positions.token_address AND a.curve_address=strategy_positions.curve_address AND a.side='sell' AND a.status IN ('pending','confirmed_pending_accounting') ORDER BY a.updated_at DESC LIMIT 1),''),
+		COALESCE((SELECT a.reason FROM strategy_pending_actions a WHERE a.user_id=strategy_positions.user_id AND a.token_address=strategy_positions.token_address AND a.curve_address=strategy_positions.curve_address AND a.side='sell' AND a.status IN ('pending','confirmed_pending_accounting') ORDER BY a.updated_at DESC LIMIT 1),''),
+		COALESCE((SELECT a.status FROM strategy_pending_actions a WHERE a.user_id=strategy_positions.user_id AND a.token_address=strategy_positions.token_address AND a.curve_address=strategy_positions.curve_address AND a.side='sell' AND a.status IN ('pending','confirmed_pending_accounting') ORDER BY a.updated_at DESC LIMIT 1),'')
+		FROM strategy_positions WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&amountRaw, &p.QuoteSpentRaw, &p.CostUSDScaledRaw, &p.AverageCost, &p.FirstPrice, &p.LastPrice, &p.BuyCount, &p.SellCount, &p.ProfitLevel, &first, &next, &cool, &last, &p.PendingSell, &p.PendingSellHash, &p.PendingSellReason, &p.PendingSellStatus)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "no rows") {
 			return position{}, nil
