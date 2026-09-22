@@ -2477,6 +2477,40 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 		if amount <= 0 {
 			continue
 		}
+		// Claim the due slot before broadcasting.  The scheduler runs every
+		// second, while a broadcast may remain unconfirmed for much longer.  If
+		// the due timestamp is left untouched, every tick can submit the same
+		// scheduled sell again (and multiple service instances can race too).
+		// The conditional update makes the claim atomic and also gives failed
+		// broadcasts a bounded retry delay instead of a hot loop.
+		interval := c.ScheduledSell.IntervalSecond
+		if interval <= 0 {
+			interval = 1
+		}
+		nextScheduled := time.Now().Add(time.Duration(interval) * time.Second)
+		var claimed bool
+		claimErr := e.Store.DB.QueryRow(ctx, `
+			UPDATE strategy_positions
+			SET next_scheduled_sell_at=$4, updated_at=now()
+			WHERE user_id=$1 AND token_address=$2 AND curve_address=$3
+			  AND next_scheduled_sell_at IS NOT NULL
+			  AND next_scheduled_sell_at<=now()
+			  AND token_amount_raw>0
+			  AND NOT EXISTS (
+				  SELECT 1 FROM strategy_pending_actions
+				  WHERE user_id=$1 AND token_address=$2 AND curve_address=$3
+					AND side='sell' AND reason='scheduled_sell'
+					AND status IN ('pending','confirmed_pending_accounting')
+			  )
+			RETURNING true`, ev.UserID, ev.TokenAddress, ev.CurveAddress, nextScheduled).Scan(&claimed)
+		if claimErr != nil {
+			e.devInfo("定时卖出抢占失败", zap.Error(claimErr), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
+			continue
+		}
+		if !claimed {
+			continue
+		}
+		p.NextScheduled = &nextScheduled
 		e.devInfo("定时卖出触发",
 			zap.Int64("userID", ev.UserID),
 			zap.String("configName", c.Name),
@@ -2486,10 +2520,6 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 			zap.String("token", ev.TokenAddress),
 			zap.String("curve", ev.CurveAddress),
 		)
-		var pendingScheduled bool
-		if err := e.Store.DB.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM strategy_pending_actions WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND side='sell' AND reason='scheduled_sell' AND status='pending')`, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&pendingScheduled); err == nil && pendingScheduled {
-			continue
-		}
 		ev.Key = fmt.Sprintf("scheduled:%d:%s:%d", ev.UserID, ev.TokenAddress, time.Now().Unix())
 		ev.Side = "sell"
 		ev.Price = price
@@ -2515,7 +2545,8 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 			}
 		}
 		if hash := firstString(result, "transactionHash", "hash"); hash != "" {
-			if e.savePendingAction(ctx, hash, ev, "sell", amount, "scheduled_sell") != nil {
+			if err := e.savePendingAction(ctx, hash, ev, "sell", amount, "scheduled_sell"); err != nil {
+				e.devInfo("定时卖出持久化失败", zap.Error(err), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
 				continue
 			}
 		}
