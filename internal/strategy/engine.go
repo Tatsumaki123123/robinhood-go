@@ -2535,16 +2535,22 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 			var ee error
 			result, ee = e.ExecuteAction(ctx, ev, "sell", amount)
 			if ee != nil {
+				e.devInfo("定时卖出执行失败", zap.Error(ee), zap.String("action", "sell"), zap.String("reason", "scheduled_sell"), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
 				continue
 			}
 		} else if e.Trading != nil {
 			var ee error
 			result, ee = e.executeLive(ctx, ev, "sell", amount, c)
 			if ee != nil {
+				e.devInfo("定时卖出执行失败", zap.Error(ee), zap.String("action", "sell"), zap.String("reason", "scheduled_sell"), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
 				continue
 			}
 		}
-		if hash := firstString(result, "transactionHash", "hash"); hash != "" {
+		hash := firstString(result, "transactionHash", "hash")
+		if hash == "" {
+			e.devInfo("定时卖出未返回交易哈希", zap.String("action", "sell"), zap.String("reason", "scheduled_sell"), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
+		} else {
+			e.devInfo("定时卖出已广播", zap.String("action", "sell"), zap.String("reason", "scheduled_sell"), zap.String("transactionHash", hash), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
 			if err := e.savePendingAction(ctx, hash, ev, "sell", amount, "scheduled_sell"); err != nil {
 				e.devInfo("定时卖出持久化失败", zap.Error(err), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
 				continue
