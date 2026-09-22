@@ -1157,7 +1157,9 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 		zap.Float64("quoteUSD", ev.QuoteUSD),
 		zap.Float64("price", ev.Price),
 	)
-	if cfg.MinMCP > 0 && ev.MarketCap <= 0 {
+	// minMcp is a buy eligibility threshold. A market buy event can still
+	// evaluate an exit for an existing position below this floor.
+	if strings.EqualFold(ev.Side, "sell") && cfg.MinMCP > 0 && ev.MarketCap <= 0 {
 		e.devInfo("策略跳过交易",
 			zap.Int64("userID", ev.UserID),
 			zap.String("reason", "market_cap_missing"),
@@ -1167,7 +1169,7 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 		)
 		return nil
 	}
-	if ev.MarketCap > 0 && ev.MarketCap < cfg.MinMCP {
+	if strings.EqualFold(ev.Side, "sell") && ev.MarketCap > 0 && ev.MarketCap < cfg.MinMCP {
 		e.devInfo("策略跳过交易",
 			zap.Int64("userID", ev.UserID),
 			zap.String("reason", "market_cap_below_minimum"),
@@ -1877,6 +1879,12 @@ func (e *Engine) applyOwnFill(ctx context.Context, ev Event, cfg Config) error {
 		remainCost.Sub(oldCost, allocatedCost)
 		realizedPnl.Sub(quoteRaw, allocated)
 		sellCount++
+		// A sell starts a new loss-buy cycle. Keep LastPrice for scheduled-sell
+		// pricing, but reset the first-buy anchor and buy counter.
+		current.BuyCount = 0
+		current.FirstPrice = 0
+		current.FirstBought = nil
+		current.LastBuy = nil
 		if actionReason == "profit_sell" {
 			profitLevel++
 		}
@@ -2096,6 +2104,12 @@ func (e *Engine) applyOwnFillLegacy(ctx context.Context, ev Event, p position, c
 		} else {
 			p.AmountRaw = remainingRaw.String()
 			p.Amount = rawFloat(p.AmountRaw)
+			// A sell starts a new loss-buy cycle while the remaining position is
+			// retained for accounting and scheduled-sell pricing.
+			p.BuyCount = 0
+			p.FirstPrice = 0
+			p.FirstBought = nil
+			p.LastBuy = nil
 		}
 		if p.Amount > 0 {
 			p.SellCount++
@@ -2164,24 +2178,23 @@ func evaluate(c Config, r TokenRule, ev Event, p position) (string, float64, str
 		if amt <= 0 {
 			return "", 0, ""
 		}
-		if p.FirstPrice > 0 && p.BuyCount > 0 && price >= p.FirstPrice {
-			return "", 0, ""
-		}
 		if p.Amount > 0 && p.BuyCount > 0 && p.FirstPrice > 0 && price < p.FirstPrice {
-			if c.MaxLossBuyTimes <= 0 || p.BuyCount >= c.MaxLossBuyTimes {
+			// BuyCount includes the initial buy. A zero limit disables this
+			// lower-than-first-price add-on path; positive limits include the first.
+			if c.MaxLossBuyTimes == 0 || p.BuyCount >= c.MaxLossBuyTimes {
 				return "", 0, ""
 			}
-		}
-		if p.LastPrice > 0 && c.MinLossBuyRatio > 0 && price > p.LastPrice*(1-c.MinLossBuyRatio) {
-			return "", 0, ""
+			if p.LastPrice > 0 && c.MinLossBuyRatio > 0 && price > p.LastPrice*(1-c.MinLossBuyRatio) {
+				return "", 0, ""
+			}
 		}
 		return "buy", amt, "external_sell_signal"
 	}
 	if strings.ToLower(ev.Side) != "buy" || p.Amount <= 0 {
 		return "", 0, ""
 	}
-	// SellCount records confirmed sells. Include the sell being planned so the
-	// configured threshold makes that sell itself a full exit.
+	// SellCount records confirmed sells. The sell that reaches the configured
+	// count is the full exit.
 	force := c.SellPolicy.FullSellAfterSellCount > 0 && p.SellCount+1 >= c.SellPolicy.FullSellAfterSellCount
 	if p.CooldownUntil != nil && time.Now().Before(*p.CooldownUntil) {
 		// An already reached public full-sell threshold has priority over the
@@ -2423,14 +2436,14 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 		if token.Decimals != nil {
 			tokenDecimals = *token.Decimals
 		}
-		// SellCount records confirmed sells. Include the scheduled sell being
-		// planned so the threshold applies to that sell itself.
+		// SellCount records confirmed sells. The scheduled sell that reaches the
+		// configured count is the full exit.
 		forceFull := c.SellPolicy.FullSellAfterSellCount > 0 && p.SellCount+1 >= c.SellPolicy.FullSellAfterSellCount
 		amount := p.Amount
 		if !forceFull && c.ScheduledSell.SellRatio > 0 {
 			amount = p.Amount * c.ScheduledSell.SellRatio
 		}
-		if c.ScheduledSell.BaseUSD > 0 && price > 0 {
+		if !forceFull && c.ScheduledSell.BaseUSD > 0 && price > 0 {
 			cap := c.ScheduledSell.BaseUSD / price * math.Pow10(tokenDecimals)
 			if amount > cap {
 				amount = cap

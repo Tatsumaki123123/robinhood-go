@@ -69,3 +69,11 @@ so weighted average cost, sell count, profit level and scheduled state advance
 only after a confirmed transaction. External buy signals check amount, impact
 and profit together; cooldown suppresses external, profit and loss decisions
 until it expires, while scheduled sells continue independently.
+
+`maxLossBuyTimes` counts the current holding cycle's buys, including the first
+buy. A value of `0` disables the lower-than-first-price add-on path. The guard
+is ignored when the current price is at or above the cycle's first buy price;
+`minLossBuyRatio` only adds a required drop from the previous buy when that
+lower-price path is active. A confirmed sell resets the current add-on cycle.
+When `fullSellAfterSellCount` is `N`, the Nth valid sell is the full exit;
+`0` disables this rule. `baseUSD` does not cap that forced scheduled exit.

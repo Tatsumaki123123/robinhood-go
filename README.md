@@ -53,3 +53,77 @@ AVE 请求优先读取数据库 `ave_configs`（`id=1`）的 `x_auth`，未保�
 策略引擎会在监控用户和代币均启用且存在私钥时使用已缓存的 V4 路由广播买卖；V4 买入的
 nonce、费用上限和替换次数写入 `strategy_pending_buys`，只有 own fill 事件才会更新持仓。
 未配置可执行路由时会回退到 Pons V2 曲线交易。
+
+## BottomFishing 配置
+
+用户配置保存在 `monitorUser.updateUser` 的 `config` 字段中。下面的 JSONC 示例与
+当前 Go 策略引擎的字段和判断顺序一致：
+
+```jsonc
+{
+  "name": "大单抄底策略",
+  "enabled": true,
+  "minMcp": 100000, // 只限制买入事件的最低市值（USD）
+  "slippage": 0.05, // 5%
+  "diffBuySecond": 60, // 两次新买入的最小间隔；不延迟首次买入
+  "maxLossBuyTimes": 5, // 价格低于本轮首笔买入价时的累计买入次数上限（含首笔）；0 禁止该加仓路径
+  "minLossBuyRatio": 0.01, // 低于首笔价格时，还需较上一笔买入价下跌 1%；0 不增加该限制
+  "replacePending": true,
+  "pendingBuyTimeoutSecond": 2,
+  "tokenConfig": [
+    {
+      "maxMcp": 1000000000,
+      "buyUSD": 1000, // buyRatio 为 0 时使用；不是金额上限
+      "buyRatio": 0.5, // 大于 0 时按触发卖单金额的 50% 买入
+      "minSellRatio": 0.01 // 外部卖出造成的最低价格跌幅
+    }
+  ],
+  "sellPolicy": {
+    "fullSellAfterSellCount": 3, // 第 N 次有效卖出直接清仓；这里 N=3；0 关闭
+    "resetSellCountOnBuy": true
+  },
+  "scheduledSell": {
+    "enabled": true,
+    "intervalSecond": 1250,
+    "sellRatio": 0.2,
+    "baseUSD": 150,
+    "resetOnBuy": false // 补仓不重启首次建仓的定时节奏
+  },
+  "externalBuySell": {
+    "enabled": true,
+    "minBuyUSD": 100,
+    "buyImpactRatio": 0.03,
+    "needProfit": true,
+    "profitRatio": 0.05,
+    "sellRatio": 0.2,
+    "buyAmountRatio": 0, // 0 使用 sellRatio；大于 0 按外部买单金额计算
+    "cooldownSecond": 30 // 命中外部买单卖出条件时开始冷却
+  },
+  "profitSell": {
+    "enabled": true,
+    "levels": [
+      { "profitRatio": 0.05, "sellRatio": 0.2 },
+      { "profitRatio": 0.1, "sellRatio": 0.25 },
+      { "profitRatio": 0.2, "sellRatio": 0.3 },
+      { "profitRatio": 0.3, "sellRatio": 1.0 }
+    ],
+    "resetOnBuy": true
+  },
+  "lossSell": {
+    "enabled": true,
+    "triggerRatio": 0.15,
+    "sellAll": true
+  },
+  "listConfig": {
+    "source": "ave",
+    "category": "pons_out_hot",
+    "minMcp": 100000,
+    "maxMcp": 1000000000,
+    "createDay": 1
+  }
+}
+```
+
+外部卖出事件（事件 `side=sell`）用于评估抄底买入；外部买入事件（事件
+`side=buy`）用于评估提前卖出。`maxLossBuyTimes` 和 `minLossBuyRatio` 只在当前价低于
+本轮首笔买入价时生效；当前价高于首笔价格时不拦截。卖出后本轮补仓计数会重置。
