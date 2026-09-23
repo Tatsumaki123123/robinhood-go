@@ -25,6 +25,7 @@ type RPC struct {
 	ingress                 chan map[string]any
 	subMu                   sync.RWMutex
 	subs                    map[chan map[string]any]struct{}
+	publishedEvents         atomic.Uint64
 	droppedEvents           atomic.Uint64
 	droppedSubscriberEvents atomic.Uint64
 }
@@ -65,6 +66,9 @@ func (r *RPC) AddSubscriber(buffer int) (<-chan map[string]any, func()) {
 }
 
 func (r *RPC) publishEvent(event map[string]any) {
+	if _, ok := event["receivedAt"]; !ok {
+		event["receivedAt"] = time.Now().UTC()
+	}
 	target := r.ingress
 	if target == nil {
 		// Preserve the behavior for callers that construct RPC literals rather
@@ -73,6 +77,7 @@ func (r *RPC) publishEvent(event map[string]any) {
 	}
 	select {
 	case target <- event:
+		r.publishedEvents.Add(1)
 	default:
 		// The WSS reader must never block on strategy/database work.  Keep the
 		// channel bounded for latency, but expose overflow so operators can
@@ -99,6 +104,22 @@ func (r *RPC) DroppedEvents() uint64 { return r.droppedEvents.Load() }
 // DroppedSubscriberEvents reports events dropped only from API consumers. The
 // strategy stream has its own counter exposed by DroppedEvents.
 func (r *RPC) DroppedSubscriberEvents() uint64 { return r.droppedSubscriberEvents.Load() }
+
+func (r *RPC) PublishedEvents() uint64 { return r.publishedEvents.Load() }
+
+func (r *RPC) IngressDepth() int {
+	if r.ingress == nil {
+		return 0
+	}
+	return len(r.ingress)
+}
+
+func (r *RPC) StrategyDepth() int {
+	if r.Events == nil {
+		return 0
+	}
+	return len(r.Events)
+}
 
 func cloneEvent(event map[string]any) map[string]any {
 	copy := make(map[string]any, len(event))

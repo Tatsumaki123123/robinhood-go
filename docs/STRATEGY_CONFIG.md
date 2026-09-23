@@ -76,6 +76,11 @@ only after a confirmed transaction. External buy signals check amount, impact
 and profit together; cooldown suppresses external, profit and loss decisions
 until it expires, while scheduled sells continue independently.
 
+With `replacePending: true`, a V4 pending buy may be fee-bumped at most once
+after `pendingBuyTimeoutSecond`; stale or failed pending rows are then removed
+without another automatic attempt. Other pending actions are cleaned after a
+short timeout and do not block independent strategy events.
+
 `maxLossBuyTimes` counts the current holding cycle's buys, including the first
 buy. A value of `0` disables the lower-than-first-price add-on path. The guard
 is ignored when the current price is at or above the cycle's first buy price;

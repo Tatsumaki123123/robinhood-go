@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -73,6 +74,11 @@ type position struct {
 	FirstBought, NextScheduled, CooldownUntil, LastBuy    *time.Time
 }
 
+type monitorTarget struct {
+	user  store.User
+	token store.Token
+}
+
 type Engine struct {
 	Store *store.Store
 	RPC   *chain.RPC
@@ -84,27 +90,75 @@ type Engine struct {
 	// mutate strategy state; own-chain fill events call applyOwnFill after a
 	// successful receipt. Keeping this hook optional preserves deterministic
 	// replay/testing of the strategy engine.
-	ExecuteAction  func(context.Context, Event, string, float64) (map[string]any, error)
-	Trading        *chain.Trading
-	EncryptionKey  string
-	NativeUSDPrice string
-	supplies       sync.Map // token address -> cached total supply raw
-	curveBlocks    sync.Map // curve address -> last polled block
-	pollMu         sync.Mutex
-	monitorMu      sync.RWMutex
-	monitorUsers   map[int64]store.User
-	monitorTokens  map[int64][]store.Token
-	monitorAt      time.Time
-	monitorLoadMu  sync.Mutex
-	ownCache       sync.Map // ownership key -> time.Time; positive results only
-	ownCacheMu     sync.Mutex
-	ownCacheSweep  time.Time
+	ExecuteAction   func(context.Context, Event, string, float64) (map[string]any, error)
+	Trading         *chain.Trading
+	EncryptionKey   string
+	NativeUSDPrice  string
+	supplies        sync.Map // token address -> cached total supply raw
+	curveBlocks     sync.Map // curve address -> last polled block
+	pollMu          sync.Mutex
+	monitorMu       sync.RWMutex
+	monitorUsers    map[int64]store.User
+	monitorTokens   map[int64][]store.Token
+	monitorRoutes   map[int64][]map[string]any
+	monitorByPool   map[string][]monitorTarget
+	monitorByCurve  map[string][]monitorTarget
+	monitorAt       time.Time
+	monitorLoadMu   sync.Mutex
+	ownCache        sync.Map // ownership key -> time.Time; positive results only
+	ownCacheMu      sync.Mutex
+	ownCacheSweep   time.Time
+	eventsProcessed atomic.Uint64
+	eventsMatched   atomic.Uint64
+	processErrors   atomic.Uint64
+	queueBacklog    atomic.Int64
+	queueHighWater  atomic.Int64
+	queueDropped    atomic.Uint64
+	queueWaitNs     atomic.Uint64
+	processNs       atomic.Uint64
+	broadcastNs     atomic.Uint64
+	broadcasts      atomic.Uint64
+	nativePriceMu   sync.RWMutex
+	nativePrice     string
+	nativePriceAt   time.Time
 }
 
 const pendingSellTimeout = 5 * time.Second
+const maxPendingBuyReplacements = 1
+const pendingBuyExecutionTimeout = 90 * time.Second
 
 func New(s *store.Store, r *chain.RPC) *Engine {
-	return &Engine{Store: s, RPC: r, monitorUsers: make(map[int64]store.User), monitorTokens: make(map[int64][]store.Token)}
+	return &Engine{Store: s, RPC: r, monitorUsers: make(map[int64]store.User), monitorTokens: make(map[int64][]store.Token), monitorRoutes: make(map[int64][]map[string]any), monitorByPool: make(map[string][]monitorTarget), monitorByCurve: make(map[string][]monitorTarget)}
+}
+
+// Metrics returns cumulative counters and average timings for the strategy
+// event path. It is intentionally allocation-only so health checks never touch
+// the event processing locks.
+func (e *Engine) Metrics() map[string]any {
+	processed := e.eventsProcessed.Load()
+	avg := func(total uint64) float64 {
+		if processed == 0 {
+			return 0
+		}
+		return float64(total) / float64(processed) / 1e6
+	}
+	broadcasts := e.broadcasts.Load()
+	avgBroadcast := float64(0)
+	if broadcasts > 0 {
+		avgBroadcast = float64(e.broadcastNs.Load()) / float64(broadcasts) / 1e6
+	}
+	return map[string]any{
+		"eventsProcessed": processed,
+		"eventsMatched":   e.eventsMatched.Load(),
+		"processErrors":   e.processErrors.Load(),
+		"queueBacklog":    e.queueBacklog.Load(),
+		"queueHighWater":  e.queueHighWater.Load(),
+		"queueDropped":    e.queueDropped.Load(),
+		"avgQueueWaitMs":  avg(e.queueWaitNs.Load()),
+		"avgProcessMs":    avg(e.processNs.Load()),
+		"broadcasts":      broadcasts,
+		"avgBroadcastMs":  avgBroadcast,
+	}
 }
 
 // ConfigureLogging enables the strategy diagnostics only for development
@@ -135,6 +189,9 @@ func (e *Engine) ConfigureTrading(t *chain.Trading, encryptionKey string, native
 func (e *Engine) InvalidateMonitorCache() {
 	e.monitorMu.Lock()
 	e.monitorAt = time.Time{}
+	e.monitorRoutes = make(map[int64][]map[string]any)
+	e.monitorByPool = make(map[string][]monitorTarget)
+	e.monitorByCurve = make(map[string][]monitorTarget)
 	e.monitorMu.Unlock()
 }
 
@@ -143,7 +200,9 @@ func (e *Engine) Run(ctx context.Context) {
 	// keeps events for one user/token/pool in chain order, while unrelated
 	// positions no longer wait behind a slow database or RPC call.
 	const workerCount = 16
+	const maxShardBacklog = 2048
 	queues := make([]chan map[string]any, workerCount)
+	backlogs := make([][]map[string]any, workerCount)
 	var wg sync.WaitGroup
 	for i := range queues {
 		queues[i] = make(chan map[string]any, 512)
@@ -163,6 +222,54 @@ func (e *Engine) Run(ctx context.Context) {
 			}
 		}(queues[i])
 	}
+	queueBacklog := func() int64 {
+		var total int64
+		for idx, backlog := range backlogs {
+			total += int64(len(backlog))
+			total += int64(len(queues[idx]))
+		}
+		return total
+	}
+	updateBacklogMetric := func() {
+		depth := queueBacklog()
+		e.queueBacklog.Store(depth)
+		for {
+			previous := e.queueHighWater.Load()
+			if depth <= previous || e.queueHighWater.CompareAndSwap(previous, depth) {
+				break
+			}
+		}
+	}
+	drain := func() {
+		for idx := range queues {
+		shard:
+			for len(backlogs[idx]) > 0 {
+				select {
+				case queues[idx] <- backlogs[idx][0]:
+					backlogs[idx] = backlogs[idx][1:]
+				default:
+					break shard
+				}
+			}
+		}
+		updateBacklogMetric()
+	}
+	enqueue := func(idx int, raw map[string]any) {
+		if len(backlogs[idx]) == 0 {
+			select {
+			case queues[idx] <- raw:
+				return
+			default:
+			}
+		}
+		if len(backlogs[idx]) >= maxShardBacklog {
+			e.queueDropped.Add(1)
+			return
+		}
+		backlogs[idx] = append(backlogs[idx], raw)
+	}
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -171,6 +278,8 @@ func (e *Engine) Run(ctx context.Context) {
 			}
 			wg.Wait()
 			return
+		case <-ticker.C:
+			drain()
 		case raw, ok := <-e.RPC.Events:
 			if !ok {
 				for _, queue := range queues {
@@ -180,18 +289,23 @@ func (e *Engine) Run(ctx context.Context) {
 				return
 			}
 			idx := eventShard(raw, workerCount)
-			select {
-			case queues[idx] <- raw:
-			case <-ctx.Done():
-			}
+			enqueue(idx, raw)
+			drain()
 		}
 	}
 }
 
 func (e *Engine) processDecoded(ctx context.Context, raw map[string]any) {
 	if ev, ok := decodeEvent(raw); ok {
+		e.eventsProcessed.Add(1)
+		if !ev.ReceivedAt.IsZero() {
+			if wait := time.Since(ev.ReceivedAt); wait > 0 {
+				e.queueWaitNs.Add(uint64(wait))
+			}
+		}
 		if ev.UserID > 0 {
 			if err := e.Process(ctx, ev); err != nil {
+				e.processErrors.Add(1)
 				e.devInfo("策略处理失败",
 					zap.Error(err),
 					zap.Int64("userID", ev.UserID),
@@ -202,6 +316,7 @@ func (e *Engine) processDecoded(ctx context.Context, raw map[string]any) {
 			}
 		} else {
 			if err := e.processForMonitors(ctx, ev); err != nil {
+				e.processErrors.Add(1)
 				e.devInfo("策略监听处理失败",
 					zap.Error(err),
 					zap.String("side", strings.ToLower(ev.Side)),
@@ -231,120 +346,133 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 		return err
 	}
 	e.monitorMu.RLock()
-	users := make([]store.User, 0, len(e.monitorUsers))
-	for _, u := range e.monitorUsers {
-		users = append(users, u)
+	targets := make([]monitorTarget, 0)
+	seen := make(map[string]struct{})
+	addTargets := func(items []monitorTarget) {
+		for _, target := range items {
+			key := fmt.Sprintf("%d:%s:%s", target.user.UserID, strings.ToLower(target.token.TokenAddress), strings.ToLower(target.token.CurveAddress))
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			targets = append(targets, target)
+		}
 	}
-	tokenSnapshot := make(map[int64][]store.Token, len(e.monitorTokens))
-	for uid, tokens := range e.monitorTokens {
-		tokenSnapshot[uid] = append([]store.Token(nil), tokens...)
+	if ev.PoolID != "" {
+		addTargets(e.monitorByPool[strings.ToLower(ev.PoolID)])
+	}
+	if ev.CurveAddress != "" {
+		addTargets(e.monitorByCurve[strings.ToLower(ev.CurveAddress)])
 	}
 	e.monitorMu.RUnlock()
-	for _, u := range users {
-		tokens := tokenSnapshot[u.UserID]
-		for _, t := range tokens {
-			if (ev.CurveAddress != "" && strings.EqualFold(t.CurveAddress, ev.CurveAddress)) || (ev.PoolID != "" && strings.EqualFold(t.PoolID, ev.PoolID)) {
-				t = e.enrichTokenSupply(ctx, t)
-				copy := ev
-				copy.UserID = u.UserID
-				copy.TokenAddress = t.TokenAddress
-				copy.CurveAddress = t.CurveAddress
-				if t.Decimals != nil {
-					copy.TokenDecimals = *t.Decimals
+	for _, target := range targets {
+		e.eventsMatched.Add(1)
+		u, t := target.user, target.token
+		t = e.enrichTokenSupply(ctx, t)
+		copy := ev
+		copy.UserID = u.UserID
+		copy.TokenAddress = t.TokenAddress
+		copy.CurveAddress = t.CurveAddress
+		if t.Decimals != nil {
+			copy.TokenDecimals = *t.Decimals
+		}
+		if t.QuoteDecimals != nil {
+			copy.QuoteDecimals = *t.QuoteDecimals
+		}
+		if t.QuoteUSDPrice != nil {
+			copy.QuoteUSDPrice = strings.TrimSpace(*t.QuoteUSDPrice)
+		}
+		if copy.QuoteUSDPrice == "" && t.QuoteTokenSymbol != nil {
+			switch strings.ToUpper(strings.TrimSpace(*t.QuoteTokenSymbol)) {
+			case "ETH", "WETH":
+				copy.QuoteUSDPrice = strings.TrimSpace(e.NativeUSDPrice)
+			}
+		}
+		if copy.QuoteUSDPrice != "" {
+			quotePrice := copy.QuoteUSDPrice
+			t.QuoteUSDPrice = &quotePrice
+		}
+		if copy.MarketCap == 0 && t.MarketCap != nil {
+			copy.MarketCap, _ = strconv.ParseFloat(*t.MarketCap, 64)
+		}
+		copy.Own = e.isOwnEvent(ctx, copy, u)
+		if ev.PoolID != "" && (ev.Amount0Raw != "" || ev.Amount1Raw != "") {
+			a0, ok0 := signedRaw(ev.Amount0Raw)
+			a1, ok1 := signedRaw(ev.Amount1Raw)
+			if !ok0 || !ok1 {
+				continue
+			}
+			// V4 Swap amounts use the swapper's perspective: a positive
+			// token delta means the token was paid out (buy), while a
+			// negative token delta means it was sold into the pool.
+			amt := new(big.Int).Set(a1)
+			quote := new(big.Int).Set(a0)
+			if strings.EqualFold(t.Currency0, t.TokenAddress) {
+				amt, quote = a0, a1
+			}
+			if amt.Sign() > 0 {
+				copy.Side = "buy"
+			} else if amt.Sign() < 0 {
+				copy.Side = "sell"
+			}
+			quote.Abs(quote)
+			amt.Abs(amt)
+			copy.QuoteAmountText = quote.String()
+			copy.TokenAmountText = amt.String()
+			copy.QuoteAmountRaw = rawFloat(copy.QuoteAmountText)
+			copy.TokenAmountRaw = rawFloat(copy.TokenAmountText)
+			if ev.SqrtPriceX96 != "" {
+				if spot := v4SpotPrice(ev.SqrtPriceX96, strings.EqualFold(t.Currency0, t.TokenAddress)); spot > 0 {
+					copy.PriceRaw = spot
 				}
-				if t.QuoteDecimals != nil {
-					copy.QuoteDecimals = *t.QuoteDecimals
+			}
+			if copy.PriceRaw == 0 && copy.QuoteAmountRaw > 0 && copy.TokenAmountRaw > 0 {
+				copy.PriceRaw = copy.QuoteAmountRaw / copy.TokenAmountRaw
+			}
+			if copy.Price == 0 && copy.PriceRaw > 0 {
+				copy.Price = usdTokenPrice(copy.PriceRaw, t)
+			}
+			if copy.QuoteUSD == 0 && copy.QuoteAmountRaw > 0 {
+				copy.QuoteUSD = rawQuoteUSDWithPrice(copy.QuoteAmountRaw, t, copy.QuoteUSDPrice)
+			}
+			if marketCap := marketCapFromEvent(copy, t); marketCap > 0 {
+				copy.MarketCap = marketCap
+			}
+			// Derive price impact from this swap's own execution price and
+			// the PoolManager post-swap sqrt price. This deliberately does
+			// not compare adjacent events, which is not a price-impact
+			// measurement and caused false external-buy triggers.
+			if copy.PriceImpactRatio == 0 && ev.SqrtPriceX96 != "" {
+				copy.PriceImpactRatio = v4PriceImpact(ev.SqrtPriceX96, copy.QuoteAmountRaw, copy.TokenAmountRaw, strings.EqualFold(t.Currency0, t.TokenAddress))
+				copy.Impact = copy.PriceImpactRatio
+			}
+			copy.PriceChangeRatio = copy.PriceImpactRatio
+			if err := e.Process(ctx, copy); err != nil {
+				e.processErrors.Add(1)
+				e.devInfo("策略处理失败", zap.Error(err), zap.Int64("userID", copy.UserID), zap.String("token", copy.TokenAddress), zap.String("curve", copy.CurveAddress))
+			}
+		} else {
+			if ev.SqrtPriceX96 != "" {
+				if spot := v4SpotPrice(ev.SqrtPriceX96, strings.EqualFold(t.Currency0, t.TokenAddress)); spot > 0 {
+					copy.PriceRaw = spot
 				}
-				if t.QuoteUSDPrice != nil {
-					copy.QuoteUSDPrice = strings.TrimSpace(*t.QuoteUSDPrice)
-				}
-				if copy.QuoteUSDPrice == "" && t.QuoteTokenSymbol != nil {
-					switch strings.ToUpper(strings.TrimSpace(*t.QuoteTokenSymbol)) {
-					case "ETH", "WETH":
-						copy.QuoteUSDPrice = strings.TrimSpace(e.NativeUSDPrice)
-					}
-				}
-				if copy.QuoteUSDPrice != "" {
-					quotePrice := copy.QuoteUSDPrice
-					t.QuoteUSDPrice = &quotePrice
-				}
-				if copy.MarketCap == 0 && t.MarketCap != nil {
-					copy.MarketCap, _ = strconv.ParseFloat(*t.MarketCap, 64)
-				}
-				copy.Own = e.isOwnEvent(ctx, copy, u)
-				if ev.PoolID != "" && (ev.Amount0Raw != "" || ev.Amount1Raw != "") {
-					a0, ok0 := signedRaw(ev.Amount0Raw)
-					a1, ok1 := signedRaw(ev.Amount1Raw)
-					if !ok0 || !ok1 {
-						continue
-					}
-					// V4 Swap amounts use the swapper's perspective: a positive
-					// token delta means the token was paid out (buy), while a
-					// negative token delta means it was sold into the pool.
-					amt := new(big.Int).Set(a1)
-					quote := new(big.Int).Set(a0)
-					if strings.EqualFold(t.Currency0, t.TokenAddress) {
-						amt, quote = a0, a1
-					}
-					if amt.Sign() > 0 {
-						copy.Side = "buy"
-					} else if amt.Sign() < 0 {
-						copy.Side = "sell"
-					}
-					quote.Abs(quote)
-					amt.Abs(amt)
-					copy.QuoteAmountText = quote.String()
-					copy.TokenAmountText = amt.String()
-					copy.QuoteAmountRaw = rawFloat(copy.QuoteAmountText)
-					copy.TokenAmountRaw = rawFloat(copy.TokenAmountText)
-					if ev.SqrtPriceX96 != "" {
-						if spot := v4SpotPrice(ev.SqrtPriceX96, strings.EqualFold(t.Currency0, t.TokenAddress)); spot > 0 {
-							copy.PriceRaw = spot
-						}
-					}
-					if copy.PriceRaw == 0 && copy.QuoteAmountRaw > 0 && copy.TokenAmountRaw > 0 {
-						copy.PriceRaw = copy.QuoteAmountRaw / copy.TokenAmountRaw
-					}
-					if copy.Price == 0 && copy.PriceRaw > 0 {
-						copy.Price = usdTokenPrice(copy.PriceRaw, t)
-					}
-					if copy.QuoteUSD == 0 && copy.QuoteAmountRaw > 0 {
-						copy.QuoteUSD = rawQuoteUSDWithPrice(copy.QuoteAmountRaw, t, copy.QuoteUSDPrice)
-					}
-					if marketCap := marketCapFromEvent(copy, t); marketCap > 0 {
-						copy.MarketCap = marketCap
-					}
-					// Derive price impact from this swap's own execution price and
-					// the PoolManager post-swap sqrt price. This deliberately does
-					// not compare adjacent events, which is not a price-impact
-					// measurement and caused false external-buy triggers.
-					if copy.PriceImpactRatio == 0 && ev.SqrtPriceX96 != "" {
-						copy.PriceImpactRatio = v4PriceImpact(ev.SqrtPriceX96, copy.QuoteAmountRaw, copy.TokenAmountRaw, strings.EqualFold(t.Currency0, t.TokenAddress))
-						copy.Impact = copy.PriceImpactRatio
-					}
-					copy.PriceChangeRatio = copy.PriceImpactRatio
-					_ = e.Process(ctx, copy)
-				} else {
-					if ev.SqrtPriceX96 != "" {
-						if spot := v4SpotPrice(ev.SqrtPriceX96, strings.EqualFold(t.Currency0, t.TokenAddress)); spot > 0 {
-							copy.PriceRaw = spot
-						}
-					}
-					if copy.PriceRaw == 0 && copy.QuoteAmountRaw > 0 && copy.TokenAmountRaw > 0 {
-						copy.PriceRaw = copy.QuoteAmountRaw / copy.TokenAmountRaw
-					}
-					if copy.Price == 0 && copy.PriceRaw > 0 {
-						copy.Price = usdTokenPrice(copy.PriceRaw, t)
-					}
-					if copy.QuoteUSD == 0 && copy.QuoteAmountRaw > 0 {
-						copy.QuoteUSD = rawQuoteUSDWithPrice(copy.QuoteAmountRaw, t, copy.QuoteUSDPrice)
-					}
-					if marketCap := marketCapFromEvent(copy, t); marketCap > 0 {
-						copy.MarketCap = marketCap
-					}
-					copy.PriceChangeRatio = copy.PriceImpactRatio
-					_ = e.Process(ctx, copy)
-				}
+			}
+			if copy.PriceRaw == 0 && copy.QuoteAmountRaw > 0 && copy.TokenAmountRaw > 0 {
+				copy.PriceRaw = copy.QuoteAmountRaw / copy.TokenAmountRaw
+			}
+			if copy.Price == 0 && copy.PriceRaw > 0 {
+				copy.Price = usdTokenPrice(copy.PriceRaw, t)
+			}
+			if copy.QuoteUSD == 0 && copy.QuoteAmountRaw > 0 {
+				copy.QuoteUSD = rawQuoteUSDWithPrice(copy.QuoteAmountRaw, t, copy.QuoteUSDPrice)
+			}
+			if marketCap := marketCapFromEvent(copy, t); marketCap > 0 {
+				copy.MarketCap = marketCap
+			}
+			copy.PriceChangeRatio = copy.PriceImpactRatio
+			if err := e.Process(ctx, copy); err != nil {
+				e.processErrors.Add(1)
+				e.devInfo("策略处理失败", zap.Error(err), zap.Int64("userID", copy.UserID), zap.String("token", copy.TokenAddress), zap.String("curve", copy.CurveAddress))
 			}
 		}
 	}
@@ -390,6 +518,8 @@ func (e *Engine) refreshMonitorCache(ctx context.Context, force bool) error {
 	}
 	userMap := make(map[int64]store.User, len(users))
 	tokenMap := make(map[int64][]store.Token, len(users))
+	byPool := make(map[string][]monitorTarget)
+	byCurve := make(map[string][]monitorTarget)
 	for _, u := range users {
 		userMap[u.UserID] = u
 		tokens, tokenErr := e.Store.Tokens(ctx, u.UserID, nil)
@@ -397,9 +527,20 @@ func (e *Engine) refreshMonitorCache(ctx context.Context, force bool) error {
 			return tokenErr
 		}
 		tokenMap[u.UserID] = tokens
+		for _, token := range tokens {
+			target := monitorTarget{user: u, token: token}
+			if pool := strings.ToLower(strings.TrimSpace(token.PoolID)); pool != "" {
+				byPool[pool] = append(byPool[pool], target)
+			}
+			if curve := strings.ToLower(strings.TrimSpace(token.CurveAddress)); curve != "" {
+				byCurve[curve] = append(byCurve[curve], target)
+			}
+		}
 	}
 	e.monitorMu.Lock()
-	e.monitorUsers, e.monitorTokens, e.monitorAt = userMap, tokenMap, time.Now()
+	e.monitorUsers, e.monitorTokens = userMap, tokenMap
+	e.monitorRoutes = make(map[int64][]map[string]any)
+	e.monitorByPool, e.monitorByCurve, e.monitorAt = byPool, byCurve, time.Now()
 	e.monitorMu.Unlock()
 	return nil
 }
@@ -413,6 +554,46 @@ func (e *Engine) cachedUser(ctx context.Context, userID int64) (store.User, erro
 		return u, nil
 	}
 	return e.Store.User(ctx, userID)
+}
+
+func (e *Engine) cachedToken(ctx context.Context, userID int64, address, curve string) (store.Token, error) {
+	_ = e.refreshMonitorCache(ctx, false)
+	e.monitorMu.RLock()
+	for _, token := range e.monitorTokens[userID] {
+		if strings.EqualFold(token.TokenAddress, address) && strings.EqualFold(token.CurveAddress, curve) {
+			e.monitorMu.RUnlock()
+			return token, nil
+		}
+	}
+	e.monitorMu.RUnlock()
+	return e.Store.Token(ctx, userID, address, curve)
+}
+
+func (e *Engine) cachedRoutes(ctx context.Context, userID int64) ([]map[string]any, error) {
+	_ = e.refreshMonitorCache(ctx, false)
+	e.monitorMu.RLock()
+	routes, ok := e.monitorRoutes[userID]
+	cacheAt := e.monitorAt
+	if ok {
+		routes = append([]map[string]any(nil), routes...)
+	}
+	e.monitorMu.RUnlock()
+	if ok {
+		return routes, nil
+	}
+	routes, err := e.Store.Routes(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	e.monitorMu.Lock()
+	if e.monitorAt == cacheAt {
+		if e.monitorRoutes == nil {
+			e.monitorRoutes = make(map[int64][]map[string]any)
+		}
+		e.monitorRoutes[userID] = routes
+	}
+	e.monitorMu.Unlock()
+	return routes, nil
 }
 
 func (e *Engine) cachedTokenEnabled(ctx context.Context, userID int64, address, curve string) (bool, error) {
@@ -611,6 +792,9 @@ func decodeEvent(raw map[string]any) (Event, bool) {
 	// drops every WSS event, so use the struct for string fields and normalize
 	// numeric aliases below instead of treating a type mismatch as a bad event.
 	_ = json.Unmarshal(b, &ev)
+	if ev.ReceivedAt.IsZero() {
+		ev.ReceivedAt = time.Now()
+	}
 	if ev.UserID == 0 {
 		ev.UserID = int64(firstFloat(raw, "userId", "userID"))
 	}
@@ -998,10 +1182,21 @@ func quotePriceEthFromToken(t store.Token, nativeUSDPrice string) string {
 }
 
 func (e *Engine) nativeUSDPrice(ctx context.Context) string {
+	e.nativePriceMu.RLock()
+	if e.nativePrice != "" && time.Since(e.nativePriceAt) < 30*time.Second {
+		price := e.nativePrice
+		e.nativePriceMu.RUnlock()
+		return price
+	}
+	e.nativePriceMu.RUnlock()
 	if e.Store != nil && e.Store.DB != nil {
 		var price *string
 		if err := e.Store.DB.QueryRow(ctx, "SELECT eth_usd_price::text FROM ave_configs WHERE id=1 AND eth_usd_price IS NOT NULL AND eth_usd_price > 0").Scan(&price); err == nil && price != nil && strings.TrimSpace(*price) != "" {
-			return strings.TrimSpace(*price)
+			value := strings.TrimSpace(*price)
+			e.nativePriceMu.Lock()
+			e.nativePrice, e.nativePriceAt = value, time.Now()
+			e.nativePriceMu.Unlock()
+			return value
 		}
 	}
 	return strings.TrimSpace(e.NativeUSDPrice)
@@ -1121,6 +1316,8 @@ func firstFloat(m map[string]any, keys ...string) float64 {
 }
 
 func (e *Engine) Process(ctx context.Context, ev Event) error {
+	started := time.Now()
+	defer func() { e.processNs.Add(uint64(time.Since(started))) }()
 	// Price change is the current swap's signed impact. It must not depend on
 	// a previous event observed by this process.
 	ev.PriceChangeRatio = ev.PriceImpactRatio
@@ -1166,23 +1363,9 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 	if err != nil {
 		return err
 	}
-	// A position may receive several market events while a previous sell is
-	// still waiting for its receipt. loadPosition includes the durable pending
-	// flag in the same round trip, so a later event cannot broadcast a second
-	// sell without adding another database latency hop to the WSS path.
-	if p.PendingSell {
-		e.devInfo("策略跳过交易",
-			zap.Int64("userID", ev.UserID),
-			zap.String("reason", "pending_sell"),
-			zap.String("pendingTransactionHash", p.PendingSellHash),
-			zap.String("pendingSellReason", p.PendingSellReason),
-			zap.String("pendingSellStatus", p.PendingSellStatus),
-			zap.String("side", strings.ToLower(ev.Side)),
-			zap.String("token", ev.TokenAddress),
-			zap.String("curve", ev.CurveAddress),
-		)
-		return nil
-	}
+	// Pending transaction state is informational for strategy events. Each
+	// matched chain event is evaluated independently; markStrategyEvent below
+	// remains the idempotency guard for the same source event.
 	action, amount, reason := evaluate(cfg, rule, ev, p)
 	if action == "" || amount <= 0 {
 		return nil
@@ -1273,6 +1456,7 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 			}
 		}
 		var result map[string]any
+		broadcastStarted := time.Now()
 		if e.ExecuteAction != nil {
 			var execErr error
 			result, execErr = e.ExecuteAction(ctx, ev, action, amount)
@@ -1287,6 +1471,8 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 				)
 				if action == "sell" {
 					e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, execErr)
+				} else if action == "buy" {
+					e.clearUnbroadcastPendingBuy(ctx, ev)
 				}
 				return execErr
 			}
@@ -1302,6 +1488,8 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 				)
 				if action == "sell" {
 					e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, execErr)
+				} else if action == "buy" {
+					e.clearUnbroadcastPendingBuy(ctx, ev)
 				}
 				return execErr
 			}
@@ -1313,6 +1501,8 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 			)
 			return nil
 		}
+		e.broadcasts.Add(1)
+		e.broadcastNs.Add(uint64(time.Since(broadcastStarted)))
 		e.devInfo("交易执行结果",
 			zap.String("action", action),
 			zap.String("mode", strings.ToLower(fmt.Sprint(result["mode"]))),
@@ -1330,6 +1520,8 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 			}
 		} else if action == "sell" {
 			e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, fmt.Errorf("empty transaction hash"))
+		} else if action == "buy" {
+			e.clearUnbroadcastPendingBuy(ctx, ev)
 		}
 		return nil
 	}
@@ -1432,7 +1624,7 @@ func exactSellAmountRaw(p position, amount float64) string {
 // through the same Trading implementation exposed by the HTTP API; receipt
 // events remain the single source of truth for position accounting.
 func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount float64, cfg Config) (map[string]any, error) {
-	u, err := e.Store.User(ctx, ev.UserID)
+	u, err := e.cachedUser(ctx, ev.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -1443,13 +1635,13 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 	if err != nil {
 		return nil, err
 	}
-	t, err := e.Store.Token(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress)
+	t, err := e.cachedToken(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress)
 	if err != nil {
 		return nil, err
 	}
 	// Prefer a validated cached V4 route. Route input is raw quote/token units;
 	// strategy buy amounts are USD, so convert using the event's quote price.
-	routes, err := e.Store.Routes(ctx, ev.UserID)
+	routes, err := e.cachedRoutes(ctx, ev.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -1609,19 +1801,42 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 // after the configured timeout. The original hash remains in buy_attempts so
 // receipt reconciliation can still classify it if it eventually lands.
 func (e *Engine) persistPendingBuy(ctx context.Context, ev Event, amount float64, replace bool, timeoutSecond int) (bool, error) {
+	// Failed/reverted/expired rows are historical state, not a reason to hold
+	// up a new source event. Remove only this position's stale row first.
+	_, _ = e.Store.DB.Exec(ctx, `DELETE FROM strategy_pending_buys WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND status IN ('failed','reverted','expired')`, ev.UserID, ev.TokenAddress, ev.CurveAddress)
 	var accepted bool
 	if replace {
-		err := e.Store.DB.QueryRow(ctx, `INSERT INTO strategy_pending_buys(user_id,token_address,curve_address,quote_usd,source_event_key,replacement_count,status) VALUES($1,$2,$3,$4,$5,0,'pending') ON CONFLICT(user_id,token_address,curve_address) DO UPDATE SET quote_usd=EXCLUDED.quote_usd,source_event_key=EXCLUDED.source_event_key,transaction_hash=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.transaction_hash ELSE NULL END,nonce=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.nonce ELSE NULL END,max_fee_per_gas=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.max_fee_per_gas ELSE NULL END,max_priority_fee_per_gas=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.max_priority_fee_per_gas ELSE NULL END,amount_out_minimum_raw=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.amount_out_minimum_raw ELSE NULL END,winner_transaction_hash=NULL,replacement_count=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.replacement_count+1 ELSE 0 END,status='pending',updated_at=now() WHERE strategy_pending_buys.status IN ('confirmed','reverted','failed','expired') OR (strategy_pending_buys.status='pending' AND $6 > 0 AND strategy_pending_buys.updated_at < now() - ($6 * interval '1 second')) RETURNING true`, ev.UserID, ev.TokenAddress, ev.CurveAddress, amount, ev.Key, timeoutSecond).Scan(&accepted)
+		// Do not fee-bump a transaction that is already known to have reverted.
+		// A later source event may start a fresh intent after cleanup, but this
+		// failed hash is never retried.
+		var pendingHash *string
+		var replacementCount int
+		var pendingUpdatedAt time.Time
+		if err := e.Store.DB.QueryRow(ctx, `SELECT transaction_hash,replacement_count,updated_at FROM strategy_pending_buys WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND status='pending'`, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&pendingHash, &replacementCount, &pendingUpdatedAt); err == nil && pendingHash != nil && strings.TrimSpace(*pendingHash) != "" && timeoutSecond > 0 && time.Since(pendingUpdatedAt) >= time.Duration(timeoutSecond)*time.Second && e.RPC != nil {
+			checkCtx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
+			receipt, receiptErr := e.RPC.Receipt(checkCtx, *pendingHash)
+			cancel()
+			if receiptErr == nil && receipt != nil && failedReceipt(receipt) {
+				_, _ = e.Store.DB.Exec(ctx, `DELETE FROM strategy_pending_buys WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND status='pending'`, ev.UserID, ev.TokenAddress, ev.CurveAddress)
+				_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_buy_attempts SET status='failed',updated_at=now() WHERE transaction_hash=$1 AND status='pending'`, *pendingHash)
+				return false, nil
+			}
+		}
+		err := e.Store.DB.QueryRow(ctx, `INSERT INTO strategy_pending_buys(user_id,token_address,curve_address,quote_usd,source_event_key,replacement_count,status) VALUES($1,$2,$3,$4,$5,0,'pending') ON CONFLICT(user_id,token_address,curve_address) DO UPDATE SET quote_usd=EXCLUDED.quote_usd,source_event_key=EXCLUDED.source_event_key,transaction_hash=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.transaction_hash ELSE NULL END,nonce=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.nonce ELSE NULL END,max_fee_per_gas=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.max_fee_per_gas ELSE NULL END,max_priority_fee_per_gas=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.max_priority_fee_per_gas ELSE NULL END,amount_out_minimum_raw=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.amount_out_minimum_raw ELSE NULL END,winner_transaction_hash=NULL,replacement_count=CASE WHEN strategy_pending_buys.status='pending' THEN strategy_pending_buys.replacement_count+1 ELSE 0 END,status='pending',updated_at=now() WHERE strategy_pending_buys.status='confirmed' OR (strategy_pending_buys.status='pending' AND $6 > 0 AND strategy_pending_buys.updated_at < now() - ($6 * interval '1 second') AND strategy_pending_buys.replacement_count < $7) RETURNING true`, ev.UserID, ev.TokenAddress, ev.CurveAddress, amount, ev.Key, timeoutSecond, maxPendingBuyReplacements).Scan(&accepted)
 		if err != nil && strings.Contains(strings.ToLower(err.Error()), "no rows") {
 			return false, nil
 		}
 		return accepted, err
 	}
-	err := e.Store.DB.QueryRow(ctx, `INSERT INTO strategy_pending_buys(user_id,token_address,curve_address,quote_usd,source_event_key,status) VALUES($1,$2,$3,$4,$5,'pending') ON CONFLICT(user_id,token_address,curve_address) DO UPDATE SET quote_usd=EXCLUDED.quote_usd,source_event_key=EXCLUDED.source_event_key,transaction_hash=NULL,nonce=NULL,max_fee_per_gas=NULL,max_priority_fee_per_gas=NULL,amount_out_minimum_raw=NULL,winner_transaction_hash=NULL,replacement_count=0,status='pending',updated_at=now() WHERE strategy_pending_buys.status IN ('confirmed','reverted','failed','expired') OR (strategy_pending_buys.status='pending' AND $6 > 0 AND strategy_pending_buys.updated_at < now() - ($6 * interval '1 second')) RETURNING true`, ev.UserID, ev.TokenAddress, ev.CurveAddress, amount, ev.Key, timeoutSecond).Scan(&accepted)
+	err := e.Store.DB.QueryRow(ctx, `INSERT INTO strategy_pending_buys(user_id,token_address,curve_address,quote_usd,source_event_key,status) VALUES($1,$2,$3,$4,$5,'pending') ON CONFLICT(user_id,token_address,curve_address) DO UPDATE SET quote_usd=EXCLUDED.quote_usd,source_event_key=EXCLUDED.source_event_key,transaction_hash=NULL,nonce=NULL,max_fee_per_gas=NULL,max_priority_fee_per_gas=NULL,amount_out_minimum_raw=NULL,winner_transaction_hash=NULL,replacement_count=0,status='pending',updated_at=now() WHERE strategy_pending_buys.status='confirmed' RETURNING true`, ev.UserID, ev.TokenAddress, ev.CurveAddress, amount, ev.Key).Scan(&accepted)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), "no rows") {
 		return false, nil
 	}
 	return accepted, err
+}
+
+func (e *Engine) clearUnbroadcastPendingBuy(ctx context.Context, ev Event) {
+	_, _ = e.Store.DB.Exec(ctx, `DELETE FROM strategy_pending_buys WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND status='pending' AND (transaction_hash IS NULL OR transaction_hash='')`, ev.UserID, ev.TokenAddress, ev.CurveAddress)
 }
 
 // UpdatePendingBroadcast records the transaction identity after RPC accepts a
@@ -2293,18 +2508,18 @@ func (e *Engine) CleanupExpiredPendingSells(ctx context.Context) {
 	e.expirePendingSells(ctx)
 }
 
-// expirePendingSells releases sell actions that were accepted by the RPC but
-// never produced a fill event. Expired rows are deleted so they no longer
-// appear in pending-actions queries or block a later strategy decision.
+// expirePendingSells releases non-buy-config pending actions that were
+// accepted by the RPC but never produced a fill event. The cleanup is scoped
+// to one user/token/curve row and never changes strategy state for other
+// positions.
 func (e *Engine) expirePendingSells(ctx context.Context) {
 	if e.Store == nil {
 		return
 	}
 	rows, err := e.Store.DB.Query(ctx, `
-		SELECT transaction_hash,user_id,token_address,curve_address,reason
+		SELECT transaction_hash,user_id,token_address,curve_address,side,reason
 		FROM strategy_pending_actions
-		WHERE side='sell'
-		  AND status IN ('pending','confirmed_pending_accounting')
+		WHERE status IN ('pending','confirmed_pending_accounting')
 		  AND updated_at < now() - $1::interval
 		ORDER BY updated_at
 		LIMIT 100`, pendingSellTimeout.String())
@@ -2313,31 +2528,96 @@ func (e *Engine) expirePendingSells(ctx context.Context) {
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var hash, token, curve, reason string
+		var hash, token, curve, side, reason string
 		var userID int64
-		if err := rows.Scan(&hash, &userID, &token, &curve, &reason); err != nil {
+		if err := rows.Scan(&hash, &userID, &token, &curve, &side, &reason); err != nil {
 			continue
 		}
 		var deleted bool
 		if err := e.Store.DB.QueryRow(ctx, `
 			DELETE FROM strategy_pending_actions
 			WHERE transaction_hash=$1
-			  AND side='sell'
 			  AND status IN ('pending','confirmed_pending_accounting')
 			  AND updated_at < now() - $2::interval
 			RETURNING true`, hash, pendingSellTimeout.String()).Scan(&deleted); err != nil || !deleted {
 			continue
 		}
-		e.devInfo("卖出待处理已超时清理",
+		e.devInfo("待处理交易已超时清理",
 			zap.Int64("userID", userID),
 			zap.String("transactionHash", hash),
 			zap.String("reason", reason),
+			zap.String("side", side),
 			zap.String("status", "deleted"),
 			zap.String("token", token),
 			zap.String("curve", curve),
 			zap.Duration("timeout", pendingSellTimeout),
 		)
-		e.reconcileFailedSell(ctx, userID, token, curve, reason, fmt.Errorf("pending sell timeout: %s", hash))
+		if side == "sell" {
+			e.reconcileFailedSell(ctx, userID, token, curve, reason, fmt.Errorf("pending sell timeout: %s", hash))
+		}
+	}
+	e.expirePendingBuys(ctx)
+}
+
+func failedReceipt(receipt any) bool {
+	m, ok := receipt.(map[string]any)
+	if !ok {
+		return false
+	}
+	status := strings.ToLower(strings.TrimSpace(fmt.Sprint(m["status"])))
+	return status == "0x0" || status == "0"
+}
+
+// expirePendingBuys bounds the replacement state machine. One original buy
+// and at most one configured replacement are allowed; a stale second attempt
+// is deleted instead of being replaced forever.
+func (e *Engine) expirePendingBuys(ctx context.Context) {
+	if e.Store == nil {
+		return
+	}
+	rows, err := e.Store.DB.Query(ctx, `
+		SELECT user_id,token_address,curve_address,transaction_hash,replacement_count,status,created_at
+		FROM strategy_pending_buys
+		WHERE status IN ('pending','failed','reverted','expired')
+		  AND updated_at < now() - $1::interval
+		ORDER BY updated_at
+		LIMIT 20`, pendingSellTimeout.String())
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var userID int64
+		var token, curve string
+		var hash *string
+		var replacementCount int
+		var status string
+		var createdAt time.Time
+		if err := rows.Scan(&userID, &token, &curve, &hash, &replacementCount, &status, &createdAt); err != nil {
+			continue
+		}
+		if status == "pending" && (hash == nil || strings.TrimSpace(*hash) == "") && time.Since(createdAt) < pendingBuyExecutionTimeout {
+			continue
+		}
+		if status == "pending" && replacementCount < maxPendingBuyReplacements && hash != nil && strings.TrimSpace(*hash) != "" && e.RPC != nil {
+			checkCtx, cancel := context.WithTimeout(ctx, time.Second)
+			receipt, receiptErr := e.RPC.Receipt(checkCtx, *hash)
+			cancel()
+			if receiptErr != nil || receipt == nil {
+				if time.Since(createdAt) < pendingBuyExecutionTimeout {
+					continue
+				}
+			} else if !failedReceipt(receipt) {
+				continue
+			}
+		}
+		if _, err := e.Store.DB.Exec(ctx, `DELETE FROM strategy_pending_buys WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND status IN ('pending','failed','reverted','expired')`, userID, token, curve); err != nil {
+			continue
+		}
+		if hash != nil && strings.TrimSpace(*hash) != "" {
+			_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_buy_attempts SET status='failed',updated_at=now() WHERE transaction_hash=$1 AND status='pending'`, *hash)
+		}
+		e.devInfo("买入 pending 已清理，不再自动重试", zap.Int64("userID", userID), zap.String("token", token), zap.String("curve", curve), zap.Int("replacementCount", replacementCount))
 	}
 }
 
@@ -2495,12 +2775,12 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 		if amount <= 0 {
 			continue
 		}
-		// Claim the due slot before broadcasting.  The scheduler runs every
-		// second, while a broadcast may remain unconfirmed for much longer.  If
+		// Claim the due slot before broadcasting. The scheduler runs every
+		// second, while a broadcast may remain unconfirmed for much longer. If
 		// the due timestamp is left untouched, every tick can submit the same
 		// scheduled sell again (and multiple service instances can race too).
-		// The conditional update makes the claim atomic and also gives failed
-		// broadcasts a bounded retry delay instead of a hot loop.
+		// The conditional update makes the claim atomic; failures clear the
+		// schedule instead of creating an automatic retry loop.
 		interval := c.ScheduledSell.IntervalSecond
 		if interval <= 0 {
 			interval = 1
@@ -2608,6 +2888,9 @@ func (e *Engine) reconcileFailedSell(ctx context.Context, userID int64, token, c
 		return
 	}
 	if balance.Sign() > 0 {
+		if reason == "scheduled_sell" {
+			_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_positions SET next_scheduled_sell_at=NULL,updated_at=now() WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, userID, token, curve)
+		}
 		e.devInfo("卖出失败后仍有 token 余额，保留持仓", zap.Error(sellErr), zap.String("reason", reason), zap.String("token", token), zap.String("curve", curve), zap.String("balanceRaw", balance.String()))
 		return
 	}

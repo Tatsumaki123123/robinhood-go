@@ -13,6 +13,7 @@ import (
 	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"math/big"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,6 +25,7 @@ type Trading struct {
 	// FixedGasPrice is an optional EIP-1559 max fee / legacy gas price in wei.
 	// When set, transaction submission skips the gasPrice and base-fee reads.
 	FixedGasPrice *big.Int
+	approvedV4    sync.Map // wallet/token -> approvals confirmed during this process
 }
 
 // BroadcastOptions controls a transaction that is submitted but whose receipt
@@ -308,8 +310,12 @@ func (t *Trading) BroadcastV4(ctx context.Context, d map[string]any, opts Broadc
 		inputToken = fmt.Sprint(d["currencyIn"])
 	}
 	if inputToken != "" && inputToken != "<nil>" && !strings.EqualFold(inputToken, NativeAddress) && !boolValue(d["wrapNative"]) && !strings.EqualFold(fmt.Sprint(d["side"]), "sell") {
-		if _, err = t.approveV4Max(ctx, key, inputToken); err != nil {
-			return BroadcastResult{}, err
+		approvalKey := strings.ToLower(from) + ":" + strings.ToLower(inputToken)
+		if _, approved := t.approvedV4.Load(approvalKey); !approved {
+			if _, err = t.approveV4Max(ctx, key, inputToken); err != nil {
+				return BroadcastResult{}, err
+			}
+			t.approvedV4.Store(approvalKey, struct{}{})
 		}
 	}
 	var prepared map[string]any
@@ -467,6 +473,10 @@ func (t *Trading) PrepareV4SellApproval(ctx context.Context, privateKey, token s
 		return fmt.Errorf("invalid privateKey: %w", err)
 	}
 	_, err = t.approveV4Max(ctx, key, token)
+	if err == nil {
+		from := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
+		t.approvedV4.Store(strings.ToLower(from)+":"+strings.ToLower(token), struct{}{})
+	}
 	return err
 }
 

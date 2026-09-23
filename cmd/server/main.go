@@ -61,6 +61,7 @@ func main() {
 	engine.ConfigureTrading(tr, cfg.EncryptionKey, cfg.NativeUSDPrice)
 	engine.ConfigureLogging(log, cfg.Env)
 	service.SetMonitorCacheInvalidator(engine.InvalidateMonitorCache)
+	service.SetStrategyMetrics(engine.Metrics)
 	engine.CleanupExpiredPendingSells(ctx)
 	go engine.Run(ctx)
 	go engine.Tick(ctx)

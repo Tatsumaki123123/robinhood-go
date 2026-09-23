@@ -36,6 +36,7 @@ type API struct {
 	Redis                  *redis.Client
 	Log                    *zap.Logger
 	invalidateMonitorCache func()
+	strategyMetrics        func() map[string]any
 	clients                map[*websocket.Conn]struct{}
 	clientsMu              sync.RWMutex
 	aveAuthMu              sync.Mutex
@@ -49,7 +50,8 @@ func New(c config.Config, s *store.Store, r *chain.RPC, t *chain.Trading, rd *re
 	return &API{Cfg: c, Store: s, RPC: r, Trading: t, Redis: rd, Log: l, clients: map[*websocket.Conn]struct{}{}}
 }
 
-func (a *API) SetMonitorCacheInvalidator(fn func()) { a.invalidateMonitorCache = fn }
+func (a *API) SetMonitorCacheInvalidator(fn func())        { a.invalidateMonitorCache = fn }
+func (a *API) SetStrategyMetrics(fn func() map[string]any) { a.strategyMetrics = fn }
 
 func (a *API) invalidateCache() {
 	if a.invalidateMonitorCache != nil {
@@ -61,8 +63,14 @@ func (a *API) Register(app *fiber.App) {
 	app.Get("/health", func(c *fiber.Ctx) error {
 		out := map[string]any{"status": "ok", "database": a.Store != nil}
 		if a.RPC != nil {
+			out["wssPublishedEvents"] = a.RPC.PublishedEvents()
 			out["wssDroppedEvents"] = a.RPC.DroppedEvents()
 			out["wssDroppedSubscriberEvents"] = a.RPC.DroppedSubscriberEvents()
+			out["wssIngressDepth"] = a.RPC.IngressDepth()
+			out["strategyChannelDepth"] = a.RPC.StrategyDepth()
+		}
+		if a.strategyMetrics != nil {
+			out["strategy"] = a.strategyMetrics()
 		}
 		return httpx.OK(c, out)
 	})
