@@ -1401,6 +1401,7 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 		}
 	}
 	if action != "" && amount > 0 {
+		fullSell := action == "sell" && p.Amount > 0 && amount >= p.Amount
 		e.devInfo("策略决定执行交易",
 			zap.Int64("userID", ev.UserID),
 			zap.String("configName", cfg.Name),
@@ -1410,7 +1411,26 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 			zap.String("token", ev.TokenAddress),
 			zap.String("curve", ev.CurveAddress),
 		)
-		if action == "sell" && reason == "external_buy_signal" && cfg.ExternalBuySell.BuyAmountRatio > 0 {
+		if action == "sell" {
+			balance, canSell, balanceErr := e.prepareSellBalance(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, p.AmountRaw, reason, ev.TokenDecimals)
+			if balanceErr != nil {
+				e.devInfo("卖出读取链上 token 余额失败，不广播交易",
+					zap.Error(balanceErr),
+					zap.String("reason", reason),
+					zap.String("token", ev.TokenAddress),
+					zap.String("curve", ev.CurveAddress),
+				)
+				return balanceErr
+			}
+			if !canSell {
+				return nil
+			}
+			if fullSell {
+				e.devInfo("清仓卖出使用链上 token 余额", zap.String("reason", reason), zap.String("balanceRaw", balance.String()), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
+				ev.ExecutionAmountRaw = balance.String()
+			}
+		}
+		if action == "sell" && reason == "external_buy_signal" && cfg.ExternalBuySell.BuyAmountRatio > 0 && !fullSell {
 			rawEventToken := ev.TokenAmountText
 			if rawEventToken == "" {
 				rawEventToken = integerRaw(ev.TokenAmountRaw)
@@ -1703,6 +1723,87 @@ func exactSellAmountRaw(p position, amount float64) string {
 		return ""
 	}
 	return rawRatio(p.AmountRaw, ratio)
+}
+
+// actualTokenBalance reads the wallet's current raw token balance. Sell
+// preflight uses it because the database can lag behind a confirmed fill or an
+// external transfer.
+func (e *Engine) actualTokenBalance(ctx context.Context, userID int64, token string) (*big.Int, error) {
+	if e.RPC == nil {
+		return nil, fmt.Errorf("rpc is not configured")
+	}
+	u, err := e.cachedUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(u.WalletAddress) == "" {
+		return nil, fmt.Errorf("wallet address is empty")
+	}
+	return e.RPC.ERC20Balance(ctx, token, u.WalletAddress)
+}
+
+// prepareSellBalance refuses a sell when either the tracked position or the
+// wallet balance is below 100 whole tokens, or when the wallet has less than
+// the tracked amount. In that case the database position is stale/dust and is
+// cleared instead of broadcasting a transaction that cannot succeed. A full
+// sell receives the live wallet amount; partial sells keep their strategy
+// calculated amount.
+func (e *Engine) prepareSellBalance(ctx context.Context, userID int64, token, curve, databaseAmountRaw, reason string, decimalsHint int) (*big.Int, bool, error) {
+	databaseAmount, ok := new(big.Int).SetString(integerText(databaseAmountRaw), 10)
+	if !ok || databaseAmount.Sign() <= 0 {
+		return nil, false, e.clearUntradeablePosition(ctx, userID, token, curve, reason, "database token balance is empty")
+	}
+	balance, err := e.actualTokenBalance(ctx, userID, token)
+	if err != nil {
+		return nil, false, err
+	}
+	minBalanceRaw, decimalsErr := e.minimumSellBalanceRaw(ctx, userID, token, curve, decimalsHint)
+	if decimalsErr != nil {
+		return nil, false, decimalsErr
+	}
+	if databaseAmount.Cmp(minBalanceRaw) < 0 || balance.Cmp(minBalanceRaw) < 0 || balance.Cmp(databaseAmount) < 0 {
+		message := "database or wallet token balance is below 100 tokens"
+		return nil, false, e.clearUntradeablePosition(ctx, userID, token, curve, reason, message)
+	}
+	return balance, true, nil
+}
+
+func (e *Engine) minimumSellBalanceRaw(ctx context.Context, userID int64, token, curve string, decimalsHint int) (*big.Int, error) {
+	decimals := decimalsHint
+	if decimals < 0 {
+		decimals = 0
+	}
+	if decimals == 0 {
+		if monitored, err := e.cachedToken(ctx, userID, token, curve); err == nil && monitored.Decimals != nil && *monitored.Decimals >= 0 {
+			decimals = *monitored.Decimals
+		} else if e.RPC != nil {
+			resolved, err := e.RPC.ERC20Decimals(ctx, token)
+			if err != nil {
+				return nil, err
+			}
+			decimals = resolved
+		}
+	}
+	return new(big.Int).Mul(big.NewInt(100), new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)), nil
+}
+
+func (e *Engine) clearUntradeablePosition(ctx context.Context, userID int64, token, curve, reason, message string) error {
+	if e.Store == nil {
+		return nil
+	}
+	if _, err := e.Store.DB.Exec(ctx, `
+		UPDATE strategy_positions
+		SET token_amount_raw='0', quote_spent_raw='0', cost_usd_raw='0',
+			average_cost_usd=0, first_buy_price=0, last_buy_price=0,
+			buy_count=0, sell_count=0, profit_sell_level=0,
+			first_bought_at=NULL, next_scheduled_sell_at=NULL,
+			external_cooldown_until=NULL, last_buy_at=NULL, updated_at=now()
+		WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, userID, token, curve); err != nil {
+		return err
+	}
+	_, _ = e.Store.DB.Exec(ctx, `DELETE FROM strategy_sell_failures WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, userID, token, curve)
+	e.devInfo("卖出前余额不足，已清零数据库持仓，不广播交易", zap.Int64("userID", userID), zap.String("reason", reason), zap.String("message", message), zap.String("token", token), zap.String("curve", curve))
+	return nil
 }
 
 // executeLive is the default strategy executor. It deliberately broadcasts
@@ -2882,6 +2983,19 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 		if amount <= 0 {
 			continue
 		}
+		var fullSellBalance *big.Int
+		balance, canSell, balanceErr := e.prepareSellBalance(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, p.AmountRaw, "scheduled_sell", tokenDecimals)
+		if balanceErr != nil {
+			e.devInfo("定时卖出读取链上 token 余额失败，不广播交易", zap.Error(balanceErr), zap.String("reason", "scheduled_sell"), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
+			continue
+		}
+		if !canSell {
+			continue
+		}
+		if forceFull {
+			e.devInfo("定时清仓卖出使用链上 token 余额", zap.String("reason", "scheduled_sell"), zap.String("balanceRaw", balance.String()), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
+			fullSellBalance = balance
+		}
 		// Claim the due slot before broadcasting. The scheduler runs every
 		// second, while a broadcast may remain unconfirmed for much longer. If
 		// the due timestamp is left untouched, every tick can submit the same
@@ -2932,7 +3046,11 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 		ev.Price = price
 		ev.PriceRaw = rawTokenPriceFromUSD(price, token)
 		ev.TokenDecimals = tokenDecimals
-		ev.ExecutionAmountRaw = exactSellAmountRaw(p, amount)
+		if fullSellBalance != nil {
+			ev.ExecutionAmountRaw = fullSellBalance.String()
+		} else {
+			ev.ExecutionAmountRaw = exactSellAmountRaw(p, amount)
+		}
 		if token.QuoteDecimals != nil {
 			ev.QuoteDecimals = *token.QuoteDecimals
 		}
