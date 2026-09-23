@@ -79,7 +79,10 @@ until it expires, while scheduled sells continue independently.
 With `replacePending: true`, a V4 pending buy may be fee-bumped at most once
 after `pendingBuyTimeoutSecond`; stale or failed pending rows are then removed
 without another automatic attempt. Other pending actions are cleaned after a
-short timeout and do not block independent strategy events.
+short timeout and do not block independent strategy events. A failed or timed
+out automatic sell is removed and recorded against the current position
+snapshot; the same unresolved sell condition is not broadcast again until a
+confirmed fill, a new position cycle, or a position reset changes that state.
 
 `maxLossBuyTimes` counts the current holding cycle's buys, including the first
 buy. A value of `0` disables the lower-than-first-price add-on path. The guard

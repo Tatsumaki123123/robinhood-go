@@ -1375,6 +1375,31 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 	if action == "" || amount <= 0 {
 		return nil
 	}
+	if action == "sell" {
+		if p.PendingSell && strings.EqualFold(strings.TrimSpace(p.PendingSellReason), strings.TrimSpace(reason)) {
+			e.devInfo("相同持仓的同类卖出仍在 pending，跳过重复广播",
+				zap.Int64("userID", ev.UserID),
+				zap.String("reason", reason),
+				zap.String("pendingSellHash", p.PendingSellHash),
+				zap.String("token", ev.TokenAddress),
+				zap.String("curve", ev.CurveAddress),
+			)
+			return nil
+		}
+		blocked, blockErr := e.sellFailureBlocked(ctx, ev, p, cfg, reason)
+		if blockErr != nil {
+			return blockErr
+		}
+		if blocked {
+			e.devInfo("相同持仓的卖出失败已封存，不再重试",
+				zap.Int64("userID", ev.UserID),
+				zap.String("reason", reason),
+				zap.String("token", ev.TokenAddress),
+				zap.String("curve", ev.CurveAddress),
+			)
+			return nil
+		}
+	}
 	if action != "" && amount > 0 {
 		e.devInfo("策略决定执行交易",
 			zap.Int64("userID", ev.UserID),
@@ -1475,7 +1500,7 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 					zap.String("token", ev.TokenAddress),
 				)
 				if action == "sell" {
-					e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, execErr)
+					e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, execErr, cfg)
 				} else if action == "buy" {
 					e.clearUnbroadcastPendingBuy(ctx, ev)
 				}
@@ -1492,7 +1517,7 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 					zap.String("token", ev.TokenAddress),
 				)
 				if action == "sell" {
-					e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, execErr)
+					e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, execErr, cfg)
 				} else if action == "buy" {
 					e.clearUnbroadcastPendingBuy(ctx, ev)
 				}
@@ -1519,12 +1544,12 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 		if hash := firstString(result, "transactionHash", "hash"); hash != "" {
 			if err := e.savePendingAction(ctx, hash, ev, action, amount, reason); err != nil {
 				if action == "sell" {
-					e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, err)
+					e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, err, cfg)
 				}
 				return err
 			}
 		} else if action == "sell" {
-			e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, fmt.Errorf("empty transaction hash"))
+			e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason, fmt.Errorf("empty transaction hash"), cfg)
 		} else if action == "buy" {
 			e.clearUnbroadcastPendingBuy(ctx, ev)
 		}
@@ -1541,6 +1566,61 @@ func (e *Engine) markStrategyEvent(ctx context.Context, ev Event) (bool, error) 
 		return false, nil
 	}
 	return inserted, err
+}
+
+// sellFailureTriggerKey identifies the strategy condition that failed. The
+// position snapshot is stored alongside it, so a changed position or changed
+// full-sell threshold can evaluate normally again without retrying the same
+// unresolved transaction forever.
+func sellFailureTriggerKey(reason string, cfg Config) string {
+	switch reason {
+	case "sell_count_force_full":
+		return fmt.Sprintf("%s:%d:%t", reason, cfg.SellPolicy.FullSellAfterSellCount, cfg.SellPolicy.ResetSellCountOnBuy)
+	case "profit_sell":
+		return fmt.Sprintf("%s:%t:%v", reason, cfg.ProfitSell.Enabled, cfg.ProfitSell.Levels)
+	case "loss_protection":
+		return fmt.Sprintf("%s:%t:%t:%g", reason, cfg.LossSell.Enabled, cfg.LossSell.SellAll, cfg.LossSell.TriggerRatio)
+	case "external_buy_signal":
+		return fmt.Sprintf("%s:%t:%g:%g:%t:%g:%g:%g:%d", reason, cfg.ExternalBuySell.Enabled, cfg.ExternalBuySell.MinBuyUSD, cfg.ExternalBuySell.BuyImpactRatio, cfg.ExternalBuySell.NeedProfit, cfg.ExternalBuySell.ProfitRatio, cfg.ExternalBuySell.SellRatio, cfg.ExternalBuySell.BuyAmountRatio, cfg.ExternalBuySell.CooldownSecond)
+	default:
+		return reason
+	}
+}
+
+func (e *Engine) sellFailureBlocked(ctx context.Context, ev Event, p position, cfg Config, reason string) (bool, error) {
+	if e.Store == nil || reason == "" || p.Amount <= 0 {
+		return false, nil
+	}
+	amountRaw := integerText(p.AmountRaw)
+	if amountRaw == "0" {
+		amountRaw = integerRaw(p.Amount)
+	}
+	var failedAmount, triggerKey string
+	var buyCount, sellCount int
+	err := e.Store.DB.QueryRow(ctx, `SELECT token_amount_raw,buy_count,sell_count,trigger_key FROM strategy_sell_failures WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND reason=$4`, ev.UserID, ev.TokenAddress, ev.CurveAddress, reason).Scan(&failedAmount, &buyCount, &sellCount, &triggerKey)
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return integerText(failedAmount) == amountRaw && buyCount == p.BuyCount && sellCount == p.SellCount && triggerKey == sellFailureTriggerKey(reason, cfg), nil
+}
+
+func (e *Engine) recordSellFailure(ctx context.Context, userID int64, token, curve, reason string, cfg Config) {
+	if e.Store == nil || reason == "" {
+		return
+	}
+	var amountRaw string
+	var buyCount, sellCount int
+	if err := e.Store.DB.QueryRow(ctx, `SELECT token_amount_raw::text,buy_count,sell_count FROM strategy_positions WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, userID, token, curve).Scan(&amountRaw, &buyCount, &sellCount); err != nil {
+		return
+	}
+	amountRaw = integerText(amountRaw)
+	if amountRaw == "0" {
+		return
+	}
+	_, _ = e.Store.DB.Exec(ctx, `INSERT INTO strategy_sell_failures(user_id,token_address,curve_address,reason,token_amount_raw,buy_count,sell_count,trigger_key,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,now(),now()) ON CONFLICT(user_id,token_address,curve_address,reason) DO UPDATE SET token_amount_raw=EXCLUDED.token_amount_raw,buy_count=EXCLUDED.buy_count,sell_count=EXCLUDED.sell_count,trigger_key=EXCLUDED.trigger_key,updated_at=now()`, userID, token, curve, reason, amountRaw, buyCount, sellCount, sellFailureTriggerKey(reason, cfg))
 }
 
 func integerRaw(v float64) string {
@@ -2152,6 +2232,12 @@ func (e *Engine) applyOwnFill(ctx context.Context, ev Event, cfg Config) error {
 			}
 		}
 	}
+	// A confirmed own fill is a meaningful position change. It releases any
+	// failure marker left by an earlier automatic sell attempt so the next
+	// strategy cycle can be evaluated normally.
+	if _, err = tx.Exec(ctx, `DELETE FROM strategy_sell_failures WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, ev.UserID, ev.TokenAddress, ev.CurveAddress); err != nil {
+		return err
+	}
 	if err = e.savePositionTx(ctx, tx, ev, current); err != nil {
 		return err
 	}
@@ -2357,6 +2443,7 @@ func (e *Engine) applyOwnFillLegacy(ctx context.Context, ev Event, p position, c
 	if err := e.savePosition(ctx, ev, p); err != nil {
 		return err
 	}
+	_, _ = e.Store.DB.Exec(ctx, `DELETE FROM strategy_sell_failures WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, ev.UserID, ev.TokenAddress, ev.CurveAddress)
 	if strings.EqualFold(ev.Side, "buy") {
 		e.queueSellApproval(ev)
 	}
@@ -2856,7 +2943,7 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 			result, ee = e.ExecuteAction(ctx, ev, "sell", amount)
 			if ee != nil {
 				e.devInfo("定时卖出执行失败", zap.Error(ee), zap.String("action", "sell"), zap.String("reason", "scheduled_sell"), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
-				e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, "scheduled_sell", ee)
+				e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, "scheduled_sell", ee, c)
 				continue
 			}
 		} else if e.Trading != nil {
@@ -2864,19 +2951,19 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 			result, ee = e.executeLive(ctx, ev, "sell", amount, c)
 			if ee != nil {
 				e.devInfo("定时卖出执行失败", zap.Error(ee), zap.String("action", "sell"), zap.String("reason", "scheduled_sell"), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
-				e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, "scheduled_sell", ee)
+				e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, "scheduled_sell", ee, c)
 				continue
 			}
 		}
 		hash := firstString(result, "transactionHash", "hash")
 		if hash == "" {
 			e.devInfo("定时卖出未返回交易哈希", zap.String("action", "sell"), zap.String("reason", "scheduled_sell"), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
-			e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, "scheduled_sell", fmt.Errorf("empty transaction hash"))
+			e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, "scheduled_sell", fmt.Errorf("empty transaction hash"), c)
 		} else {
 			e.devInfo("定时卖出已广播", zap.String("action", "sell"), zap.String("reason", "scheduled_sell"), zap.String("transactionHash", hash), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
 			if err := e.savePendingAction(ctx, hash, ev, "sell", amount, "scheduled_sell"); err != nil {
 				e.devInfo("定时卖出持久化失败", zap.Error(err), zap.String("token", ev.TokenAddress), zap.String("curve", ev.CurveAddress))
-				e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, "scheduled_sell", err)
+				e.reconcileFailedSell(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, "scheduled_sell", err, c)
 				continue
 			}
 		}
@@ -2887,10 +2974,23 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 // reconcileFailedSell checks the wallet after a sell failure. A zero token
 // balance means the tracked position is stale (for example, tokens were
 // transferred or sold outside this process), so clear all sell scheduling and
-// pending sell state. RPC failures and positive balances leave the position
-// intact for a later retry.
-func (e *Engine) reconcileFailedSell(ctx context.Context, userID int64, token, curve, reason string, sellErr error) {
-	if e.RPC == nil || e.Store == nil {
+// pending sell state. A positive balance keeps the position but records a
+// failure snapshot so the same automatic sell is not retried indefinitely.
+func (e *Engine) reconcileFailedSell(ctx context.Context, userID int64, token, curve, reason string, sellErr error, configs ...Config) {
+	if e.Store == nil {
+		return
+	}
+	cfg := Config{}
+	if len(configs) > 0 {
+		cfg = configs[0]
+	} else if u, userErr := e.cachedUser(ctx, userID); userErr == nil {
+		cfg = Parse(u.Config)
+	}
+	// Record the failure before any wallet reconciliation. A failed or timed
+	// out automatic sell must not be submitted again just because the balance
+	// query is temporarily unavailable.
+	e.recordSellFailure(ctx, userID, token, curve, reason, cfg)
+	if e.RPC == nil {
 		return
 	}
 	u, err := e.cachedUser(ctx, userID)
@@ -2911,7 +3011,7 @@ func (e *Engine) reconcileFailedSell(ctx context.Context, userID int64, token, c
 		if reason == "scheduled_sell" {
 			_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_positions SET next_scheduled_sell_at=NULL,updated_at=now() WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, userID, token, curve)
 		}
-		e.devInfo("卖出失败后仍有 token 余额，保留持仓", zap.Error(sellErr), zap.String("reason", reason), zap.String("token", token), zap.String("curve", curve), zap.String("balanceRaw", balance.String()))
+		e.devInfo("卖出失败后仍有 token 余额，保留持仓且封存同一卖出条件", zap.Error(sellErr), zap.String("reason", reason), zap.String("token", token), zap.String("curve", curve), zap.String("balanceRaw", balance.String()))
 		return
 	}
 	_, err = e.Store.DB.Exec(ctx, `
@@ -2926,6 +3026,7 @@ func (e *Engine) reconcileFailedSell(ctx context.Context, userID int64, token, c
 		e.devInfo("卖出失败后重置持仓失败", zap.Error(err), zap.String("reason", reason), zap.String("token", token), zap.String("curve", curve))
 		return
 	}
+	_, _ = e.Store.DB.Exec(ctx, `DELETE FROM strategy_sell_failures WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, userID, token, curve)
 	_, _ = e.Store.DB.Exec(ctx, `UPDATE strategy_pending_actions SET status='reverted',updated_at=now() WHERE user_id=$1 AND token_address=$2 AND curve_address=$3 AND side='sell' AND status IN ('pending','confirmed_pending_accounting')`, userID, token, curve)
 	e.devInfo("卖出失败后余额为零，已重置持仓", zap.Error(sellErr), zap.String("reason", reason), zap.String("token", token), zap.String("curve", curve))
 }
