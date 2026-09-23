@@ -1377,13 +1377,6 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 	}
 	if action == "sell" {
 		if p.PendingSell && strings.EqualFold(strings.TrimSpace(p.PendingSellReason), strings.TrimSpace(reason)) {
-			e.devInfo("相同持仓的同类卖出仍在 pending，跳过重复广播",
-				zap.Int64("userID", ev.UserID),
-				zap.String("reason", reason),
-				zap.String("pendingSellHash", p.PendingSellHash),
-				zap.String("token", ev.TokenAddress),
-				zap.String("curve", ev.CurveAddress),
-			)
 			return nil
 		}
 		blocked, blockErr := e.sellFailureBlocked(ctx, ev, p, cfg, reason)
@@ -1391,12 +1384,10 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 			return blockErr
 		}
 		if blocked {
-			e.devInfo("相同持仓的卖出失败已封存，不再重试",
-				zap.Int64("userID", ev.UserID),
-				zap.String("reason", reason),
-				zap.String("token", ev.TokenAddress),
-				zap.String("curve", ev.CurveAddress),
-			)
+			// A sealed failure is still reconciled against the live wallet. If
+			// the tracked or on-chain amount is now below the sell threshold,
+			// prepareSellBalance clears the stale position and ends this path.
+			_, _, _ = e.prepareSellBalance(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress, p.AmountRaw, reason, ev.TokenDecimals)
 			return nil
 		}
 	}
