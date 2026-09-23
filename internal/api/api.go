@@ -446,11 +446,13 @@ type apiTokenRuleView struct {
 }
 
 type apiListConfigView struct {
-	MaxMCP    float64 `json:"maxMcp"`
-	MinMCP    float64 `json:"minMcp"`
-	Source    string  `json:"source"`
-	Category  string  `json:"category"`
-	CreateDay int     `json:"createDay"`
+	MaxMCP      float64 `json:"maxMcp"`
+	MinMCP      float64 `json:"minMcp"`
+	Source      string  `json:"source"`
+	Category    string  `json:"category"`
+	CreateDay   int     `json:"createDay"`
+	From        string  `json:"from"`
+	UserAddress string  `json:"userAddress"`
 }
 
 // apiConfigView is deliberately a struct: encoding a map cannot guarantee
@@ -501,7 +503,7 @@ func (a *API) userView(u store.User, withBalance bool) map[string]any {
 		ProfitSell:      apiProfitSellView{Enabled: cfg.ProfitSell.Enabled, ResetOnBuy: cfg.ProfitSell.ResetOnBuy, Levels: levels},
 		LossSell:        apiLossSellView{Enabled: cfg.LossSell.Enabled, TriggerRatio: cfg.LossSell.TriggerRatio, SellAll: cfg.LossSell.SellAll},
 		TokenConfig:     rules,
-		ListConfig:      apiListConfigView{MaxMCP: cfg.ListConfig.MaxMCP, MinMCP: cfg.ListConfig.MinMCP, Source: cfg.ListConfig.Source, Category: cfg.ListConfig.Category, CreateDay: cfg.ListConfig.CreateDay},
+		ListConfig:      apiListConfigView{MaxMCP: cfg.ListConfig.MaxMCP, MinMCP: cfg.ListConfig.MinMCP, Source: cfg.ListConfig.Source, Category: cfg.ListConfig.Category, CreateDay: cfg.ListConfig.CreateDay, From: cfg.ListConfig.From, UserAddress: cfg.ListConfig.UserAddress},
 	}
 	out := map[string]any{"userId": u.UserID, "walletAddress": strings.ToLower(u.WalletAddress), "config": public, "enabled": u.Enabled, "createdAt": u.CreatedAt, "updatedAt": u.UpdatedAt}
 	if withBalance && a.RPC != nil {
@@ -967,6 +969,20 @@ func (a *API) aveList(c *fiber.Ctx) error {
 			if !strings.EqualFold(cfg.ListConfig.Source, "ave") {
 				return a.ok(c, []any{})
 			}
+			if strings.EqualFold(strings.TrimSpace(cfg.ListConfig.From), "user") {
+				userAddress := strings.TrimSpace(cfg.ListConfig.UserAddress)
+				if userAddress == "" {
+					return httpx.Error(c, 400, "listConfig.userAddress is required when listConfig.from is user")
+				}
+				out, err := a.aveJSON(c.Context(), "/v2api/walletinfo/v1/tokens", map[string]string{
+					"user_address": strings.ToLower(userAddress), "chain": "robinhood", "pageNO": "1", "pageSize": "500",
+					"sort_dir": "desc", "sort": "last_txn_time", "is_self": "0",
+				})
+				if err != nil {
+					return a.fail(c, err)
+				}
+				return a.ok(c, aveWalletListViews(out))
+			}
 			if category == "" {
 				category = cfg.ListConfig.Category
 			}
@@ -1025,6 +1041,46 @@ func (a *API) aveList(c *fiber.Ctx) error {
 		}
 	}
 	return a.ok(c, views)
+}
+
+func aveWalletListViews(payload map[string]any) []map[string]any {
+	items := make([]any, 0)
+	if data, ok := payload["data"].([]any); ok {
+		items = data
+	} else if nested, ok := payload["data"].(map[string]any); ok {
+		if data, ok := nested["data"].([]any); ok {
+			items = data
+		}
+	}
+	views := make([]map[string]any, 0, len(items))
+	for _, raw := range items {
+		if item, ok := raw.(map[string]any); ok {
+			views = append(views, aveWalletListView(item))
+		}
+	}
+	return views
+}
+
+func aveWalletListView(item map[string]any) map[string]any {
+	token := item["token"]
+	symbol := str(item["symbol"])
+	name := symbol
+	if name == "" {
+		name = str(item["token_name"])
+	}
+	return map[string]any{
+		"pair": nil, "amm": nil,
+		"token0Address": nil, "token0Symbol": nil,
+		"token1Address": nil, "token1Symbol": nil,
+		"token0PriceUsd": nil, "token1PriceUsd": nil,
+		"tokenAddress": token, "tokenName": nullableString(name), "tokenSymbol": nullableString(symbol), "tokenLogoUrl": nullableString(str(item["logo_url"])),
+		"quoteTokenSymbol": nullableString(str(item["main_token_symbol"])), "quoteTokenLogoUrl": nil,
+		"createdAt": nil, "lastTradeAt": item["last_txn_time"], "marketCap": item["market_cap"],
+		"holdersCount": nil, "buyCount5m": nil, "sellCount5m": nil,
+		"priceChange5m": nil, "priceChange1h": nil,
+		"buyTax": nil, "sellTax": nil,
+		"action": "START",
+	}
 }
 
 func aveListView(item map[string]any) map[string]any {

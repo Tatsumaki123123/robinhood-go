@@ -124,10 +124,15 @@ nonce、费用上限和替换次数写入 `strategy_pending_buys`，只有 own f
     "category": "pons_out_hot",
     "minMcp": 100000,
     "maxMcp": 1000000000,
-    "createDay": 1
+    "createDay": 1,
+    "from": "list",
+    "userAddress": ""
   }
 }
 ```
+
+`listConfig.from` 默认为 `list`（省略或为空时沿用 AVE 列表接口）。设置为 `user` 时，
+`/monitorToken/getAveList` 改为调用 AVE 钱包代币接口，并使用 `listConfig.userAddress` 作为钱包地址。
 
 外部卖出事件（事件 `side=sell`）用于评估抄底买入；外部买入事件（事件
 `side=buy`）用于评估提前卖出。`maxLossBuyTimes` 和 `minLossBuyRatio` 只在当前价低于

@@ -58,10 +58,16 @@ validated as non-negative numbers; `tokenConfig` is selected by ascending
     "category": "pons_out_hot",
     "minMcp": 100000,
     "maxMcp": 1000000000,
-    "createDay": 1
+    "createDay": 1,
+    "from": "list",
+    "userAddress": ""
   }
 }
 ```
+
+`listConfig.from` defaults to `list` (or empty), which keeps the existing AVE list request.
+Set it to `user` to make `/monitorToken/getAveList` use the AVE wallet token endpoint with
+`listConfig.userAddress`.
 
 The engine persists `strategy_positions`, `strategy_pending_buys` and
 `strategy_events`. A successful own-wallet fill must be emitted with `own:true`

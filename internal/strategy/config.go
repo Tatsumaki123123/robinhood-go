@@ -75,11 +75,13 @@ type Config struct {
 }
 
 type ListConfig struct {
-	Source    string  `json:"source"`
-	Category  string  `json:"category"`
-	MinMCP    float64 `json:"minMcp"`
-	MaxMCP    float64 `json:"maxMcp"`
-	CreateDay int     `json:"createDay"`
+	Source      string  `json:"source"`
+	Category    string  `json:"category"`
+	MinMCP      float64 `json:"minMcp"`
+	MaxMCP      float64 `json:"maxMcp"`
+	CreateDay   int     `json:"createDay"`
+	From        string  `json:"from"`
+	UserAddress string  `json:"userAddress"`
 }
 
 func Parse(v map[string]any) Config {
@@ -102,7 +104,7 @@ func Parse(v map[string]any) Config {
 		// the nested object is omitted.  The top-level default strategy is
 		// enabled, while callers that want the optional sell paths must provide
 		// their nested object (or use the full default config from the API).
-		ListConfig: ListConfig{Source: "ave", Category: "pons_out_hot", MinMCP: 20000, MaxMCP: 200000, CreateDay: 1},
+		ListConfig: ListConfig{Source: "ave", Category: "pons_out_hot", MinMCP: 20000, MaxMCP: 200000, CreateDay: 1, From: "list"},
 	}
 	b, _ := json.Marshal(v)
 	_ = json.Unmarshal(b, &c)
@@ -231,8 +233,11 @@ func Parse(v map[string]any) Config {
 		if _, exists := x["createDay"]; !exists {
 			c.ListConfig.CreateDay = 1
 		}
+		if _, exists := x["from"]; !exists {
+			c.ListConfig.From = "list"
+		}
 	} else if _, exists := v["listConfig"]; !exists {
-		c.ListConfig = ListConfig{Source: "ave", Category: "pons_out_hot", MinMCP: 20000, MaxMCP: 200000, CreateDay: 1}
+		c.ListConfig = ListConfig{Source: "ave", Category: "pons_out_hot", MinMCP: 20000, MaxMCP: 200000, CreateDay: 1, From: "list"}
 	}
 	if c.MinMCP < 0 {
 		c.MinMCP = 100000
