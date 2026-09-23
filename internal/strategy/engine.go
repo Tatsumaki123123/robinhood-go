@@ -71,7 +71,11 @@ type position struct {
 	BuyCount, SellCount, ProfitLevel                      int
 	PendingSell                                           bool
 	PendingSellHash, PendingSellReason, PendingSellStatus string
-	FirstBought, NextScheduled, CooldownUntil, LastBuy    *time.Time
+	// RecentBuyIntent records a strategy buy that was accepted/broadcast but
+	// may not have been confirmed by the chain yet. It prevents an immediate
+	// opposite sell decision caused by the next large external buy event.
+	RecentBuyIntent                                    *time.Time
+	FirstBought, NextScheduled, CooldownUntil, LastBuy *time.Time
 }
 
 type monitorTarget struct {
@@ -126,6 +130,7 @@ type Engine struct {
 const pendingSellTimeout = 5 * time.Second
 const maxPendingBuyReplacements = 1
 const pendingBuyExecutionTimeout = 90 * time.Second
+const buySellTriggerCooldown = time.Second
 
 func New(s *store.Store, r *chain.RPC) *Engine {
 	return &Engine{Store: s, RPC: r, monitorUsers: make(map[int64]store.User), monitorTokens: make(map[int64][]store.Token), monitorRoutes: make(map[int64][]map[string]any), monitorByPool: make(map[string][]monitorTarget), monitorByCurve: make(map[string][]monitorTarget)}
@@ -1875,11 +1880,15 @@ func (e *Engine) loadPosition(ctx context.Context, ev Event) (position, error) {
 	var amountRaw string
 	var first, next, cool, last *time.Time
 	err := e.Store.DB.QueryRow(ctx, `SELECT token_amount_raw::text,quote_spent_raw,cost_usd_raw,average_cost_usd::double precision,first_buy_price::double precision,last_buy_price::double precision,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at,
+		NULLIF(GREATEST(
+			COALESCE((SELECT MAX(a.updated_at) FROM strategy_pending_actions a WHERE a.user_id=strategy_positions.user_id AND a.token_address=strategy_positions.token_address AND a.curve_address=strategy_positions.curve_address AND a.side='buy' AND a.status IN ('pending','confirmed_pending_accounting','confirmed')), to_timestamp(0)),
+			COALESCE((SELECT MAX(b.updated_at) FROM strategy_pending_buys b WHERE b.user_id=strategy_positions.user_id AND b.token_address=strategy_positions.token_address AND b.curve_address=strategy_positions.curve_address AND b.status IN ('pending','confirmed_pending_accounting','confirmed')), to_timestamp(0))
+		), to_timestamp(0)),
 		EXISTS(SELECT 1 FROM strategy_pending_actions a WHERE a.user_id=strategy_positions.user_id AND a.token_address=strategy_positions.token_address AND a.curve_address=strategy_positions.curve_address AND a.side='sell' AND a.status IN ('pending','confirmed_pending_accounting')),
 		COALESCE((SELECT a.transaction_hash FROM strategy_pending_actions a WHERE a.user_id=strategy_positions.user_id AND a.token_address=strategy_positions.token_address AND a.curve_address=strategy_positions.curve_address AND a.side='sell' AND a.status IN ('pending','confirmed_pending_accounting') ORDER BY a.updated_at DESC LIMIT 1),''),
 		COALESCE((SELECT a.reason FROM strategy_pending_actions a WHERE a.user_id=strategy_positions.user_id AND a.token_address=strategy_positions.token_address AND a.curve_address=strategy_positions.curve_address AND a.side='sell' AND a.status IN ('pending','confirmed_pending_accounting') ORDER BY a.updated_at DESC LIMIT 1),''),
 		COALESCE((SELECT a.status FROM strategy_pending_actions a WHERE a.user_id=strategy_positions.user_id AND a.token_address=strategy_positions.token_address AND a.curve_address=strategy_positions.curve_address AND a.side='sell' AND a.status IN ('pending','confirmed_pending_accounting') ORDER BY a.updated_at DESC LIMIT 1),'')
-		FROM strategy_positions WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&amountRaw, &p.QuoteSpentRaw, &p.CostUSDScaledRaw, &p.AverageCost, &p.FirstPrice, &p.LastPrice, &p.BuyCount, &p.SellCount, &p.ProfitLevel, &first, &next, &cool, &last, &p.PendingSell, &p.PendingSellHash, &p.PendingSellReason, &p.PendingSellStatus)
+		FROM strategy_positions WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, ev.UserID, ev.TokenAddress, ev.CurveAddress).Scan(&amountRaw, &p.QuoteSpentRaw, &p.CostUSDScaledRaw, &p.AverageCost, &p.FirstPrice, &p.LastPrice, &p.BuyCount, &p.SellCount, &p.ProfitLevel, &first, &next, &cool, &last, &p.RecentBuyIntent, &p.PendingSell, &p.PendingSellHash, &p.PendingSellReason, &p.PendingSellStatus)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "no rows") {
 			return position{}, nil
@@ -2396,6 +2405,9 @@ func evaluate(c Config, r TokenRule, ev Event, p position) (string, float64, str
 	if strings.ToLower(ev.Side) != "buy" || p.Amount <= 0 {
 		return "", 0, ""
 	}
+	if p.RecentBuyIntent != nil && time.Since(*p.RecentBuyIntent) < buySellTriggerCooldown {
+		return "", 0, ""
+	}
 	// SellCount records confirmed sells. The sell that reaches the configured
 	// count is the full exit.
 	force := c.SellPolicy.FullSellAfterSellCount > 0 && p.SellCount+1 >= c.SellPolicy.FullSellAfterSellCount
@@ -2726,7 +2738,12 @@ func hexNumber(s string) *big.Int {
 	return n
 }
 func (e *Engine) checkScheduled(ctx context.Context) {
-	rows, err := e.Store.DB.Query(ctx, `SELECT user_id,token_address,curve_address,token_amount_raw::text,quote_spent_raw,cost_usd_raw,average_cost_usd::double precision,first_buy_price::double precision,last_buy_price::double precision,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at FROM strategy_positions WHERE next_scheduled_sell_at IS NOT NULL AND next_scheduled_sell_at<=now() AND token_amount_raw>0`)
+	rows, err := e.Store.DB.Query(ctx, `SELECT user_id,token_address,curve_address,token_amount_raw::text,quote_spent_raw,cost_usd_raw,average_cost_usd::double precision,first_buy_price::double precision,last_buy_price::double precision,buy_count,sell_count,profit_sell_level,first_bought_at,next_scheduled_sell_at,external_cooldown_until,last_buy_at,
+		NULLIF(GREATEST(
+			COALESCE((SELECT MAX(a.updated_at) FROM strategy_pending_actions a WHERE a.user_id=strategy_positions.user_id AND a.token_address=strategy_positions.token_address AND a.curve_address=strategy_positions.curve_address AND a.side='buy' AND a.status IN ('pending','confirmed_pending_accounting','confirmed')), to_timestamp(0)),
+			COALESCE((SELECT MAX(b.updated_at) FROM strategy_pending_buys b WHERE b.user_id=strategy_positions.user_id AND b.token_address=strategy_positions.token_address AND b.curve_address=strategy_positions.curve_address AND b.status IN ('pending','confirmed_pending_accounting','confirmed')), to_timestamp(0))
+		), to_timestamp(0))
+		FROM strategy_positions WHERE next_scheduled_sell_at IS NOT NULL AND next_scheduled_sell_at<=now() AND token_amount_raw>0`)
 	if err != nil {
 		return
 	}
@@ -2734,11 +2751,14 @@ func (e *Engine) checkScheduled(ctx context.Context) {
 	for rows.Next() {
 		var ev Event
 		var p position
-		if rows.Scan(&ev.UserID, &ev.TokenAddress, &ev.CurveAddress, &p.AmountRaw, &p.QuoteSpentRaw, &p.CostUSDScaledRaw, &p.AverageCost, &p.FirstPrice, &p.LastPrice, &p.BuyCount, &p.SellCount, &p.ProfitLevel, &p.FirstBought, &p.NextScheduled, &p.CooldownUntil, &p.LastBuy) != nil {
+		if rows.Scan(&ev.UserID, &ev.TokenAddress, &ev.CurveAddress, &p.AmountRaw, &p.QuoteSpentRaw, &p.CostUSDScaledRaw, &p.AverageCost, &p.FirstPrice, &p.LastPrice, &p.BuyCount, &p.SellCount, &p.ProfitLevel, &p.FirstBought, &p.NextScheduled, &p.CooldownUntil, &p.LastBuy, &p.RecentBuyIntent) != nil {
 			continue
 		}
 		p.AmountRaw = integerText(p.AmountRaw)
 		p.Amount = rawFloat(p.AmountRaw)
+		if p.RecentBuyIntent != nil && time.Since(*p.RecentBuyIntent) < buySellTriggerCooldown {
+			continue
+		}
 		u, err := e.cachedUser(ctx, ev.UserID)
 		if err != nil {
 			continue
