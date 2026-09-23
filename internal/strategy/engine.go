@@ -1150,73 +1150,22 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 	if enabled, err := e.cachedTokenEnabled(ctx, ev.UserID, ev.TokenAddress, ev.CurveAddress); err != nil || !enabled {
 		return err
 	}
-	e.devInfo("监听到匹配 token 的交易",
-		zap.Int64("userID", ev.UserID),
-		zap.String("eventKey", ev.Key),
-		zap.String("side", strings.ToLower(ev.Side)),
-		zap.String("token", ev.TokenAddress),
-		zap.String("curve", ev.CurveAddress),
-		zap.String("pool", ev.PoolID),
-		zap.Float64("quoteUSD", ev.QuoteUSD),
-		zap.Float64("price", ev.Price),
-	)
 	// minMcp is a buy eligibility threshold. A market buy event can still
 	// evaluate an exit for an existing position below this floor.
 	if strings.EqualFold(ev.Side, "sell") && cfg.MinMCP > 0 && ev.MarketCap <= 0 {
-		e.devInfo("策略跳过交易",
-			zap.Int64("userID", ev.UserID),
-			zap.String("reason", "market_cap_missing"),
-			zap.Float64("minMCP", cfg.MinMCP),
-			zap.Float64("marketCap", ev.MarketCap),
-			zap.String("token", ev.TokenAddress),
-		)
 		return nil
 	}
 	if strings.EqualFold(ev.Side, "sell") && ev.MarketCap > 0 && ev.MarketCap < cfg.MinMCP {
-		e.devInfo("策略跳过交易",
-			zap.Int64("userID", ev.UserID),
-			zap.String("reason", "market_cap_below_minimum"),
-			zap.Float64("minMCP", cfg.MinMCP),
-			zap.Float64("marketCap", ev.MarketCap),
-			zap.String("token", ev.TokenAddress),
-		)
 		return nil
 	}
-	rule, ruleIndex, ok := cfg.RuleWithIndex(ev.MarketCap)
+	rule, _, ok := cfg.RuleWithIndex(ev.MarketCap)
 	if !ok {
-		e.devInfo("策略跳过交易",
-			zap.Int64("userID", ev.UserID),
-			zap.String("reason", "no_token_config_rule"),
-			zap.Float64("marketCap", ev.MarketCap),
-			zap.String("token", ev.TokenAddress),
-		)
 		return nil
 	}
-	e.devInfo("交易匹配策略配置",
-		zap.Int64("userID", ev.UserID),
-		zap.String("configName", cfg.Name),
-		zap.Int("ruleIndex", ruleIndex),
-		zap.Float64("ruleMaxMCP", rule.MaxMCP),
-		zap.Float64("marketCap", ev.MarketCap),
-		zap.String("token", ev.TokenAddress),
-		zap.String("curve", ev.CurveAddress),
-	)
 	p, err := e.loadPosition(ctx, ev)
 	if err != nil {
 		return err
 	}
-	e.devInfo("策略评估输入",
-		zap.Int64("userID", ev.UserID),
-		zap.String("side", strings.ToLower(ev.Side)),
-		zap.Float64("priceImpactRatio", ev.PriceImpactRatio),
-		zap.Float64("impact", ev.Impact),
-		zap.Float64("priceChangeRatio", ev.PriceChangeRatio),
-		zap.Float64("minSellRatio", rule.MinSellRatio),
-		zap.Float64("positionAmount", p.Amount),
-		zap.String("positionAmountRaw", p.AmountRaw),
-		zap.Int("buyCount", p.BuyCount),
-		zap.String("token", ev.TokenAddress),
-	)
 	// A position may receive several market events while a previous sell is
 	// still waiting for its receipt. loadPosition includes the durable pending
 	// flag in the same round trip, so a later event cannot broadcast a second
@@ -1236,13 +1185,6 @@ func (e *Engine) Process(ctx context.Context, ev Event) error {
 	}
 	action, amount, reason := evaluate(cfg, rule, ev, p)
 	if action == "" || amount <= 0 {
-		e.devInfo("策略未触发交易",
-			zap.Int64("userID", ev.UserID),
-			zap.String("reason", "conditions_not_met"),
-			zap.String("side", strings.ToLower(ev.Side)),
-			zap.Float64("amount", amount),
-			zap.String("token", ev.TokenAddress),
-		)
 		return nil
 	}
 	if action != "" && amount > 0 {
