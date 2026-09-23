@@ -299,6 +299,12 @@ func (a *API) syncAveWalletToken(ctx context.Context, token store.Token, item ma
 	if !ok {
 		return nil
 	}
+	balanceInt, balanceOK := new(big.Int).SetString(balanceRaw, 10)
+	if !balanceOK || balanceInt.Sign() < 0 {
+		return nil
+	}
+	minimumBalanceRaw := new(big.Int).Mul(big.NewInt(100), new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil))
+	belowMinimum := balanceInt.Cmp(minimumBalanceRaw) < 0
 	averageUSD := strings.TrimSpace(str(firstAny(item, "average_net_purchase_price", "averageNetPurchasePrice")))
 	averageCostRaw, averageOK := aveDecimalToRaw(averageUSD, 8)
 	if averageCostRaw == "0" {
@@ -319,7 +325,7 @@ func (a *API) syncAveWalletToken(ctx context.Context, token store.Token, item ma
 	} else if readErr != nil {
 		return readErr
 	}
-	if balanceRaw == "0" {
+	if balanceRaw == "0" || belowMinimum {
 		if _, err = tx.Exec(ctx, `UPDATE strategy_positions SET token_amount_raw='0',quote_spent_raw='0',cost_usd_raw='0',average_cost_usd=0,first_buy_price=0,last_buy_price=0,buy_count=0,sell_count=0,profit_sell_level=0,first_bought_at=NULL,next_scheduled_sell_at=NULL,external_cooldown_until=NULL,last_buy_at=NULL,updated_at=now() WHERE user_id=$1 AND token_address=$2 AND curve_address=$3`, token.UserID, token.TokenAddress, token.CurveAddress); err != nil {
 			return err
 		}

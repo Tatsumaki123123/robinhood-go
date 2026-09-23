@@ -1734,11 +1734,10 @@ func (e *Engine) actualTokenBalance(ctx context.Context, userID int64, token str
 }
 
 // prepareSellBalance refuses a sell when either the tracked position or the
-// wallet balance is below 100 whole tokens, or when the wallet has less than
-// the tracked amount. In that case the database position is stale/dust and is
-// cleared instead of broadcasting a transaction that cannot succeed. A full
-// sell receives the live wallet amount; partial sells keep their strategy
-// calculated amount.
+// wallet balance is below 100 whole tokens. In that case the database
+// position is stale/dust and is cleared instead of broadcasting a transaction
+// that cannot succeed. A full sell receives the live wallet amount; partial
+// sells keep their strategy-calculated amount.
 func (e *Engine) prepareSellBalance(ctx context.Context, userID int64, token, curve, databaseAmountRaw, reason string, decimalsHint int) (*big.Int, bool, error) {
 	databaseAmount, ok := new(big.Int).SetString(integerText(databaseAmountRaw), 10)
 	if !ok || databaseAmount.Sign() <= 0 {
@@ -1752,7 +1751,7 @@ func (e *Engine) prepareSellBalance(ctx context.Context, userID int64, token, cu
 	if decimalsErr != nil {
 		return nil, false, decimalsErr
 	}
-	if databaseAmount.Cmp(minBalanceRaw) < 0 || balance.Cmp(minBalanceRaw) < 0 || balance.Cmp(databaseAmount) < 0 {
+	if databaseAmount.Cmp(minBalanceRaw) < 0 || balance.Cmp(minBalanceRaw) < 0 {
 		message := "database or wallet token balance is below 100 tokens"
 		return nil, false, e.clearUntradeablePosition(ctx, userID, token, curve, reason, message)
 	}
