@@ -33,7 +33,7 @@ func main() {
 	if err = st.Migrate(ctx); err != nil {
 		log.Fatal("migration", zap.Error(err))
 	}
-	rpc := chain.NewWithOptions(cfg.RPCURL, cfg.RPCWSURL, chain.Options{IngressBuffer: cfg.WSSIngressBuffer, StrategyBuffer: cfg.WSSStrategyBuffer, ReadLimit: int64(cfg.WSSReadLimitBytes)})
+	rpc := chain.NewWithEndpoints(cfg.RPCURL, cfg.RPCSendURL, cfg.RPCWSURL, chain.Options{IngressBuffer: cfg.WSSIngressBuffer, StrategyBuffer: cfg.WSSStrategyBuffer, ReadLimit: int64(cfg.WSSReadLimitBytes)})
 	rpc.SetStrategyFilter(chain.StrategyEventFilter)
 	rd := redis.NewClient(&redis.Options{Addr: redisAddr(cfg.RedisURL)})
 	fixedGasPrice := chain.ToBig(cfg.FixedGasPriceWei)

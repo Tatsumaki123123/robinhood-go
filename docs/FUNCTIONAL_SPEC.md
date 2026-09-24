@@ -71,7 +71,8 @@ RobinhoodGo 是原 NestJS/Prisma Robinhood 链上交易服务的 Go 后端替代
 Pons V2 的 `quote/buy/sell` 与 Uniswap V4 的 `quote/buy/sell/route/quote/route/swap`
 均已注册。V4 单跳和 1--3 跳 route 会生成 Universal Router `execute` calldata，支持
 wrap/unwrap ETH、custom recipient 和 Permit2/ERC-20 allowance；交易会
-签名、广播并等待 receipt。策略日志不会记录私钥；生产环境应由内部策略调用而不是把
+签名、广播并等待 receipt；策略执行路径只等待广播响应，成交由后续 own fill 事件确认。
+策略日志不会记录私钥；生产环境应由内部策略调用而不是把
 私钥暴露给公网。
 
 ### 文件
@@ -116,5 +117,6 @@ docker compose up -d --build
 Permit2、Pons Factory 和 Pons 外部 Hook 地址均从环境变量读取。性能参数包括
 `STRATEGY_MIN_EVENT_USD`、`WSS_INGRESS_BUFFER`、`WSS_STRATEGY_BUFFER`、
 `WSS_READ_LIMIT_BYTES`、`STRATEGY_WORKERS`、`STRATEGY_QUEUE_BUFFER` 和
-`STRATEGY_SHARD_BACKLOG`；
+`STRATEGY_SHARD_BACKLOG`；`RPC_HTTP_SEND_URL` 可选，用于将 nonce、gas 和交易广播
+与读取型 RPC 分离；留空时回退到 `RPC_HTTP_URL`。
 `.env.example` 给出可直接用于 Compose 的默认值。

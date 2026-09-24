@@ -13,15 +13,30 @@ const (
 )
 
 func decodeChainEvent(log map[string]any) map[string]any {
+	return decodeChainEventMode(log, true)
+}
+
+// decodeChainEventInPlace is used only by the WSS reader, where the decoded
+// result is immediately published and the raw map has no other owner. It
+// avoids copying every log's map on the hottest path; block-poll callers keep
+// the copy-preserving DecodeChainEvent behavior below.
+func decodeChainEventInPlace(log map[string]any) map[string]any {
+	return decodeChainEventMode(log, false)
+}
+
+func decodeChainEventMode(log map[string]any, copyLog bool) map[string]any {
 	topics, ok := log["topics"].([]any)
 	if !ok || len(topics) == 0 {
 		return log
 	}
 	topic := strings.ToLower(toString(topics[0]))
 	data := strings.TrimPrefix(strings.ToLower(toString(log["data"])), "0x")
-	out := map[string]any{}
-	for k, v := range log {
-		out[k] = v
+	out := log
+	if copyLog {
+		out = make(map[string]any, len(log)+8)
+		for k, v := range log {
+			out[k] = v
+		}
 	}
 	if len(data) >= 4*64 && topic == CurveBuyTopic {
 		out["side"] = "buy"
@@ -64,8 +79,9 @@ func decodeChainEvent(log map[string]any) map[string]any {
 	return out
 }
 
-// DecodeChainEvent is used by the bottom-fishing block poller as well as the
-// live WSS subscriber, keeping both transports on exactly the same decoder.
+// DecodeChainEvent is used by the bottom-fishing block poller. The live WSS
+// subscriber calls the in-place variant above, keeping both transports on the
+// same decoder without copying the WSS map.
 func DecodeChainEvent(log map[string]any) map[string]any { return decodeChainEvent(log) }
 
 // StrategyEventFilter accepts only decoded swap events. Raw deployment logs

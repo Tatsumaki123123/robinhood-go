@@ -19,9 +19,9 @@ import (
 )
 
 type RPC struct {
-	HTTP, WS                string
+	HTTP, SendHTTP, WS      string
 	id                      uint64
-	client                  *http.Client
+	client, sendClient      *http.Client
 	readLimit               int64
 	Events                  chan map[string]any
 	ingress                 chan map[string]any
@@ -56,6 +56,13 @@ func New(httpURL, wsURL string) *RPC {
 }
 
 func NewWithOptions(httpURL, wsURL string, options Options) *RPC {
+	return NewWithEndpoints(httpURL, "", wsURL, options)
+}
+
+// NewWithEndpoints keeps read-heavy RPC traffic separate from the optional
+// transaction submission endpoint. When sendHTTPURL is empty, both paths use
+// the read endpoint and preserve the single-endpoint deployment behavior.
+func NewWithEndpoints(httpURL, sendHTTPURL, wsURL string, options Options) *RPC {
 	if options.IngressBuffer < 1 {
 		options.IngressBuffer = 32768
 	}
@@ -65,22 +72,34 @@ func NewWithOptions(httpURL, wsURL string, options Options) *RPC {
 	if options.ReadLimit < 64*1024 {
 		options.ReadLimit = 1 << 20
 	}
-	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   750 * time.Millisecond,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		MaxIdleConns:          64,
-		MaxIdleConnsPerHost:   32,
-		MaxConnsPerHost:       64,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   750 * time.Millisecond,
-		ExpectContinueTimeout: 0,
-		ForceAttemptHTTP2:     true,
-		DisableCompression:    true,
+	newClient := func() *http.Client {
+		transport := &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   750 * time.Millisecond,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxIdleConns:          256,
+			MaxIdleConnsPerHost:   128,
+			MaxConnsPerHost:       128,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   750 * time.Millisecond,
+			ExpectContinueTimeout: 0,
+			ForceAttemptHTTP2:     true,
+			DisableCompression:    true,
+		}
+		return &http.Client{Transport: transport, Timeout: 15 * time.Second}
 	}
-	r := &RPC{HTTP: httpURL, WS: wsURL, readLimit: options.ReadLimit, client: &http.Client{Transport: transport, Timeout: 15 * time.Second}, Events: make(chan map[string]any, options.StrategyBuffer), ingress: make(chan map[string]any, options.IngressBuffer), subs: make(map[chan map[string]any]struct{})}
+	readClient := newClient()
+	sendHTTPURL = strings.TrimSpace(sendHTTPURL)
+	sendClient := readClient
+	if sendHTTPURL != "" && !strings.EqualFold(strings.TrimSpace(httpURL), sendHTTPURL) {
+		sendClient = newClient()
+	}
+	r := &RPC{HTTP: httpURL, SendHTTP: sendHTTPURL, WS: wsURL, readLimit: options.ReadLimit, client: readClient, sendClient: sendClient, Events: make(chan map[string]any, options.StrategyBuffer), ingress: make(chan map[string]any, options.IngressBuffer), subs: make(map[chan map[string]any]struct{})}
+	if r.SendHTTP == "" {
+		r.SendHTTP = r.HTTP
+	}
 	// Keep the websocket reader independent from strategy/database latency.
 	// The ingress queue absorbs short bursts and this ordered dispatcher is the
 	// only writer of the public strategy stream, so events cannot overtake one
@@ -206,8 +225,21 @@ func cloneEvent(event map[string]any) map[string]any {
 	return copy
 }
 func (r *RPC) Call(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	if r.HTTP == "" {
+	return r.callWith(ctx, r.HTTP, r.client, method, params)
+}
+
+func (r *RPC) callWith(ctx context.Context, endpoint string, client *http.Client, method string, params any) (json.RawMessage, error) {
+	if endpoint == "" {
 		return nil, fmt.Errorf("RPC_HTTP_URL is not configured")
+	}
+	if client == nil {
+		client = r.client
+	}
+	if client == nil {
+		// Keep RPC value literals and small replay tools safe. Production
+		// constructors always install a tuned client, but a nil fallback should
+		// never turn a configuration mistake into a process panic.
+		client = http.DefaultClient
 	}
 	r.httpCalls.Add(1)
 	started := time.Now()
@@ -218,13 +250,13 @@ func (r *RPC) Call(ctx context.Context, method string, params any) (json.RawMess
 		r.httpErrors.Add(1)
 		return nil, e
 	}
-	req, e := http.NewRequestWithContext(ctx, "POST", r.HTTP, bytes.NewReader(body))
+	req, e := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
 	if e != nil {
 		r.httpErrors.Add(1)
 		return nil, e
 	}
 	req.Header.Set("content-type", "application/json")
-	res, e := r.client.Do(req)
+	res, e := client.Do(req)
 	if e != nil {
 		r.httpErrors.Add(1)
 		return nil, e
@@ -255,6 +287,14 @@ func (r *RPC) Call(ctx context.Context, method string, params any) (json.RawMess
 		return nil, fmt.Errorf("rpc %d: %s", out.Error.Code, out.Error.Message)
 	}
 	return out.Result, nil
+}
+
+func (r *RPC) sendCall(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	endpoint, client := r.SendHTTP, r.sendClient
+	if strings.TrimSpace(endpoint) == "" {
+		endpoint, client = r.HTTP, r.client
+	}
+	return r.callWith(ctx, endpoint, client, method, params)
 }
 func (r *RPC) LatestBlock(ctx context.Context) (string, error) {
 	v, e := r.Call(ctx, "eth_blockNumber", []any{})
@@ -363,7 +403,7 @@ func (r *RPC) Logs(ctx context.Context, filter map[string]any) (any, error) {
 	return x, nil
 }
 func (r *RPC) SendRaw(ctx context.Context, raw string) (string, error) {
-	v, e := r.Call(ctx, "eth_sendRawTransaction", []any{raw})
+	v, e := r.sendCall(ctx, "eth_sendRawTransaction", []any{raw})
 	var out string
 	if e == nil {
 		e = json.Unmarshal(v, &out)
@@ -371,14 +411,14 @@ func (r *RPC) SendRaw(ctx context.Context, raw string) (string, error) {
 	return out, e
 }
 func (r *RPC) Nonce(ctx context.Context, address string) (uint64, error) {
-	v, e := r.Call(ctx, "eth_getTransactionCount", []any{address, "pending"})
+	v, e := r.sendCall(ctx, "eth_getTransactionCount", []any{address, "pending"})
 	if e != nil {
 		return 0, e
 	}
 	return strconv.ParseUint(strings.TrimPrefix(strings.Trim(string(v), `"`), "0x"), 16, 64)
 }
 func (r *RPC) GasPrice(ctx context.Context) (*big.Int, error) {
-	v, e := r.Call(ctx, "eth_gasPrice", []any{})
+	v, e := r.sendCall(ctx, "eth_gasPrice", []any{})
 	if e != nil {
 		return nil, e
 	}
@@ -391,7 +431,7 @@ func (r *RPC) GasPrice(ctx context.Context) (*big.Int, error) {
 }
 
 func (r *RPC) BaseFee(ctx context.Context) (*big.Int, error) {
-	v, e := r.Call(ctx, "eth_getBlockByNumber", []any{"latest", false})
+	v, e := r.sendCall(ctx, "eth_getBlockByNumber", []any{"latest", false})
 	if e != nil {
 		return nil, e
 	}
@@ -550,7 +590,7 @@ func (r *RPC) Subscribe(ctx context.Context, params map[string]any) {
 				}
 				if msg.Method == "eth_subscription" {
 					r.wssMessages.Add(1)
-					msg.Params.Result = decodeChainEvent(msg.Params.Result)
+					msg.Params.Result = decodeChainEventInPlace(msg.Params.Result)
 					r.publishEvent(msg.Params.Result)
 				}
 			}

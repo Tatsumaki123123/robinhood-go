@@ -9,6 +9,7 @@ Alchemy WSS
   -> 先识别己方成交，再做外部 USD 快速过滤
   -> 完整策略和数据库状态机
   -> 按钱包串行 nonce 分配
+  -> V4/Pons 统一先广播，own fill 再确认
   -> Keep-Alive HTTP RPC
 ```
 
@@ -52,7 +53,12 @@ WSS_READ_LIMIT_BYTES=1048576
 STRATEGY_WORKERS=16
 STRATEGY_QUEUE_BUFFER=512
 STRATEGY_SHARD_BACKLOG=2048
+RPC_HTTP_SEND_URL=
 ```
+
+`RPC_HTTP_SEND_URL` 可配置为独立的 Alchemy HTTP endpoint。nonce、gas 和
+`eth_sendRawTransaction` 会走发送连接池，`RPC_HTTP_URL` 继续承载日志补偿、余额和
+合约读取，避免读流量拥堵交易广播。留空时自动回退到 `RPC_HTTP_URL`。
 
 `t3` 等突发型实例不适合作为稳定交易节点。优先使用计算型实例、ENA 增强网络和
 专用 vCPU。只有在 p99 数据证明调度或 softirq 是瓶颈时，才使用 Docker 的

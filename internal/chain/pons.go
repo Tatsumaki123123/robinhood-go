@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"reflect"
 	"strings"
+	"sync"
 )
 
 var ponsABI = mustABI(`[
@@ -112,6 +113,16 @@ type PonsState struct {
 	PairToken                                                                      common.Address
 }
 
+type ponsPreparedTrade struct {
+	curve, token, recipient string
+	state                   PonsState
+	amount, out, spent      *big.Int
+	refund, minimum         *big.Int
+	buy                     bool
+	clamped                 bool
+	data                    []byte
+}
+
 func (r *RPC) PonsState(ctx context.Context, curve, recipient string) (PonsState, error) {
 	addr := common.HexToAddress(curve)
 	who := common.HexToAddress(recipient)
@@ -128,30 +139,54 @@ func (r *RPC) PonsState(ctx context.Context, curve, recipient string) (PonsState
 		out, e := ponsABI.Unpack(name, common.FromHex("0x"+b))
 		return out, e
 	}
-	rr, e := call("getReserves")
-	if e != nil {
-		return PonsState{}, e
+	// These reads are independent. Run them concurrently so the quote path is
+	// bounded by one RPC round trip instead of six sequential round trips.
+	type callSpec struct {
+		name string
+		args []any
 	}
-	sell, e := call("sellableTokens")
-	if e != nil {
-		return PonsState{}, e
+	type callResult struct {
+		name string
+		vals []any
+		err  error
 	}
-	fee, e := call("feeBps")
-	if e != nil {
-		return PonsState{}, e
+	specs := []callSpec{
+		{name: "getReserves"},
+		{name: "sellableTokens"},
+		{name: "feeBps"},
+		{name: "creatorTaxBps"},
+		{name: "currentSnipeTaxBps", args: []any{who}},
+		{name: "pairToken"},
 	}
-	creator, e := call("creatorTaxBps")
-	if e != nil {
-		return PonsState{}, e
+	results := make(chan callResult, len(specs))
+	var wg sync.WaitGroup
+	for _, spec := range specs {
+		spec := spec
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			vals, err := call(spec.name, spec.args...)
+			results <- callResult{name: spec.name, vals: vals, err: err}
+		}()
 	}
-	snipe, e := call("currentSnipeTaxBps", who)
-	if e != nil {
-		return PonsState{}, e
+	wg.Wait()
+	close(results)
+	values := make(map[string][]any, len(specs))
+	for result := range results {
+		if result.err != nil {
+			return PonsState{}, fmt.Errorf("pons %s: %w", result.name, result.err)
+		}
+		values[result.name] = result.vals
 	}
-	pair, e := call("pairToken")
-	if e != nil {
-		return PonsState{}, e
+	if len(values["getReserves"]) < 2 || len(values["sellableTokens"]) < 1 || len(values["feeBps"]) < 1 || len(values["creatorTaxBps"]) < 1 || len(values["currentSnipeTaxBps"]) < 1 || len(values["pairToken"]) < 1 {
+		return PonsState{}, fmt.Errorf("pons state returned incomplete data")
 	}
+	rr := values["getReserves"]
+	sell := values["sellableTokens"]
+	fee := values["feeBps"]
+	creator := values["creatorTaxBps"]
+	snipe := values["currentSnipeTaxBps"]
+	pair := values["pairToken"]
 	asBig := func(v any) *big.Int {
 		if x, ok := v.(*big.Int); ok {
 			return x
@@ -218,31 +253,29 @@ func (r *RPC) PackPonsSell(input, minOut *big.Int, recipient string) ([]byte, er
 	return ponsABI.Pack("sell", input, minOut, common.HexToAddress(recipient))
 }
 
-// PonsSwap signs and submits a curve buy/sell. It shares Trading's receipt
-// handling and returns the same live response shape used by V4 swaps.
-func (t *Trading) PonsSwap(ctx context.Context, d map[string]any, buy bool) (map[string]any, error) {
+func (t *Trading) preparePonsTrade(ctx context.Context, d map[string]any, buy bool) (ponsPreparedTrade, error) {
 	curve := fmt.Sprint(d["curveAddress"])
 	recipient := fmt.Sprint(d["recipient"])
 	if recipient == "" || recipient == "<nil>" {
 		recipient = fmt.Sprint(d["to"])
 	}
 	if recipient == "" || recipient == "<nil>" {
-		return nil, fmt.Errorf("recipient is required")
+		return ponsPreparedTrade{}, fmt.Errorf("recipient is required")
 	}
 	amount := ToBig(d["amountRaw"])
 	if amount.Sign() <= 0 {
-		return nil, fmt.Errorf("amountRaw must be positive")
+		return ponsPreparedTrade{}, fmt.Errorf("amountRaw must be positive")
 	}
 	state, err := t.RPC.PonsState(ctx, curve, recipient)
 	if err != nil {
-		return nil, err
+		return ponsPreparedTrade{}, err
 	}
 	slip := ToBig(d["slippageBps"])
 	if _, supplied := d["slippageBps"]; !supplied {
 		slip = big.NewInt(100)
 	}
 	if slip.Sign() < 0 || slip.Cmp(big.NewInt(5000)) > 0 {
-		return nil, fmt.Errorf("slippageBps must be between 0 and 5000")
+		return ponsPreparedTrade{}, fmt.Errorf("slippageBps must be between 0 and 5000")
 	}
 	var out, spent, refund *big.Int
 	var clamped bool
@@ -259,55 +292,91 @@ func (t *Trading) PonsSwap(ctx context.Context, d map[string]any, buy bool) (map
 		data, err = t.RPC.PackPonsSell(amount, min, recipient)
 	}
 	if err != nil {
+		return ponsPreparedTrade{}, err
+	}
+	return ponsPreparedTrade{curve: curve, token: fmt.Sprint(d["tokenAddress"]), recipient: recipient, state: state, amount: amount, out: out, spent: spent, refund: refund, minimum: min, buy: buy, clamped: clamped, data: data}, nil
+}
+
+func (t *Trading) broadcastPonsTrade(ctx context.Context, prepared ponsPreparedTrade, key *ecdsa.PrivateKey) (BroadcastResult, error) {
+	from := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
+	unlockWallet := t.lockWallet(from)
+	defer unlockWallet()
+	nonce, err := t.reserveNonce(ctx, from, nil)
+	if err != nil {
+		return BroadcastResult{}, err
+	}
+	gasPrice, err := t.gasPrice(ctx)
+	if err != nil {
+		t.invalidateNonce(from)
+		return BroadcastResult{}, err
+	}
+	value := big.NewInt(0)
+	if prepared.buy {
+		value = new(big.Int).Set(prepared.amount)
+	}
+	tx := types.NewTx(&types.LegacyTx{Nonce: nonce, To: ptrAddress(prepared.curve), Value: value, GasPrice: gasPrice, Gas: 700000, Data: prepared.data})
+	signed, err := types.SignTx(tx, types.LatestSignerForChainID(big.NewInt(t.ChainID)), key)
+	if err != nil {
+		t.invalidateNonce(from)
+		return BroadcastResult{}, err
+	}
+	rawTx, err := signed.MarshalBinary()
+	if err != nil {
+		t.invalidateNonce(from)
+		return BroadcastResult{}, err
+	}
+	hash, err := t.RPC.SendRaw(ctx, "0x"+hex.EncodeToString(rawTx))
+	if err != nil {
+		t.invalidateNonce(from)
+		return BroadcastResult{}, err
+	}
+	return BroadcastResult{TransactionHash: hash, Nonce: nonce, From: from, MaxFeePerGas: new(big.Int).Set(gasPrice), TipPerGas: new(big.Int).Set(gasPrice)}, nil
+}
+
+// BroadcastPons signs and submits a curve buy/sell without waiting for a
+// receipt. Strategy execution uses this fast path and reconciles the fill from
+// the own transaction event, just like the V4 broadcast path.
+func (t *Trading) BroadcastPons(ctx context.Context, d map[string]any, buy bool) (BroadcastResult, error) {
+	prepared, err := t.preparePonsTrade(ctx, d, buy)
+	if err != nil {
+		return BroadcastResult{}, err
+	}
+	keyText := strings.TrimPrefix(fmt.Sprint(d["privateKey"]), "0x")
+	if keyText == "" {
+		return BroadcastResult{}, fmt.Errorf("privateKey is required")
+	}
+	key, err := gethcrypto.HexToECDSA(keyText)
+	if err != nil {
+		return BroadcastResult{}, err
+	}
+	return t.broadcastPonsTrade(ctx, prepared, key)
+}
+
+// PonsSwap signs and submits a curve buy/sell. It retains the API's confirmed
+// response shape; strategy code should use BroadcastPons to avoid waiting.
+func (t *Trading) PonsSwap(ctx context.Context, d map[string]any, buy bool) (map[string]any, error) {
+	prepared, err := t.preparePonsTrade(ctx, d, buy)
+	if err != nil {
 		return nil, err
 	}
 	keyText := strings.TrimPrefix(fmt.Sprint(d["privateKey"]), "0x")
 	if keyText == "" {
-		return map[string]any{"mode": "calldata-preview", "side": map[bool]string{true: "buy", false: "sell"}[buy], "curveAddress": strings.ToLower(curve), "tokenAddress": strings.ToLower(fmt.Sprint(d["tokenAddress"])), "pairToken": strings.ToLower(state.PairToken.Hex()), "quoteInRaw": map[bool]string{true: amount.String(), false: ""}[buy], "tokensInRaw": map[bool]string{true: "", false: amount.String()}[buy], "expectedTokensOutRaw": map[bool]string{true: out.String(), false: ""}[buy], "expectedQuoteOutRaw": map[bool]string{true: "", false: out.String()}[buy], "minimumAmountOutRaw": min.String(), "spentRaw": spent.String(), "refundRaw": refund.String(), "clamped": clamped, "transactionHash": nil, "to": curve, "data": "0x" + hex.EncodeToString(data)}, nil
+		return map[string]any{"mode": "calldata-preview", "side": map[bool]string{true: "buy", false: "sell"}[buy], "curveAddress": strings.ToLower(prepared.curve), "tokenAddress": strings.ToLower(prepared.token), "pairToken": strings.ToLower(prepared.state.PairToken.Hex()), "quoteInRaw": map[bool]string{true: prepared.amount.String(), false: ""}[buy], "tokensInRaw": map[bool]string{true: "", false: prepared.amount.String()}[buy], "expectedTokensOutRaw": map[bool]string{true: prepared.out.String(), false: ""}[buy], "expectedQuoteOutRaw": map[bool]string{true: "", false: prepared.out.String()}[buy], "minimumAmountOutRaw": prepared.minimum.String(), "spentRaw": prepared.spent.String(), "refundRaw": prepared.refund.String(), "clamped": prepared.clamped, "transactionHash": nil, "to": prepared.curve, "data": "0x" + hex.EncodeToString(prepared.data)}, nil
 	}
 	key, err := gethcrypto.HexToECDSA(keyText)
 	if err != nil {
 		return nil, err
 	}
-	from := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
-	unlockWallet := t.lockWallet(from)
-	nonce, err := t.reserveNonce(ctx, from, nil)
-	if err != nil {
-		unlockWallet()
-		return nil, err
-	}
-	gasPrice, err := t.gasPrice(ctx)
-	if err != nil {
-		t.invalidateNonce(from)
-		unlockWallet()
-		return nil, err
-	}
-	value := big.NewInt(0)
-	if buy {
-		value = amount
-	}
-	tx := types.NewTx(&types.LegacyTx{Nonce: nonce, To: ptrAddress(curve), Value: value, GasPrice: gasPrice, Gas: 700000, Data: data})
-	signed, err := types.SignTx(tx, types.LatestSignerForChainID(big.NewInt(t.ChainID)), key)
-	if err != nil {
-		t.invalidateNonce(from)
-		unlockWallet()
-		return nil, err
-	}
-	rawTx, _ := signed.MarshalBinary()
-	hash, err := t.RPC.SendRaw(ctx, "0x"+hex.EncodeToString(rawTx))
-	if err != nil {
-		t.invalidateNonce(from)
-	}
-	unlockWallet()
+	broadcast, err := t.broadcastPonsTrade(ctx, prepared, key)
 	if err != nil {
 		return nil, err
 	}
-	receipt, err := t.waitReceipt(ctx, hash)
+	receipt, err := t.waitReceipt(ctx, broadcast.TransactionHash)
 	if err != nil {
 		return nil, err
 	}
-	result := map[string]any{"mode": "live", "status": "confirmed", "side": map[bool]string{true: "buy", false: "sell"}[buy], "curveAddress": strings.ToLower(curve), "tokenAddress": strings.ToLower(fmt.Sprint(d["tokenAddress"])), "pairToken": strings.ToLower(state.PairToken.Hex()), "transactionHash": hash, "hash": hash, "from": from, "nonce": nonce, "expectedAmountOutRaw": out.String(), "minimumAmountOutRaw": min.String(), "receipt": receipt}
-	if fill := ponsReceiptFill(receipt, curve, buy); fill != nil {
+	result := map[string]any{"mode": "live", "status": "confirmed", "side": map[bool]string{true: "buy", false: "sell"}[buy], "curveAddress": strings.ToLower(prepared.curve), "tokenAddress": strings.ToLower(prepared.token), "pairToken": strings.ToLower(prepared.state.PairToken.Hex()), "transactionHash": broadcast.TransactionHash, "hash": broadcast.TransactionHash, "from": broadcast.From, "nonce": broadcast.Nonce, "expectedAmountOutRaw": prepared.out.String(), "minimumAmountOutRaw": prepared.minimum.String(), "receipt": receipt}
+	if fill := ponsReceiptFill(receipt, prepared.curve, buy); fill != nil {
 		result["actualAmountOutRaw"] = fill["actualAmountOutRaw"]
 		result["actualQuoteAmountRaw"] = fill["quoteAmountRaw"]
 		result["actualTokenAmountRaw"] = fill["tokenAmountRaw"]

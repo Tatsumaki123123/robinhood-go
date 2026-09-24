@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"testing"
+	"time"
 
 	"robinhood-go/internal/chain"
 	"robinhood-go/internal/store"
@@ -84,5 +85,15 @@ func TestDirectOwnEventMatchesSenderCaseInsensitively(t *testing.T) {
 	user := store.User{UserID: 7, WalletAddress: "0xAbC"}
 	if !directOwnEvent(Event{Sender: "0xabc"}, user) {
 		t.Fatal("expected sender matching wallet to be recognized as own event")
+	}
+}
+
+func TestCachedOwnEventAvoidsDatabaseLookup(t *testing.T) {
+	e := &Engine{}
+	user := store.User{UserID: 7, WalletAddress: "0xabc"}
+	ev := Event{Key: "0xdeadbeef:3", TokenAddress: "0xtoken", CurveAddress: "0xcurve"}
+	e.cacheOwnTransaction("0xdeadbeef", user.UserID, ev.TokenAddress, ev.CurveAddress, time.Minute)
+	if !e.cachedOwnEvent(ev, user) {
+		t.Fatal("expected pending transaction to be recognized from the positive cache")
 	}
 }

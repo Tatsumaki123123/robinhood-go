@@ -59,7 +59,8 @@ AVE 持仓数量、平均成本和剩余持仓写回 `strategy_positions` 及最
 
 策略引擎会在监控用户和代币均启用且存在私钥时使用已缓存的 V4 路由广播买卖；V4 买入的
 nonce、费用上限和替换次数写入 `strategy_pending_buys`，只有 own fill 事件才会更新持仓。
-未配置可执行路由时会回退到 Pons V2 曲线交易。
+未配置可执行路由时会回退到 Pons V2 曲线交易；两条策略路径均在广播成功后立即释放
+策略 worker，成交由后续 own fill 事件确认。HTTP 手动交易接口仍返回 confirmed receipt。
 
 ## BottomFishing 配置
 
