@@ -100,6 +100,7 @@ type Engine struct {
 	NativeUSDPrice  string
 	supplies        sync.Map // token address -> cached total supply raw
 	curveBlocks     sync.Map // curve address -> last polled block
+	v4Blocks        sync.Map // PoolManager address -> last polled block
 	pollMu          sync.Mutex
 	monitorMu       sync.RWMutex
 	monitorUsers    map[int64]store.User
@@ -122,9 +123,15 @@ type Engine struct {
 	processNs       atomic.Uint64
 	broadcastNs     atomic.Uint64
 	broadcasts      atomic.Uint64
+	lowValueDrops   atomic.Uint64
+	filterUnknown   atomic.Uint64
 	nativePriceMu   sync.RWMutex
 	nativePrice     string
 	nativePriceAt   time.Time
+	workerCount     int
+	queueBuffer     int
+	maxShardBacklog int
+	minEventUSD     *big.Int
 }
 
 const pendingSellTimeout = 5 * time.Second
@@ -132,8 +139,14 @@ const maxPendingBuyReplacements = 1
 const pendingBuyExecutionTimeout = 90 * time.Second
 const buySellTriggerCooldown = time.Second
 
+// minEventUSDScaled is the hard lower bound for the large-order strategy.
+// Values are represented in 8-decimal USD units to keep the comparison exact.
+const minEventUSDScaled int64 = 1_000_000_000
+
+var defaultMinEventUSD = big.NewInt(minEventUSDScaled)
+
 func New(s *store.Store, r *chain.RPC) *Engine {
-	return &Engine{Store: s, RPC: r, monitorUsers: make(map[int64]store.User), monitorTokens: make(map[int64][]store.Token), monitorRoutes: make(map[int64][]map[string]any), monitorByPool: make(map[string][]monitorTarget), monitorByCurve: make(map[string][]monitorTarget)}
+	return &Engine{Store: s, RPC: r, monitorUsers: make(map[int64]store.User), monitorTokens: make(map[int64][]store.Token), monitorRoutes: make(map[int64][]map[string]any), monitorByPool: make(map[string][]monitorTarget), monitorByCurve: make(map[string][]monitorTarget), workerCount: 16, queueBuffer: 512, maxShardBacklog: 2048, minEventUSD: new(big.Int).Set(defaultMinEventUSD)}
 }
 
 // Metrics returns cumulative counters and average timings for the strategy
@@ -152,17 +165,24 @@ func (e *Engine) Metrics() map[string]any {
 	if broadcasts > 0 {
 		avgBroadcast = float64(e.broadcastNs.Load()) / float64(broadcasts) / 1e6
 	}
+	threshold := e.minEventUSD
+	if threshold == nil || threshold.Sign() <= 0 {
+		threshold = defaultMinEventUSD
+	}
 	return map[string]any{
-		"eventsProcessed": processed,
-		"eventsMatched":   e.eventsMatched.Load(),
-		"processErrors":   e.processErrors.Load(),
-		"queueBacklog":    e.queueBacklog.Load(),
-		"queueHighWater":  e.queueHighWater.Load(),
-		"queueDropped":    e.queueDropped.Load(),
-		"avgQueueWaitMs":  avg(e.queueWaitNs.Load()),
-		"avgProcessMs":    avg(e.processNs.Load()),
-		"broadcasts":      broadcasts,
-		"avgBroadcastMs":  avgBroadcast,
+		"eventsProcessed":   processed,
+		"eventsMatched":     e.eventsMatched.Load(),
+		"processErrors":     e.processErrors.Load(),
+		"queueBacklog":      e.queueBacklog.Load(),
+		"queueHighWater":    e.queueHighWater.Load(),
+		"queueDropped":      e.queueDropped.Load(),
+		"avgQueueWaitMs":    avg(e.queueWaitNs.Load()),
+		"avgProcessMs":      avg(e.processNs.Load()),
+		"broadcasts":        broadcasts,
+		"avgBroadcastMs":    avgBroadcast,
+		"lowValueDrops":     e.lowValueDrops.Load(),
+		"filterUnknown":     e.filterUnknown.Load(),
+		"minEventUSDScaled": threshold.String(),
 	}
 }
 
@@ -188,6 +208,42 @@ func (e *Engine) ConfigureTrading(t *chain.Trading, encryptionKey string, native
 	}
 }
 
+// ConfigurePerformance sets the bounded strategy worker queues. It must be
+// called before Run; invalid values fall back to conservative defaults.
+func (e *Engine) ConfigurePerformance(workers, queueBuffer, shardBacklog int) {
+	if workers > 0 {
+		if workers > 256 {
+			workers = 256
+		}
+		e.workerCount = workers
+	}
+	if queueBuffer > 0 {
+		if queueBuffer > 65536 {
+			queueBuffer = 65536
+		}
+		e.queueBuffer = queueBuffer
+	}
+	if shardBacklog > 0 {
+		if shardBacklog > 1_000_000 {
+			shardBacklog = 1_000_000
+		}
+		e.maxShardBacklog = shardBacklog
+	}
+}
+
+// ConfigureEventFilter sets the minimum event notional in USD. The hot path
+// keeps the threshold as an 8-decimal integer and never uses float arithmetic.
+func (e *Engine) ConfigureEventFilter(minUSD float64) {
+	if minUSD <= 0 || math.IsNaN(minUSD) || math.IsInf(minUSD, 0) {
+		return
+	}
+	scaled := scaledUSDText(minUSD)
+	n := new(big.Int)
+	if _, ok := n.SetString(scaled, 10); ok && n.Sign() > 0 {
+		e.minEventUSD = n
+	}
+}
+
 // InvalidateMonitorCache is called by the HTTP mutation handlers after a
 // user/token change so the next WSS event observes the new switch immediately
 // instead of waiting for the normal ten-second refresh interval.
@@ -204,13 +260,21 @@ func (e *Engine) Run(ctx context.Context) {
 	// Decode and evaluate independent pools in parallel. A stable shard key
 	// keeps events for one user/token/pool in chain order, while unrelated
 	// positions no longer wait behind a slow database or RPC call.
-	const workerCount = 16
-	const maxShardBacklog = 2048
+	workerCount, queueBuffer, maxShardBacklog := e.workerCount, e.queueBuffer, e.maxShardBacklog
+	if workerCount <= 0 {
+		workerCount = 16
+	}
+	if queueBuffer <= 0 {
+		queueBuffer = 512
+	}
+	if maxShardBacklog <= 0 {
+		maxShardBacklog = 2048
+	}
 	queues := make([]chan map[string]any, workerCount)
 	backlogs := make([][]map[string]any, workerCount)
 	var wg sync.WaitGroup
 	for i := range queues {
-		queues[i] = make(chan map[string]any, 512)
+		queues[i] = make(chan map[string]any, queueBuffer)
 		wg.Add(1)
 		go func(queue <-chan map[string]any) {
 			defer wg.Done()
@@ -371,8 +435,30 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 	}
 	e.monitorMu.RUnlock()
 	for _, target := range targets {
-		e.eventsMatched.Add(1)
 		u, t := target.user, target.token
+		// Check the cheap ownership fields before the notional filter. A strategy
+		// fill can legitimately be below the external-event threshold and still
+		// must update positions and pending transaction state.
+		own := directOwnEvent(ev, u)
+		candidate := ev
+		candidate.UserID = u.UserID
+		candidate.TokenAddress = t.TokenAddress
+		candidate.CurveAddress = t.CurveAddress
+		if drop, known := e.dropLowValueEvent(ev, t); known && drop && !own {
+			// Only the rare low-value path needs the database/cache ownership
+			// fallback. This keeps the common external-event path cheap while
+			// preserving fills whose sender is hidden behind a router.
+			own = e.isOwnEvent(ctx, candidate, u)
+			if !own {
+				e.lowValueDrops.Add(1)
+				continue
+			}
+		} else if !known {
+			// A missing price/decimals value is not evidence that the event is
+			// small. Keep it on the full path until the metadata is available.
+			e.filterUnknown.Add(1)
+		}
+		e.eventsMatched.Add(1)
 		t = e.enrichTokenSupply(ctx, t)
 		copy := ev
 		copy.UserID = u.UserID
@@ -400,7 +486,7 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 		if copy.MarketCap == 0 && t.MarketCap != nil {
 			copy.MarketCap, _ = strconv.ParseFloat(*t.MarketCap, 64)
 		}
-		copy.Own = e.isOwnEvent(ctx, copy, u)
+		copy.Own = own || e.isOwnEvent(ctx, copy, u)
 		if ev.PoolID != "" && (ev.Amount0Raw != "" || ev.Amount1Raw != "") {
 			a0, ok0 := signedRaw(ev.Amount0Raw)
 			a1, ok1 := signedRaw(ev.Amount1Raw)
@@ -482,6 +568,113 @@ func (e *Engine) processForMonitors(ctx context.Context, ev Event) error {
 		}
 	}
 	return nil
+}
+
+// dropLowValueEvent performs the cheapest reliable value check available for
+// an event. It intentionally runs before token enrichment and strategy work.
+// The bool result reports whether the event had enough metadata to make a
+// decision; unknown values are allowed through by the caller.
+func (e *Engine) dropLowValueEvent(ev Event, token store.Token) (drop, known bool) {
+	quoteRaw, ok := eventQuoteAmountRaw(ev, token)
+	if !ok || quoteRaw == nil || quoteRaw.Sign() < 0 {
+		return false, false
+	}
+	quoteDecimals, ok := filterQuoteDecimals(token)
+	if !ok {
+		return false, false
+	}
+	price := filterQuoteUSDPrice(token, e.NativeUSDPrice)
+	if price == "" {
+		return false, false
+	}
+	value := quoteCostUSDScaled(quoteRaw, quoteDecimals, price, 0)
+	threshold := e.minEventUSD
+	if threshold == nil || threshold.Sign() <= 0 {
+		threshold = defaultMinEventUSD
+	}
+	return value.Cmp(threshold) < 0, true
+}
+
+func eventQuoteAmountRaw(ev Event, token store.Token) (*big.Int, bool) {
+	if ev.PoolID != "" && (ev.Amount0Raw != "" || ev.Amount1Raw != "") {
+		a0, ok0 := signedRaw(ev.Amount0Raw)
+		a1, ok1 := signedRaw(ev.Amount1Raw)
+		if !ok0 || !ok1 {
+			return nil, false
+		}
+		quote := a0
+		if strings.EqualFold(token.Currency0, token.TokenAddress) {
+			quote = a1
+		}
+		return new(big.Int).Abs(new(big.Int).Set(quote)), true
+	}
+	text := strings.TrimSpace(ev.QuoteAmountText)
+	if text == "" {
+		return nil, false
+	}
+	amount := new(big.Int)
+	if _, ok := amount.SetString(integerText(text), 10); !ok {
+		return nil, false
+	}
+	return amount, true
+}
+
+func filterQuoteUSDPrice(token store.Token, nativePrice string) string {
+	if token.QuoteUSDPrice != nil {
+		price := strings.TrimSpace(*token.QuoteUSDPrice)
+		if validPositiveDecimal(price) && (isStableQuote(token) || token.UpdatedAt.IsZero() || time.Since(token.UpdatedAt) <= 5*time.Minute) {
+			return price
+		}
+	}
+	if isStableQuote(token) {
+		return "1"
+	}
+	if isNativeQuote(token) && validPositiveDecimal(strings.TrimSpace(nativePrice)) {
+		return strings.TrimSpace(nativePrice)
+	}
+	return ""
+}
+
+func validPositiveDecimal(value string) bool {
+	scaled, ok := decimalScaled(strings.TrimSpace(value), 8)
+	return ok && scaled.Sign() > 0
+}
+
+func isStableQuote(token store.Token) bool {
+	if token.QuoteTokenSymbol == nil {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(*token.QuoteTokenSymbol)) {
+	case "USDG", "USDC", "USDT", "DAI":
+		return true
+	default:
+		return false
+	}
+}
+
+func isNativeQuote(token store.Token) bool {
+	if strings.EqualFold(strings.TrimSpace(token.QuoteTokenAddress), chain.NativeAddress) || strings.EqualFold(strings.TrimSpace(token.QuoteTokenAddress), chain.WrappedNativeAddress) {
+		return true
+	}
+	if token.QuoteTokenSymbol == nil {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(*token.QuoteTokenSymbol)) {
+	case "ETH", "WETH":
+		return true
+	default:
+		return false
+	}
+}
+
+func filterQuoteDecimals(token store.Token) (int, bool) {
+	if token.QuoteDecimals != nil && *token.QuoteDecimals >= 0 {
+		return *token.QuoteDecimals, true
+	}
+	if isNativeQuote(token) {
+		return 18, true
+	}
+	return 0, false
 }
 
 func (e *Engine) enrichTokenSupply(ctx context.Context, t store.Token) store.Token {
@@ -876,11 +1069,13 @@ func eventTransactionHash(ev Event) string {
 	return key
 }
 
+func directOwnEvent(ev Event, user store.User) bool {
+	return (ev.TransactionFrom != "" && strings.EqualFold(ev.TransactionFrom, user.WalletAddress)) ||
+		(ev.Sender != "" && strings.EqualFold(ev.Sender, user.WalletAddress))
+}
+
 func (e *Engine) isOwnEvent(ctx context.Context, ev Event, user store.User) bool {
-	if ev.TransactionFrom != "" && strings.EqualFold(ev.TransactionFrom, user.WalletAddress) {
-		return true
-	}
-	if ev.Sender != "" && strings.EqualFold(ev.Sender, user.WalletAddress) {
+	if directOwnEvent(ev, user) {
 		return true
 	}
 	hash := eventTransactionHash(ev)
@@ -2834,10 +3029,14 @@ func (e *Engine) pollCurves(ctx context.Context) {
 		tokenSnapshot[uid] = append([]store.Token(nil), tokens...)
 	}
 	e.monitorMu.RUnlock()
+	configuredManager := ""
+	if e.Trading != nil {
+		configuredManager = strings.ToLower(strings.TrimSpace(e.Trading.PoolManager))
+	}
 	curves := map[string]struct{}{}
 	for _, tokens := range tokenSnapshot {
 		for _, token := range tokens {
-			if commonCurve(token.CurveAddress) {
+			if commonCurve(token.CurveAddress) && !isV4MonitorToken(token, configuredManager) {
 				curves[strings.ToLower(token.CurveAddress)] = struct{}{}
 			}
 		}
@@ -2895,7 +3094,9 @@ func (e *Engine) pollCurves(ctx context.Context) {
 			})
 			for _, decoded := range decodedLogs {
 				if ev, good := decodeEvent(decoded); good {
-					_ = e.processForMonitors(ctx, ev)
+					if err := e.processForMonitors(ctx, ev); err != nil {
+						allOK = false
+					}
 				}
 			}
 			if allOK {
@@ -2904,6 +3105,106 @@ func (e *Engine) pollCurves(ctx context.Context) {
 		}()
 	}
 	wg.Wait()
+	e.pollV4Pools(ctx, head, tokenSnapshot)
+}
+
+func (e *Engine) pollV4Pools(ctx context.Context, head *big.Int, tokenSnapshot map[int64][]store.Token) {
+	if e.RPC == nil || head == nil {
+		return
+	}
+	configuredManager := ""
+	if e.Trading != nil {
+		configuredManager = strings.ToLower(strings.TrimSpace(e.Trading.PoolManager))
+	}
+	managers := make(map[string]struct{})
+	for _, tokens := range tokenSnapshot {
+		for _, token := range tokens {
+			if !isV4MonitorToken(token, configuredManager) {
+				continue
+			}
+			manager := configuredManager
+			if manager == "" {
+				manager = strings.ToLower(strings.TrimSpace(token.CurveAddress))
+			}
+			if commonCurve(manager) {
+				managers[manager] = struct{}{}
+			}
+		}
+	}
+	if len(managers) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+	for manager := range managers {
+		manager := manager
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			from := new(big.Int).Set(head)
+			if v, ok := e.v4Blocks.Load(manager); ok {
+				if n, ok2 := v.(*big.Int); ok2 {
+					from = new(big.Int).Add(n, big.NewInt(1))
+				}
+			} else if from.Sign() > 0 {
+				from.Sub(from, big.NewInt(2))
+			}
+			if from.Cmp(head) > 0 {
+				return
+			}
+			to := new(big.Int).Set(head)
+			if span := new(big.Int).Sub(to, from); span.Cmp(big.NewInt(2000)) > 0 {
+				to = new(big.Int).Add(from, big.NewInt(2000))
+			}
+			logs, err := e.RPC.Logs(ctx, map[string]any{
+				"address":   manager,
+				"topics":    []any{[]string{chain.V4SwapTopic}},
+				"fromBlock": "0x" + fmt.Sprintf("%x", from),
+				"toBlock":   "0x" + fmt.Sprintf("%x", to),
+			})
+			if err != nil {
+				return
+			}
+			decodedLogs := make([]map[string]any, 0)
+			if arr, ok := logs.([]any); ok {
+				for _, raw := range arr {
+					if m, ok := raw.(map[string]any); ok {
+						decodedLogs = append(decodedLogs, chain.DecodeChainEvent(m))
+					}
+				}
+			}
+			sort.SliceStable(decodedLogs, func(i, j int) bool {
+				bi := hexNumber(firstString(decodedLogs[i], "blockNumber", "block"))
+				bj := hexNumber(firstString(decodedLogs[j], "blockNumber", "block"))
+				li := hexNumber(firstString(decodedLogs[i], "logIndex"))
+				lj := hexNumber(firstString(decodedLogs[j], "logIndex"))
+				bc := bi.Cmp(bj)
+				return bc < 0 || (bc == 0 && li.Cmp(lj) < 0)
+			})
+			allOK := true
+			for _, decoded := range decodedLogs {
+				if ev, good := decodeEvent(decoded); good {
+					if err := e.processForMonitors(ctx, ev); err != nil {
+						allOK = false
+					}
+				}
+			}
+			if allOK {
+				e.v4Blocks.Store(manager, to)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func isV4MonitorToken(token store.Token, configuredManager string) bool {
+	amm := strings.ToLower(strings.TrimSpace(token.Amm))
+	if strings.Contains(amm, "v4") || strings.Contains(amm, "uniswap") {
+		return true
+	}
+	return configuredManager != "" && strings.EqualFold(strings.TrimSpace(token.CurveAddress), configuredManager)
 }
 
 func commonCurve(s string) bool { return s != "" && !strings.EqualFold(s, chain.NativeAddress) }

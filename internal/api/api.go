@@ -68,6 +68,8 @@ func (a *API) Register(app *fiber.App) {
 			out["wssDroppedSubscriberEvents"] = a.RPC.DroppedSubscriberEvents()
 			out["wssIngressDepth"] = a.RPC.IngressDepth()
 			out["strategyChannelDepth"] = a.RPC.StrategyDepth()
+			out["rpcHTTP"] = a.RPC.HTTPMetrics()
+			out["wss"] = a.RPC.WSSMetrics()
 		}
 		if a.strategyMetrics != nil {
 			out["strategy"] = a.strategyMetrics()

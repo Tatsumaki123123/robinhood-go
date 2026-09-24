@@ -20,6 +20,22 @@ RobinhoodGo 是原 NestJS/Prisma Robinhood 链上交易服务的 Go 后端替代
 - **链工具**：go-ethereum 用于地址/私钥、Universal Router/Permit2 ABI 编码和交易签名；私钥采用 AES-GCM 加密保存。
 - **文件**：本地卷驱动已实现，S3/Wasabi/Azure 可在同一 `StorageDriver` 接口上替换。
 
+### 高频路径优化
+
+- WSS 使用有界 ingress/strategy 队列；读取循环不等待数据库或策略执行。队列溢出、WSS
+  连接、消息数和 RPC HTTP 延迟通过 `/health` 暴露。
+- Curve 与 Uniswap V4 事件在进入 token supply 查询和完整策略前进行本地 USD 名义价值
+  快速过滤。默认只丢弃可可靠计算且小于 10 USD 的外部事件；己方成交回执先完成识别
+  并始终进入记账。价格或 decimals 缺失、无效或过期时保守放行，native quote 缺失
+  decimals 时按 18 位处理。
+- WSS 消息 buffer、RPC 请求 buffer 和事件 word 解析均避免不必要的长期分配；HTTP RPC
+  使用共享 Keep-Alive Transport、HTTP/2、多路连接上限和禁用压缩。
+- 同一钱包的交易 nonce 在进程内按钱包串行分配；显式 nonce 用于替换交易，广播失败时
+  会使本地 nonce cursor 失效并重新从 RPC 同步；nonce 已分配但广播前的 RPC、签名
+  失败也会失效 cursor。
+- WSS 断线或有界队列溢出后，Pons 曲线和 Uniswap V4 PoolManager 均由区块日志轮询补偿，
+  使用交易 hash 与 log index 做幂等处理。
+
 ## API 合约
 
 所有业务成功响应都是 `{success,statusCode,message,data,meta}`，资源错误返回
@@ -97,5 +113,8 @@ docker compose up -d --build
 
 `PORT`、`DATABASE_URL`、`REDIS_URL`、`RPC_HTTP_URL`、`RPC_WS_URL`、`CHAIN_ID`、
 `AVE_BASE_URL`、`AVE_X_AUTH`、`AVE_VISITOR_ID`（AVE 网页的浏览器指纹，用于自动刷新认证）、私钥密码、存储路径、监听开关、PoolManager、Universal Router、
-Permit2、Pons Factory 和 Pons 外部 Hook 地址均从环境变量读取；
+Permit2、Pons Factory 和 Pons 外部 Hook 地址均从环境变量读取。性能参数包括
+`STRATEGY_MIN_EVENT_USD`、`WSS_INGRESS_BUFFER`、`WSS_STRATEGY_BUFFER`、
+`WSS_READ_LIMIT_BYTES`、`STRATEGY_WORKERS`、`STRATEGY_QUEUE_BUFFER` 和
+`STRATEGY_SHARD_BACKLOG`；
 `.env.example` 给出可直接用于 Compose 的默认值。

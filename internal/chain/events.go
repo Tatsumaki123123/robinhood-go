@@ -1,7 +1,6 @@
 package chain
 
 import (
-	"encoding/hex"
 	"fmt"
 	"math/big"
 	"strings"
@@ -20,46 +19,44 @@ func decodeChainEvent(log map[string]any) map[string]any {
 	}
 	topic := strings.ToLower(toString(topics[0]))
 	data := strings.TrimPrefix(strings.ToLower(toString(log["data"])), "0x")
-	words := make([]*big.Int, 0, len(data)/64)
-	for i := 0; i+64 <= len(data); i += 64 {
-		n := new(big.Int)
-		n.SetString(data[i:i+64], 16)
-		words = append(words, n)
-	}
 	out := map[string]any{}
 	for k, v := range log {
 		out[k] = v
 	}
-	if len(words) >= 4 && topic == CurveBuyTopic {
+	if len(data) >= 4*64 && topic == CurveBuyTopic {
 		out["side"] = "buy"
 		out["curveAddress"] = toString(log["address"])
 		out["sender"] = topicAddress(topics, 1)
 		out["recipient"] = topicAddress(topics, 2)
-		out["quoteAmountRaw"] = words[0].String()
-		out["tokenAmountRaw"] = words[1].String()
-		out["quoteInRaw"] = words[0].String()
-		out["tokensOutRaw"] = words[1].String()
+		quote := eventWord(data, 0)
+		tokens := eventWord(data, 1)
+		out["quoteAmountRaw"] = quote.String()
+		out["tokenAmountRaw"] = tokens.String()
+		out["quoteInRaw"] = quote.String()
+		out["tokensOutRaw"] = tokens.String()
 	}
-	if len(words) >= 4 && topic == CurveSellTopic {
+	if len(data) >= 4*64 && topic == CurveSellTopic {
 		out["side"] = "sell"
 		out["curveAddress"] = toString(log["address"])
 		out["sender"] = topicAddress(topics, 1)
 		out["recipient"] = topicAddress(topics, 2)
-		out["tokenAmountRaw"] = words[0].String()
-		out["quoteAmountRaw"] = words[1].String()
-		out["tokensInRaw"] = words[0].String()
-		out["quoteOutRaw"] = words[1].String()
+		tokens := eventWord(data, 0)
+		quote := eventWord(data, 1)
+		out["tokenAmountRaw"] = tokens.String()
+		out["quoteAmountRaw"] = quote.String()
+		out["tokensInRaw"] = tokens.String()
+		out["quoteOutRaw"] = quote.String()
 	}
-	if len(words) >= 6 && topic == V4SwapTopic {
+	if len(data) >= 6*64 && topic == V4SwapTopic {
 		out["side"] = "buy"
 		out["poolId"] = toStringAt(topics, 1)
 		out["sender"] = topicAddress(topics, 2)
 		out["amount0Raw"] = signedWord(data, 0).String()
 		out["amount1Raw"] = signedWord(data, 1).String()
-		out["sqrtPriceX96"] = words[2].String()
-		out["liquidity"] = words[3].String()
+		out["sqrtPriceX96"] = eventWord(data, 2).String()
+		out["liquidity"] = eventWord(data, 3).String()
 		out["tick"] = signedWord(data, 4).String()
-		out["fee"] = words[5].String()
+		out["fee"] = eventWord(data, 5).String()
 	}
 	if tx := toString(log["transactionHash"]); tx != "" {
 		out["sourceEventKey"] = tx + ":" + toString(log["logIndex"])
@@ -70,6 +67,20 @@ func decodeChainEvent(log map[string]any) map[string]any {
 // DecodeChainEvent is used by the bottom-fishing block poller as well as the
 // live WSS subscriber, keeping both transports on exactly the same decoder.
 func DecodeChainEvent(log map[string]any) map[string]any { return decodeChainEvent(log) }
+
+// StrategyEventFilter accepts only decoded swap events. Raw deployment logs
+// remain available to API subscribers but do not consume the trading queue.
+func StrategyEventFilter(event map[string]any) bool {
+	if event == nil {
+		return false
+	}
+	if pool := toString(event["poolId"]); pool != "" {
+		return true
+	}
+	side := strings.ToLower(strings.TrimSpace(toString(event["side"])))
+	return (side == "buy" || side == "sell") && toString(event["curveAddress"]) != ""
+}
+
 func toString(v any) string {
 	if v == nil {
 		return ""
@@ -89,14 +100,27 @@ func topicAddress(topics []any, i int) string {
 	}
 	return "0x" + s[len(s)-40:]
 }
-func signedWord(data string, index int) *big.Int {
+
+func eventWord(data string, index int) *big.Int {
 	if index < 0 || (index+1)*64 > len(data) {
 		return big.NewInt(0)
 	}
-	b, _ := hex.DecodeString(data[index*64 : (index+1)*64])
-	n := new(big.Int).SetBytes(b)
-	if len(b) > 0 && b[0]&0x80 != 0 {
-		n.Sub(n, new(big.Int).Lsh(big.NewInt(1), uint(8*len(b))))
+	n := new(big.Int)
+	if _, ok := n.SetString(data[index*64:(index+1)*64], 16); !ok {
+		return big.NewInt(0)
+	}
+	return n
+}
+
+func signedWord(data string, index int) *big.Int {
+	n := eventWord(data, index)
+	if index >= 0 && (index+1)*64 <= len(data) {
+		first := data[index*64]
+		negative := (first >= '8' && first <= '9') || (first >= 'a' && first <= 'f') || (first >= 'A' && first <= 'F')
+		if !negative {
+			return n
+		}
+		n.Sub(n, new(big.Int).Lsh(big.NewInt(1), 256))
 	}
 	return n
 }

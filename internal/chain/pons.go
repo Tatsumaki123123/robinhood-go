@@ -270,12 +270,16 @@ func (t *Trading) PonsSwap(ctx context.Context, d map[string]any, buy bool) (map
 		return nil, err
 	}
 	from := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
-	nonce, err := t.RPC.Nonce(ctx, from)
+	unlockWallet := t.lockWallet(from)
+	nonce, err := t.reserveNonce(ctx, from, nil)
 	if err != nil {
+		unlockWallet()
 		return nil, err
 	}
 	gasPrice, err := t.gasPrice(ctx)
 	if err != nil {
+		t.invalidateNonce(from)
+		unlockWallet()
 		return nil, err
 	}
 	value := big.NewInt(0)
@@ -285,10 +289,16 @@ func (t *Trading) PonsSwap(ctx context.Context, d map[string]any, buy bool) (map
 	tx := types.NewTx(&types.LegacyTx{Nonce: nonce, To: ptrAddress(curve), Value: value, GasPrice: gasPrice, Gas: 700000, Data: data})
 	signed, err := types.SignTx(tx, types.LatestSignerForChainID(big.NewInt(t.ChainID)), key)
 	if err != nil {
+		t.invalidateNonce(from)
+		unlockWallet()
 		return nil, err
 	}
 	rawTx, _ := signed.MarshalBinary()
 	hash, err := t.RPC.SendRaw(ctx, "0x"+hex.EncodeToString(rawTx))
+	if err != nil {
+		t.invalidateNonce(from)
+	}
+	unlockWallet()
 	if err != nil {
 		return nil, err
 	}

@@ -9,6 +9,7 @@ import (
 	"github.com/gorilla/websocket"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -21,17 +22,65 @@ type RPC struct {
 	HTTP, WS                string
 	id                      uint64
 	client                  *http.Client
+	readLimit               int64
 	Events                  chan map[string]any
 	ingress                 chan map[string]any
 	subMu                   sync.RWMutex
 	subs                    map[chan map[string]any]struct{}
+	strategyFilterMu        sync.RWMutex
+	strategyFilter          func(map[string]any) bool
 	publishedEvents         atomic.Uint64
 	droppedEvents           atomic.Uint64
 	droppedSubscriberEvents atomic.Uint64
+	httpCalls               atomic.Uint64
+	httpErrors              atomic.Uint64
+	httpDurationNs          atomic.Uint64
+	wssConnections          atomic.Uint64
+	wssMessages             atomic.Uint64
+	wssReadErrors           atomic.Uint64
+	wssReconnects           atomic.Uint64
 }
 
+type Options struct {
+	IngressBuffer  int
+	StrategyBuffer int
+	ReadLimit      int64
+}
+
+var wssMessageBufferPool = sync.Pool{New: func() any {
+	return bytes.NewBuffer(make([]byte, 0, 4096))
+}}
+
 func New(httpURL, wsURL string) *RPC {
-	r := &RPC{HTTP: httpURL, WS: wsURL, client: &http.Client{Timeout: 15 * time.Second}, Events: make(chan map[string]any, 8192), ingress: make(chan map[string]any, 32768), subs: make(map[chan map[string]any]struct{})}
+	return NewWithOptions(httpURL, wsURL, Options{})
+}
+
+func NewWithOptions(httpURL, wsURL string, options Options) *RPC {
+	if options.IngressBuffer < 1 {
+		options.IngressBuffer = 32768
+	}
+	if options.StrategyBuffer < 1 {
+		options.StrategyBuffer = 8192
+	}
+	if options.ReadLimit < 64*1024 {
+		options.ReadLimit = 1 << 20
+	}
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   750 * time.Millisecond,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   32,
+		MaxConnsPerHost:       64,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   750 * time.Millisecond,
+		ExpectContinueTimeout: 0,
+		ForceAttemptHTTP2:     true,
+		DisableCompression:    true,
+	}
+	r := &RPC{HTTP: httpURL, WS: wsURL, readLimit: options.ReadLimit, client: &http.Client{Transport: transport, Timeout: 15 * time.Second}, Events: make(chan map[string]any, options.StrategyBuffer), ingress: make(chan map[string]any, options.IngressBuffer), subs: make(map[chan map[string]any]struct{})}
 	// Keep the websocket reader independent from strategy/database latency.
 	// The ingress queue absorbs short bursts and this ordered dispatcher is the
 	// only writer of the public strategy stream, so events cannot overtake one
@@ -65,6 +114,14 @@ func (r *RPC) AddSubscriber(buffer int) (<-chan map[string]any, func()) {
 	}
 }
 
+// SetStrategyFilter keeps non-strategy logs available to API subscribers while
+// preventing deployment/debug noise from consuming the trading queue.
+func (r *RPC) SetStrategyFilter(filter func(map[string]any) bool) {
+	r.strategyFilterMu.Lock()
+	r.strategyFilter = filter
+	r.strategyFilterMu.Unlock()
+}
+
 func (r *RPC) publishEvent(event map[string]any) {
 	if _, ok := event["receivedAt"]; !ok {
 		event["receivedAt"] = time.Now().UTC()
@@ -75,15 +132,19 @@ func (r *RPC) publishEvent(event map[string]any) {
 		// than using New (for example small embedders and replay tools).
 		target = r.Events
 	}
-	select {
-	case target <- event:
-		r.publishedEvents.Add(1)
-	default:
-		// The WSS reader must never block on strategy/database work.  Keep the
-		// channel bounded for latency, but expose overflow so operators can
-		// detect that polling/reconciliation needs to catch up instead of
-		// silently treating a saturated stream as healthy.
-		r.droppedEvents.Add(1)
+	r.strategyFilterMu.RLock()
+	filter := r.strategyFilter
+	r.strategyFilterMu.RUnlock()
+	if filter == nil || filter(event) {
+		select {
+		case target <- event:
+			r.publishedEvents.Add(1)
+		default:
+			// The WSS reader must never block on strategy/database work. Keep the
+			// channel bounded for latency, but expose overflow so operators can
+			// detect that polling/reconciliation needs to catch up.
+			r.droppedEvents.Add(1)
+		}
 	}
 	r.subMu.RLock()
 	defer r.subMu.RUnlock()
@@ -106,6 +167,19 @@ func (r *RPC) DroppedEvents() uint64 { return r.droppedEvents.Load() }
 func (r *RPC) DroppedSubscriberEvents() uint64 { return r.droppedSubscriberEvents.Load() }
 
 func (r *RPC) PublishedEvents() uint64 { return r.publishedEvents.Load() }
+
+func (r *RPC) HTTPMetrics() map[string]any {
+	calls := r.httpCalls.Load()
+	avg := float64(0)
+	if calls > 0 {
+		avg = float64(r.httpDurationNs.Load()) / float64(calls) / 1e6
+	}
+	return map[string]any{"calls": calls, "errors": r.httpErrors.Load(), "avgLatencyMs": avg}
+}
+
+func (r *RPC) WSSMetrics() map[string]any {
+	return map[string]any{"connections": r.wssConnections.Load(), "messages": r.wssMessages.Load(), "readErrors": r.wssReadErrors.Load(), "reconnects": r.wssReconnects.Load()}
+}
 
 func (r *RPC) IngressDepth() int {
 	if r.ingress == nil {
@@ -135,20 +209,34 @@ func (r *RPC) Call(ctx context.Context, method string, params any) (json.RawMess
 	if r.HTTP == "" {
 		return nil, fmt.Errorf("RPC_HTTP_URL is not configured")
 	}
+	r.httpCalls.Add(1)
+	started := time.Now()
+	defer func() { r.httpDurationNs.Add(uint64(time.Since(started))) }()
 	id := atomic.AddUint64(&r.id, 1)
-	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+	body, e := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+	if e != nil {
+		r.httpErrors.Add(1)
+		return nil, e
+	}
 	req, e := http.NewRequestWithContext(ctx, "POST", r.HTTP, bytes.NewReader(body))
 	if e != nil {
+		r.httpErrors.Add(1)
 		return nil, e
 	}
 	req.Header.Set("content-type", "application/json")
 	res, e := r.client.Do(req)
 	if e != nil {
+		r.httpErrors.Add(1)
 		return nil, e
 	}
 	defer res.Body.Close()
-	b, _ := io.ReadAll(res.Body)
+	b, readErr := io.ReadAll(res.Body)
+	if readErr != nil {
+		r.httpErrors.Add(1)
+		return nil, readErr
+	}
 	if res.StatusCode >= 300 {
+		r.httpErrors.Add(1)
 		return nil, fmt.Errorf("rpc status %d: %s", res.StatusCode, b)
 	}
 	var out struct {
@@ -159,9 +247,11 @@ func (r *RPC) Call(ctx context.Context, method string, params any) (json.RawMess
 		} `json:"error"`
 	}
 	if e = json.Unmarshal(b, &out); e != nil {
+		r.httpErrors.Add(1)
 		return nil, e
 	}
 	if out.Error != nil {
+		r.httpErrors.Add(1)
 		return nil, fmt.Errorf("rpc %d: %s", out.Error.Code, out.Error.Message)
 	}
 	return out.Result, nil
@@ -326,20 +416,42 @@ func (r *RPC) Subscribe(ctx context.Context, params map[string]any) {
 		return
 	}
 	go func() {
+		reconnectDelay := 250 * time.Millisecond
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
-			c, _, e := websocket.DefaultDialer.Dial(r.WS, nil)
+			dialer := websocket.Dialer{HandshakeTimeout: 2 * time.Second, ReadBufferSize: 32 * 1024, WriteBufferSize: 4 * 1024, EnableCompression: false}
+			c, _, e := dialer.Dial(r.WS, nil)
 			if e != nil {
+				r.wssReconnects.Add(1)
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(250 * time.Millisecond):
+				case <-time.After(reconnectDelay):
+				}
+				if reconnectDelay < 5*time.Second {
+					reconnectDelay *= 2
 				}
 				continue
+			}
+			r.wssConnections.Add(1)
+			c.SetReadLimit(r.readLimit)
+			connectionStarted := time.Now()
+			waitReconnect := func() bool {
+				if time.Since(connectionStarted) >= 10*time.Second {
+					reconnectDelay = 250 * time.Millisecond
+				} else if reconnectDelay < 5*time.Second {
+					reconnectDelay *= 2
+				}
+				select {
+				case <-ctx.Done():
+					return false
+				case <-time.After(reconnectDelay):
+					return true
+				}
 			}
 			const readTimeout = 90 * time.Second
 			_ = c.SetReadDeadline(time.Now().Add(readTimeout))
@@ -369,26 +481,75 @@ func (r *RPC) Subscribe(ctx context.Context, params map[string]any) {
 					}
 				}
 			}()
-			_ = c.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": []any{"logs", params}})
+			if e = c.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": []any{"logs", params}}); e != nil {
+				r.wssReadErrors.Add(1)
+				r.wssReconnects.Add(1)
+				close(pingDone)
+				close(connDone)
+				_ = c.Close()
+				if !waitReconnect() {
+					return
+				}
+				continue
+			}
 			for {
+				messageType, reader, readErr := c.NextReader()
+				if readErr != nil {
+					r.wssReconnects.Add(1)
+					r.wssReadErrors.Add(1)
+					close(pingDone)
+					close(connDone)
+					_ = c.Close()
+					if !waitReconnect() {
+						return
+					}
+					break
+				}
+				if messageType != websocket.TextMessage {
+					continue
+				}
+				buffer := wssMessageBufferPool.Get().(*bytes.Buffer)
+				buffer.Reset()
+				_, readErr = io.Copy(buffer, reader)
+				if readErr != nil {
+					if buffer.Cap() <= 1<<20 {
+						wssMessageBufferPool.Put(buffer)
+					}
+					r.wssReadErrors.Add(1)
+					r.wssReconnects.Add(1)
+					close(pingDone)
+					close(connDone)
+					_ = c.Close()
+					if !waitReconnect() {
+						return
+					}
+					break
+				}
 				var msg struct {
 					Method string `json:"method"`
 					Params struct {
 						Result map[string]any `json:"result"`
 					} `json:"params"`
 				}
-				if e = c.ReadJSON(&msg); e != nil {
+				if e = json.Unmarshal(buffer.Bytes(), &msg); e != nil {
+					if buffer.Cap() <= 1<<20 {
+						wssMessageBufferPool.Put(buffer)
+					}
+					r.wssReadErrors.Add(1)
+					r.wssReconnects.Add(1)
 					close(pingDone)
 					close(connDone)
 					_ = c.Close()
-					select {
-					case <-ctx.Done():
+					if !waitReconnect() {
 						return
-					case <-time.After(250 * time.Millisecond):
 					}
 					break
 				}
+				if buffer.Cap() <= 1<<20 {
+					wssMessageBufferPool.Put(buffer)
+				}
 				if msg.Method == "eth_subscription" {
+					r.wssMessages.Add(1)
 					msg.Params.Result = decodeChainEvent(msg.Params.Result)
 					r.publishEvent(msg.Params.Result)
 				}

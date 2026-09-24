@@ -5,6 +5,8 @@ The complete endpoint and strategy specification is in
 [`docs/FUNCTIONAL_SPEC.md`](docs/FUNCTIONAL_SPEC.md).
 The accepted BottomFishing configuration example is in
 [`docs/STRATEGY_CONFIG.md`](docs/STRATEGY_CONFIG.md).
+The latency tuning and production runbook is in
+[`docs/OPTIMIZATION.md`](docs/OPTIMIZATION.md).
 
 ```powershell
 Copy-Item .env.example .env

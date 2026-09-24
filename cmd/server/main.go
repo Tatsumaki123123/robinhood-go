@@ -33,13 +33,14 @@ func main() {
 	if err = st.Migrate(ctx); err != nil {
 		log.Fatal("migration", zap.Error(err))
 	}
-	rpc := chain.New(cfg.RPCURL, cfg.RPCWSURL)
+	rpc := chain.NewWithOptions(cfg.RPCURL, cfg.RPCWSURL, chain.Options{IngressBuffer: cfg.WSSIngressBuffer, StrategyBuffer: cfg.WSSStrategyBuffer, ReadLimit: int64(cfg.WSSReadLimitBytes)})
+	rpc.SetStrategyFilter(chain.StrategyEventFilter)
 	rd := redis.NewClient(&redis.Options{Addr: redisAddr(cfg.RedisURL)})
 	fixedGasPrice := chain.ToBig(cfg.FixedGasPriceWei)
 	if fixedGasPrice.Sign() <= 0 {
 		fixedGasPrice = nil
 	}
-	tr := &chain.Trading{RPC: rpc, ChainID: cfg.ChainID, Router: cfg.UniversalRouter, Permit2: cfg.Permit2, FixedGasPrice: fixedGasPrice}
+	tr := &chain.Trading{RPC: rpc, ChainID: cfg.ChainID, Router: cfg.UniversalRouter, Permit2: cfg.Permit2, PoolManager: cfg.PoolManager, FixedGasPrice: fixedGasPrice}
 	app := fiber.New(fiber.Config{AppName: "Robinhood Go", BodyLimit: 32 * 1024 * 1024, ErrorHandler: func(c *fiber.Ctx, e error) error {
 		return c.Status(500).JSON(map[string]any{"statusCode": 500, "message": e.Error()})
 	}})
@@ -59,6 +60,8 @@ func main() {
 	}
 	engine := strategy.New(st, rpc)
 	engine.ConfigureTrading(tr, cfg.EncryptionKey, cfg.NativeUSDPrice)
+	engine.ConfigurePerformance(cfg.StrategyWorkers, cfg.StrategyQueueBuffer, cfg.StrategyShardBacklog)
+	engine.ConfigureEventFilter(cfg.MinEventUSD)
 	engine.ConfigureLogging(log, cfg.Env)
 	service.SetMonitorCacheInvalidator(engine.InvalidateMonitorCache)
 	service.SetStrategyMetrics(engine.Metrics)

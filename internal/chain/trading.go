@@ -18,14 +18,75 @@ import (
 )
 
 type Trading struct {
-	RPC     *RPC
-	ChainID int64
-	Router  string
-	Permit2 string
+	RPC         *RPC
+	ChainID     int64
+	Router      string
+	Permit2     string
+	PoolManager string
 	// FixedGasPrice is an optional EIP-1559 max fee / legacy gas price in wei.
 	// When set, transaction submission skips the gasPrice and base-fee reads.
 	FixedGasPrice *big.Int
 	approvedV4    sync.Map // wallet/token -> approvals confirmed during this process
+	approvalLocks sync.Map // wallet/token -> *sync.Mutex
+	walletLocks   sync.Map // wallet address -> *sync.Mutex
+	nonceCursors  sync.Map // wallet address -> *nonceCursor
+}
+
+type nonceCursor struct {
+	next        uint64
+	initialized bool
+}
+
+func (t *Trading) lockWallet(address string) func() {
+	key := strings.ToLower(strings.TrimSpace(address))
+	mutex := &sync.Mutex{}
+	actual, _ := t.walletLocks.LoadOrStore(key, mutex)
+	locked := actual.(*sync.Mutex)
+	locked.Lock()
+	return locked.Unlock
+}
+
+func (t *Trading) lockApproval(key string) func() {
+	mutex := &sync.Mutex{}
+	actual, _ := t.approvalLocks.LoadOrStore(strings.ToLower(strings.TrimSpace(key)), mutex)
+	locked := actual.(*sync.Mutex)
+	locked.Lock()
+	return locked.Unlock
+}
+
+// reserveNonce serializes nonce allocation per wallet. Explicit nonces are
+// used for replacements; new transactions consume a local cursor and only
+// refresh it from the RPC when the cursor is uninitialized or invalidated.
+func (t *Trading) reserveNonce(ctx context.Context, from string, requested *uint64) (uint64, error) {
+	key := strings.ToLower(strings.TrimSpace(from))
+	state := &nonceCursor{}
+	actual, _ := t.nonceCursors.LoadOrStore(key, state)
+	state = actual.(*nonceCursor)
+	if requested != nil {
+		if !state.initialized || state.next <= *requested {
+			state.next = *requested + 1
+			state.initialized = true
+		}
+		return *requested, nil
+	}
+	if !state.initialized {
+		nonce, err := t.RPC.Nonce(ctx, from)
+		if err != nil {
+			return 0, err
+		}
+		state.next = nonce
+		state.initialized = true
+	}
+	nonce := state.next
+	state.next++
+	return nonce, nil
+}
+
+func (t *Trading) invalidateNonce(from string) {
+	key := strings.ToLower(strings.TrimSpace(from))
+	if value, ok := t.nonceCursors.Load(key); ok {
+		value.(*nonceCursor).initialized = false
+	}
 }
 
 // BroadcastOptions controls a transaction that is submitted but whose receipt
@@ -217,19 +278,28 @@ func (t *Trading) Swap(ctx context.Context, d map[string]any) (map[string]any, e
 		preparedToken = fmt.Sprint(d["currencyIn"])
 	}
 	if preparedToken != "" && preparedToken != "<nil>" && !strings.EqualFold(preparedToken, NativeAddress) && !boolValue(d["wrapNative"]) && !strings.EqualFold(fmt.Sprint(d["side"]), "sell") {
-		if hashes, ae := t.approveV4Max(ctx, key, preparedToken); ae != nil {
-			return nil, ae
-		} else {
-			approvalHashes = hashes
+		approvalKey := strings.ToLower(from) + ":" + strings.ToLower(preparedToken)
+		unlockApproval := t.lockApproval(approvalKey)
+		if _, approved := t.approvedV4.Load(approvalKey); !approved {
+			if hashes, ae := t.approveV4Max(ctx, key, preparedToken); ae != nil {
+				unlockApproval()
+				return nil, ae
+			} else {
+				approvalHashes = hashes
+				t.approvedV4.Store(approvalKey, struct{}{})
+			}
 		}
+		unlockApproval()
 	}
-	nonce := uint64(0)
-	if d["nonce"] == nil {
-		nonce, err = t.RPC.Nonce(ctx, from)
-	} else {
-		nonce = uint64(ToBig(d["nonce"]).Uint64())
+	unlockWallet := t.lockWallet(from)
+	var requestedNonce *uint64
+	if d["nonce"] != nil {
+		n := uint64(ToBig(d["nonce"]).Uint64())
+		requestedNonce = &n
 	}
+	nonce, err := t.reserveNonce(ctx, from, requestedNonce)
 	if err != nil {
+		unlockWallet()
 		return nil, err
 	}
 	value := ToBig(d["value"])
@@ -247,13 +317,18 @@ func (t *Trading) Swap(ctx context.Context, d map[string]any) (map[string]any, e
 		tx := types.NewTx(&types.DynamicFeeTx{ChainID: chainID, Nonce: nonce, To: ptrAddress(to), Value: value, Gas: gas, GasFeeCap: ToBig(d["maxFeePerGas"]), GasTipCap: ToBig(d["maxPriorityFeePerGas"]), Data: data})
 		signed, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), key)
 		if err != nil {
+			t.invalidateNonce(from)
+			unlockWallet()
 			return nil, err
 		}
 		raw, _ := signed.MarshalBinary()
 		hash, err := t.RPC.SendRaw(ctx, "0x"+hex.EncodeToString(raw))
 		if err != nil {
+			t.invalidateNonce(from)
+			unlockWallet()
 			return nil, err
 		}
+		unlockWallet()
 		receipt, re := t.waitReceipt(ctx, hash)
 		if re != nil {
 			return nil, re
@@ -266,20 +341,29 @@ func (t *Trading) Swap(ctx context.Context, d map[string]any) (map[string]any, e
 	}
 	gasPrice := ToBig(d["gasPrice"])
 	if gasPrice.Sign() == 0 {
-		if gp, ge := t.gasPrice(ctx); ge == nil {
-			gasPrice = gp
+		gp, ge := t.gasPrice(ctx)
+		if ge != nil {
+			t.invalidateNonce(from)
+			unlockWallet()
+			return nil, ge
 		}
+		gasPrice = gp
 	}
 	tx := types.NewTx(&types.LegacyTx{Nonce: nonce, To: ptrAddress(to), Value: value, GasPrice: gasPrice, Gas: gas, Data: data})
 	signed, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), key)
 	if err != nil {
+		t.invalidateNonce(from)
+		unlockWallet()
 		return nil, err
 	}
 	raw, _ := signed.MarshalBinary()
 	hash, err := t.RPC.SendRaw(ctx, "0x"+hex.EncodeToString(raw))
 	if err != nil {
+		t.invalidateNonce(from)
+		unlockWallet()
 		return nil, err
 	}
+	unlockWallet()
 	receipt, re := t.waitReceipt(ctx, hash)
 	if re != nil {
 		return nil, re
@@ -311,12 +395,15 @@ func (t *Trading) BroadcastV4(ctx context.Context, d map[string]any, opts Broadc
 	}
 	if inputToken != "" && inputToken != "<nil>" && !strings.EqualFold(inputToken, NativeAddress) && !boolValue(d["wrapNative"]) && !strings.EqualFold(fmt.Sprint(d["side"]), "sell") {
 		approvalKey := strings.ToLower(from) + ":" + strings.ToLower(inputToken)
+		unlockApproval := t.lockApproval(approvalKey)
 		if _, approved := t.approvedV4.Load(approvalKey); !approved {
 			if _, err = t.approveV4Max(ctx, key, inputToken); err != nil {
+				unlockApproval()
 				return BroadcastResult{}, err
 			}
 			t.approvedV4.Store(approvalKey, struct{}{})
 		}
+		unlockApproval()
 	}
 	var prepared map[string]any
 	if d["path"] != nil {
@@ -346,16 +433,16 @@ func (t *Trading) BroadcastV4(ctx context.Context, d map[string]any, opts Broadc
 	if value.Sign() == 0 {
 		value = ToBig(prepared["valueRaw"])
 	}
-	nonce := uint64(0)
-	if opts.Nonce != nil {
-		nonce = *opts.Nonce
-	} else if d["nonce"] != nil {
-		nonce = ToBig(d["nonce"]).Uint64()
-	} else {
-		nonce, err = t.RPC.Nonce(ctx, from)
-		if err != nil {
-			return BroadcastResult{}, err
-		}
+	unlockWallet := t.lockWallet(from)
+	defer unlockWallet()
+	requestedNonce := opts.Nonce
+	if requestedNonce == nil && d["nonce"] != nil {
+		n := ToBig(d["nonce"]).Uint64()
+		requestedNonce = &n
+	}
+	nonce, err := t.reserveNonce(ctx, from, requestedNonce)
+	if err != nil {
+		return BroadcastResult{}, err
 	}
 	gas := opts.Gas
 	if gas == 0 {
@@ -372,6 +459,7 @@ func (t *Trading) BroadcastV4(ctx context.Context, d map[string]any, opts Broadc
 		} else {
 			base, err = t.RPC.GasPrice(ctx)
 			if err != nil {
+				t.invalidateNonce(from)
 				return BroadcastResult{}, err
 			}
 		}
@@ -414,11 +502,13 @@ func (t *Trading) BroadcastV4(ctx context.Context, d map[string]any, opts Broadc
 	tx := types.NewTx(&types.DynamicFeeTx{ChainID: chainID, Nonce: nonce, To: ptrAddress(to), Value: value, Gas: gas, GasFeeCap: base, GasTipCap: tip, Data: data})
 	signed, err := types.SignTx(tx, types.LatestSignerForChainID(chainID), key)
 	if err != nil {
+		t.invalidateNonce(from)
 		return BroadcastResult{}, err
 	}
 	raw, _ := signed.MarshalBinary()
 	hash, err := t.RPC.SendRaw(ctx, "0x"+hex.EncodeToString(raw))
 	if err != nil {
+		t.invalidateNonce(from)
 		return BroadcastResult{}, err
 	}
 	return BroadcastResult{TransactionHash: hash, Nonce: nonce, From: from, MaxFeePerGas: new(big.Int).Set(base), TipPerGas: new(big.Int).Set(tip)}, nil
@@ -472,10 +562,16 @@ func (t *Trading) PrepareV4SellApproval(ctx context.Context, privateKey, token s
 	if err != nil {
 		return fmt.Errorf("invalid privateKey: %w", err)
 	}
+	from := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
+	approvalKey := strings.ToLower(from) + ":" + strings.ToLower(token)
+	unlockApproval := t.lockApproval(approvalKey)
+	defer unlockApproval()
+	if _, approved := t.approvedV4.Load(approvalKey); approved {
+		return nil
+	}
 	_, err = t.approveV4Max(ctx, key, token)
 	if err == nil {
-		from := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
-		t.approvedV4.Store(strings.ToLower(from)+":"+strings.ToLower(token), struct{}{})
+		t.approvedV4.Store(approvalKey, struct{}{})
 	}
 	return err
 }
@@ -488,21 +584,29 @@ func (t *Trading) gasPrice(ctx context.Context) (*big.Int, error) {
 }
 func (t *Trading) sendContract(ctx context.Context, key *ecdsa.PrivateKey, to common.Address, data []byte, value *big.Int) (string, error) {
 	from := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
-	nonce, e := t.RPC.Nonce(ctx, from)
+	unlockWallet := t.lockWallet(from)
+	defer unlockWallet()
+	nonce, e := t.reserveNonce(ctx, from, nil)
 	if e != nil {
 		return "", e
 	}
 	gasPrice, e := t.gasPrice(ctx)
 	if e != nil {
-		gasPrice = big.NewInt(1)
+		t.invalidateNonce(from)
+		return "", e
 	}
 	tx := types.NewTx(&types.LegacyTx{Nonce: nonce, To: &to, Value: value, GasPrice: gasPrice, Gas: 120000, Data: data})
 	signed, e := types.SignTx(tx, types.LatestSignerForChainID(big.NewInt(t.ChainID)), key)
 	if e != nil {
+		t.invalidateNonce(from)
 		return "", e
 	}
 	raw, _ := signed.MarshalBinary()
-	return t.RPC.SendRaw(ctx, "0x"+hex.EncodeToString(raw))
+	hash, e := t.RPC.SendRaw(ctx, "0x"+hex.EncodeToString(raw))
+	if e != nil {
+		t.invalidateNonce(from)
+	}
+	return hash, e
 }
 func (t *Trading) waitReceipt(ctx context.Context, hash string) (any, error) {
 	deadline := time.NewTimer(60 * time.Second)
