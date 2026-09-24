@@ -109,6 +109,13 @@ func (a *API) syncMonitorToken(ctx context.Context, token store.Token) error {
 	}
 	data, _ := detail["data"].(map[string]any)
 	tokenDetail, _ := data["token"].(map[string]any)
+	var extraData map[string]any
+	if extra, extraErr := a.aveJSON(ctx, "/v1api/v2/tokens/"+strings.ToLower(token.TokenAddress)+"-robinhood/extraDetail", nil); extraErr == nil {
+		extraData = extra
+		if nested, ok := extra["data"].(map[string]any); ok {
+			extraData = nested
+		}
+	}
 	pairs, _ := data["pairs"].([]any)
 	for _, raw := range pairs {
 		pair, ok := raw.(map[string]any)
@@ -123,7 +130,7 @@ func (a *API) syncMonitorToken(ctx context.Context, token store.Token) error {
 			!strings.EqualFold(token.QuoteTokenAddress, chain.NativeAddress) {
 			continue
 		}
-		sources := []map[string]any{pair, tokenDetail, data}
+		sources := []map[string]any{pair, extraData, tokenDetail, data}
 		if value := aveStringPtr(sources, "name", "token_name", "tokenName", "name_en", "name_zh"); value != nil {
 			token.Name = value
 		}
@@ -222,13 +229,11 @@ func (a *API) syncMonitorToken(ctx context.Context, token store.Token) error {
 			s := str(value)
 			token.PriceChange24h = &s
 		}
-		if value := pairValue(pair, "buy_tax", "buyTax"); value != nil {
-			s := str(value)
-			token.BuyTax = &s
+		if value := aveTaxSources([]map[string]any{extraData, pair, tokenDetail, data}, "total_buy_tax", "totalBuyTax", "buy_tax", "buyTax", "buy_tax_rate", "buyTaxRate", "buy_tax_percent", "buyTaxPercent"); value != nil {
+			token.BuyTax = value
 		}
-		if value := pairValue(pair, "sell_tax", "sellTax"); value != nil {
-			s := str(value)
-			token.SellTax = &s
+		if value := aveTaxSources([]map[string]any{extraData, pair, tokenDetail, data}, "total_sell_tax", "totalSellTax", "sell_tax", "sellTax", "sell_tax_rate", "sellTaxRate", "sell_tax_percent", "sellTaxPercent"); value != nil {
+			token.SellTax = value
 		}
 		if (token.MarketCap == nil || strings.TrimSpace(*token.MarketCap) == "") && token.TotalSupplyRaw != nil && token.Decimals != nil && token.TokenPriceUsd != nil {
 			token.MarketCap = derivedMarketCapFromSupply(*token.TotalSupplyRaw, *token.Decimals, *token.TokenPriceUsd)

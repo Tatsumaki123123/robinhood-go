@@ -1433,8 +1433,8 @@ func (a *API) startAve(c *fiber.Ctx) error {
 	// the response wrapper so fields such as total/current_price_usd are found.
 	sources := []map[string]any{pair, extraData, tokenDetail, data}
 	taxSources := []map[string]any{extraData, pair, tokenDetail, data}
-	buyTax := aveTaxSources(taxSources, "buy_tax", "buyTax", "buy_tax_rate", "buyTaxRate", "buy_tax_percent", "buyTaxPercent")
-	sellTax := aveTaxSources(taxSources, "sell_tax", "sellTax", "sell_tax_rate", "sellTaxRate", "sell_tax_percent", "sellTaxPercent")
+	buyTax := aveTaxSources(taxSources, "total_buy_tax", "totalBuyTax", "buy_tax", "buyTax", "buy_tax_rate", "buyTaxRate", "buy_tax_percent", "buyTaxPercent")
+	sellTax := aveTaxSources(taxSources, "total_sell_tax", "totalSellTax", "sell_tax", "sellTax", "sell_tax_rate", "sellTaxRate", "sell_tax_percent", "sellTaxPercent")
 	if value := aveValue(sources, "token_name", "tokenName", "name_en", "name_zh", "name"); str(d["tokenName"]) == "" && value != nil {
 		d["tokenName"] = value
 	}
