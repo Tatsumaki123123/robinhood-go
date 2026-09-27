@@ -131,6 +131,9 @@ func (a *API) Register(app *fiber.App) {
 	files.Post("/upload-multiple", a.fileUploadMultiple)
 	g.Get("/logger", a.logs)
 	app.Get("/ws", websocket.New(a.ws))
+	// Execute endpoints use their own Robinhood-specific namespace so they do
+	// not share the monitor or legacy chain route prefixes.
+	a.executeRegisterRoutes(app)
 }
 func body(c *fiber.Ctx) map[string]any {
 	var v map[string]any

@@ -576,6 +576,92 @@ func (t *Trading) PrepareV4SellApproval(ctx context.Context, privateKey, token s
 	return err
 }
 
+// SendNative transfers the Robinhood native asset from a locally controlled
+// EVM wallet and waits for the receipt.  Execute workflow funding/recycling
+// uses this helper so nonce serialization and the configured gas policy stay
+// identical to V4 swaps.
+func (t *Trading) SendNative(ctx context.Context, privateKey, to string, amount *big.Int) (map[string]any, error) {
+	keyText := strings.TrimPrefix(strings.TrimSpace(privateKey), "0x")
+	if keyText == "" || !common.IsHexAddress(to) {
+		return nil, fmt.Errorf("privateKey and a valid destination are required")
+	}
+	if amount == nil || amount.Sign() <= 0 {
+		return nil, fmt.Errorf("native transfer amount must be positive")
+	}
+	key, err := gethcrypto.HexToECDSA(keyText)
+	if err != nil {
+		return nil, fmt.Errorf("invalid privateKey: %w", err)
+	}
+	from := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
+	unlock := t.lockWallet(from)
+	defer unlock()
+	nonce, err := t.reserveNonce(ctx, from, nil)
+	if err != nil {
+		return nil, err
+	}
+	gasPrice, err := t.gasPrice(ctx)
+	if err != nil {
+		t.invalidateNonce(from)
+		return nil, err
+	}
+	gas := uint64(21000)
+	tx := types.NewTx(&types.LegacyTx{Nonce: nonce, To: ptrAddress(to), Value: new(big.Int).Set(amount), GasPrice: gasPrice, Gas: gas})
+	signed, err := types.SignTx(tx, types.LatestSignerForChainID(big.NewInt(t.ChainID)), key)
+	if err != nil {
+		t.invalidateNonce(from)
+		return nil, err
+	}
+	raw, err := signed.MarshalBinary()
+	if err != nil {
+		t.invalidateNonce(from)
+		return nil, err
+	}
+	hash, err := t.RPC.SendRaw(ctx, "0x"+hex.EncodeToString(raw))
+	if err != nil {
+		t.invalidateNonce(from)
+		return nil, err
+	}
+	receipt, err := t.waitReceipt(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"mode": "live", "status": "confirmed", "transactionHash": hash, "hash": hash, "from": strings.ToLower(from), "to": strings.ToLower(to), "nonce": nonce, "amountRaw": amount.String(), "receipt": receipt}, nil
+}
+
+// SendNativeAll leaves enough native currency to pay the transfer gas and
+// sends the remainder.  It is deliberately explicit about the amount so a
+// caller can use a fixed amount when a wallet must retain a reserve.
+func (t *Trading) SendNativeAll(ctx context.Context, privateKey, to string) (map[string]any, error) {
+	keyText := strings.TrimPrefix(strings.TrimSpace(privateKey), "0x")
+	key, err := gethcrypto.HexToECDSA(keyText)
+	if err != nil {
+		return nil, fmt.Errorf("invalid privateKey: %w", err)
+	}
+	from := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
+	balanceHex, err := t.RPC.Balance(ctx, from)
+	if err != nil {
+		return nil, err
+	}
+	balance := new(big.Int)
+	if strings.HasPrefix(balanceHex, "0x") {
+		if _, ok := balance.SetString(balanceHex[2:], 16); !ok {
+			return nil, fmt.Errorf("invalid native balance")
+		}
+	} else if _, ok := balance.SetString(balanceHex, 10); !ok {
+		return nil, fmt.Errorf("invalid native balance")
+	}
+	gasPrice, err := t.gasPrice(ctx)
+	if err != nil {
+		return nil, err
+	}
+	gasCost := new(big.Int).Mul(gasPrice, big.NewInt(21000))
+	amount := new(big.Int).Sub(balance, gasCost)
+	if amount.Sign() <= 0 {
+		return nil, fmt.Errorf("wallet balance is not enough to pay transfer gas")
+	}
+	return t.SendNative(ctx, privateKey, to, amount)
+}
+
 func (t *Trading) gasPrice(ctx context.Context) (*big.Int, error) {
 	if t.FixedGasPrice != nil && t.FixedGasPrice.Sign() > 0 {
 		return new(big.Int).Set(t.FixedGasPrice), nil

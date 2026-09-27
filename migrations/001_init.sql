@@ -29,3 +29,89 @@ CREATE INDEX IF NOT EXISTS strategy_sell_failures_position_idx ON strategy_sell_
 CREATE TABLE IF NOT EXISTS pending_buys (id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, token_address TEXT NOT NULL, curve_address TEXT NOT NULL, transaction_hash TEXT NOT NULL, nonce BIGINT NOT NULL, quote_in_raw TEXT NOT NULL, amount_out_minimum_raw TEXT NOT NULL, route_json JSONB, source_event_key TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', replacement_count INT NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE(user_id,token_address,curve_address));
 CREATE TABLE IF NOT EXISTS files (id BIGSERIAL PRIMARY KEY, filename TEXT NOT NULL, original_name TEXT NOT NULL, mime_type TEXT NOT NULL, size BIGINT NOT NULL, driver TEXT NOT NULL, path TEXT NOT NULL, url TEXT, is_public BOOLEAN NOT NULL DEFAULT false, deleted_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS app_logs (id BIGSERIAL PRIMARY KEY, level TEXT NOT NULL, message TEXT NOT NULL, context JSONB, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+
+-- Execute workflow tables.  A line is a reusable execution configuration,
+-- while a batch (eid) isolates the wallets and token jobs for one run.
+CREATE TABLE IF NOT EXISTS execute_lines (
+    line_id BIGINT PRIMARY KEY,
+    user_id BIGINT,
+    name TEXT NOT NULL DEFAULT '',
+    config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    boss_address TEXT,
+    boss_private_key_encrypted TEXT,
+    enabled BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS execute_lines_user_idx ON execute_lines(user_id, enabled);
+ALTER TABLE execute_lines DROP CONSTRAINT IF EXISTS execute_lines_user_id_fkey;
+ALTER TABLE execute_lines ALTER COLUMN user_id DROP NOT NULL;
+ALTER TABLE execute_lines ADD COLUMN IF NOT EXISTS boss_address TEXT;
+ALTER TABLE execute_lines ADD COLUMN IF NOT EXISTS boss_private_key_encrypted TEXT;
+CREATE TABLE IF NOT EXISTS execute_batches (
+    eid BIGSERIAL PRIMARY KEY,
+    line_id BIGINT NOT NULL REFERENCES execute_lines(line_id) ON DELETE CASCADE,
+    active BOOLEAN NOT NULL DEFAULT true,
+    boss_address TEXT NOT NULL,
+    private_key_encrypted TEXT NOT NULL,
+    wallets_exist BOOLEAN NOT NULL DEFAULT false,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS execute_batches_active_line_idx ON execute_batches(line_id) WHERE active = true;
+CREATE TABLE IF NOT EXISTS execute_wallets (
+    id BIGSERIAL PRIMARY KEY,
+    eid BIGINT NOT NULL REFERENCES execute_batches(eid) ON DELETE CASCADE,
+    wallet_index INT NOT NULL,
+    address TEXT NOT NULL,
+    private_key_encrypted TEXT NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(eid, address)
+);
+CREATE INDEX IF NOT EXISTS execute_wallets_active_idx ON execute_wallets(eid, active, wallet_index);
+-- A replaced wallet keeps its original index for audit and token-balance
+-- recovery, so only the active flag identifies the current wallet.
+ALTER TABLE execute_wallets DROP CONSTRAINT IF EXISTS execute_wallets_eid_wallet_index_key;
+CREATE TABLE IF NOT EXISTS execute_tokens (
+    tid BIGSERIAL PRIMARY KEY,
+    eid BIGINT NOT NULL REFERENCES execute_batches(eid) ON DELETE CASCADE,
+    line_id BIGINT NOT NULL REFERENCES execute_lines(line_id) ON DELETE CASCADE,
+    token_address TEXT NOT NULL,
+    pool_id TEXT NOT NULL,
+    quote_token_address TEXT NOT NULL,
+    currency0 TEXT NOT NULL,
+    currency1 TEXT NOT NULL,
+    fee INT NOT NULL,
+    tick_spacing INT NOT NULL,
+    hooks TEXT NOT NULL,
+    route_buy JSONB NOT NULL DEFAULT '[]'::jsonb,
+    route_sell JSONB NOT NULL DEFAULT '[]'::jsonb,
+    amm TEXT NOT NULL DEFAULT 'uniswapv4',
+    status TEXT NOT NULL DEFAULT 'pending',
+    buy_status TEXT NOT NULL DEFAULT '',
+    buy_start_time TIMESTAMPTZ,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(eid, token_address, pool_id)
+);
+CREATE INDEX IF NOT EXISTS execute_tokens_batch_status_idx ON execute_tokens(eid, status, updated_at);
+CREATE TABLE IF NOT EXISTS execute_trades (
+    id BIGSERIAL PRIMARY KEY,
+    tid BIGINT NOT NULL REFERENCES execute_tokens(tid) ON DELETE CASCADE,
+    eid BIGINT NOT NULL REFERENCES execute_batches(eid) ON DELETE CASCADE,
+    wallet_address TEXT NOT NULL,
+    side TEXT NOT NULL,
+    stage TEXT NOT NULL DEFAULT '',
+    amount_in_raw TEXT NOT NULL,
+    amount_out_minimum_raw TEXT NOT NULL DEFAULT '0',
+    transaction_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS execute_trades_tid_idx ON execute_trades(tid, created_at DESC);

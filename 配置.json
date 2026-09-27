@@ -1,0 +1,87 @@
+{
+  "name": "user-111",
+  "minMcp": 30000,
+  "slippage": 0.2,
+  "diffBuySecond": 0,
+  "maxLossBuyTimes": 3,
+  "minLossBuyRatio": 0.05,
+  "replacePending": true,
+  "pendingBuyTimeoutSecond": 2,
+  "sellPolicy": {
+    "fullSellAfterSellCount": 5,
+    "resetSellCountOnBuy": true
+  },
+  "scheduledSell": {
+    "enabled": true,
+    "intervalSecond": 1250,
+    "sellRatio": 0.2,
+    "baseUSD": 150,
+    "resetOnBuy": false
+  },
+  "externalBuySell": {
+    "enabled": true,
+    "minBuyUSD": 100,
+    "buyImpactRatio": 0.075,
+    "needProfit": true,
+    "profitRatio": 0.05,
+    "sellRatio": 1,
+    "buyAmountRatio": 0.01,
+    "cooldownSecond": 30
+  },
+  "profitSell": {
+    "enabled": true,
+    "resetOnBuy": true,
+    "levels": [
+      {
+        "profitRatio": 0.05,
+        "sellRatio": 0.2
+      },
+      {
+        "profitRatio": 0.1,
+        "sellRatio": 0.25
+      },
+      {
+        "profitRatio": 0.2,
+        "sellRatio": 0.3
+      },
+      {
+        "profitRatio": 0.3,
+        "sellRatio": 1
+      }
+    ]
+  },
+  "lossSell": {
+    "enabled": true,
+    "triggerRatio": 0.3,
+    "sellAll": true
+  },
+  "tokenConfig": [
+    {
+      "maxMcp": 500000,
+      "buyUSD": 0,
+      "buyRatio": 0.01,
+      "minSellRatio": 0.15
+    },
+    {
+      "maxMcp": 2000000,
+      "buyUSD": 0,
+      "buyRatio": 0.01,
+      "minSellRatio": 0.1
+    },
+    {
+      "maxMcp": 5000000,
+      "buyUSD": 0,
+      "buyRatio": 0.01,
+      "minSellRatio": 0.075
+    }
+  ],
+  "listConfig": {
+    "maxMcp": 10000000,
+    "minMcp": 50000,
+    "source": "ave",
+    "category": "pons_out_hot",
+    "createDay": 30,
+    "from": "list",
+    "userAddress": "0xc87b51c71707cfdd08cd374a596a6946cb1d6a66"
+  }
+}

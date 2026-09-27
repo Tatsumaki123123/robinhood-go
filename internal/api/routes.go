@@ -145,7 +145,8 @@ func pairNumber(pair map[string]any, keys ...string) (int64, bool) {
 
 func isV4Pair(pair map[string]any) bool {
 	amm := strings.ToLower(fmt.Sprint(pairValue(pair, "amm")))
-	return amm == "v4" || amm == "uniswapv4" || strings.Contains(amm, "uniswap_v4")
+	amm = strings.NewReplacer("-", "", "_", "", " ", "").Replace(amm)
+	return amm == "v4" || strings.Contains(amm, "uniswapv4")
 }
 
 func pairMatches(pair map[string]any, left, right string) bool {
