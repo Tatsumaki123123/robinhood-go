@@ -125,7 +125,7 @@ POST /api/v1/executerobin/updateLineData
 说明：
 
 - `data` 可以是对象，也可以是 JSON 字符串。
-- `walletConfig`、`walletCount`、`withdrawAddress`、`autoSwap`、`name` 等字段也可以直接放在请求顶层。
+- `walletConfig`、`walletCount`、`autoSwap`、`name` 等字段也可以直接放在请求顶层。修改 `withdrawAddress` 时必须同时传入 `password`，且密码必须匹配 `ROBINHOOD_MONITOR_PRIVATE_KEY_EXPORT_PASSWORD`；也可以使用专用的 `updateWithdrawAddress` 接口。
 - 创建线路时会自动生成 boss；也可以传 `bossPrivateKey` 导入已有 boss。私钥会加密保存，不会出现在响应中。
 
 返回 `line`、`name`、`config`、`bossAddress`、`enabled` 和时间字段。
@@ -142,7 +142,7 @@ POST /api/v1/executerobin/addLine
 { "name": "Line 2" }
 ```
 
-服务会自动分配 `lineId`，生成第一条 active boss 批次，并返回 `line`、`eid` 和 `bossAddress`。boss 私钥只会加密保存。
+服务会自动分配 `lineId`，按默认线路配置生成第一条 active boss 批次，并返回 `line`、`eid` 和 `bossAddress`。默认配置使用 `sourceWeb: "ave"`、`minFollowStates: 2`、`maxBuyTax: 1.5` 和 `groupSort` 的新池筛选条件；boss 私钥只会加密保存。
 
 ### 3.3 查询线路
 
@@ -152,7 +152,23 @@ POST /api/v1/executerobin/getLines
 
 请求体可以为空。返回线路数组，线路列表不会返回 boss 私钥。
 
-### 3.4 删除线路
+### 3.4 修改线路提现地址
+
+```http
+POST /api/v1/executerobin/updateWithdrawAddress
+```
+
+```json
+{
+  "lineId": 1001,
+  "withdrawAddress": "0x1111111111111111111111111111111111111111",
+  "password": "your-export-password"
+}
+```
+
+`password` 必须匹配 `ROBINHOOD_MONITOR_PRIVATE_KEY_EXPORT_PASSWORD`。也可以使用兼容路径 `/api/v1/executerobin/updateLineWithdrawAddress`。
+
+### 3.5 删除线路
 
 ```http
 POST /api/v1/executerobin/deleteLine
@@ -167,7 +183,7 @@ POST /api/v1/executerobin/deleteLine
 
 密码必须匹配服务端配置的 `ROBINHOOD_MONITOR_PRIVATE_KEY_EXPORT_PASSWORD`。删除前会检查线路 boss 和当前活动批次的 active 执行钱包原生币余额；任一余额大于 0 时返回失败。删除成功后会级联删除该线路的批次、钱包和 token。
 
-### 3.5 启动执行批次
+### 3.6 启动执行批次
 
 ```http
 POST /api/v1/executerobin/start
@@ -190,7 +206,7 @@ POST /api/v1/executerobin/start
 }
 ```
 
-### 3.4 生成执行钱包
+### 3.7 生成执行钱包
 
 ```http
 POST /api/v1/executerobin/generateWallets
@@ -202,7 +218,7 @@ POST /api/v1/executerobin/generateWallets
 
 也可以传 `{ "eid": 1 }`。钱包数量为 `max(walletCount, walletConfig.length, 1)`。每个钱包生成独立私钥并由 boss 按 `transferAmount` 充值。重复调用时，余额为 0 的 active 钱包可以再次补款。
 
-### 3.5 结束批次并回收钱包余额
+### 3.8 结束批次并回收钱包余额
 
 ```http
 POST /api/v1/executerobin/end
@@ -214,7 +230,7 @@ POST /api/v1/executerobin/end
 
 或者传 `{ "line": 1001 }`。接口会把执行钱包的剩余原生币扣除转账 gas 后归集到 boss，返回 `eid` 和 `recycled` 交易结果数组。
 
-### 3.6 boss 提现
+### 3.9 boss 提现
 
 ```http
 POST /api/v1/executerobin/withdraw
@@ -322,7 +338,7 @@ POST /api/v1/executerobin/checkToken
 
 可选字段：`poolId`、`routeBuy`、`routeSell`、`tokenName`、`tokenSymbol`、`quoteTokenSymbol`、`forceCheck`。
 
-服务会重新计算并校验 PoolId，检查 PoolKey 地址和 route hop 是否连接。没有显式 route 时，会尝试发现 native ETH 到目标 token 的 1--3 跳 V4 路由。成功返回的 `data` 是 ExecuteToken，包含 `tid`、`eid`、`poolId`、`routeBuy`、`routeSell`、`status` 等字段。
+服务会重新计算并校验 PoolId，检查 PoolKey 地址和 route hop 是否连接。没有显式 route 时，会尝试发现 native ETH 到目标 token 的 1--3 跳 V4 路由。线路配置中的 `maxBuyTax` 会校验 AVE 的 `total_buy_tax`，`minFollowStates` 会校验 AVE 关注聚合数据中的 `all`，`lineBots` 会统计这些 EVM 地址的 ERC-20 持仓；规则不满足时不会创建 token 任务。成功返回的 `data` 是 ExecuteToken，包含 `tid`、`eid`、`poolId`、`routeBuy`、`routeSell`、`status` 等字段。
 
 默认情况下，如果其他 eid 已经在买入同一 token，会返回冲突错误；确需重新检查时传 `forceCheck: true`。
 

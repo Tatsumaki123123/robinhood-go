@@ -20,6 +20,7 @@ updateLineData -> start -> generateWallets -> checkToken -> buyToken
 | 接口 | 请求重点 | 作用 |
 | --- | --- | --- |
 | `POST /api/v1/executerobin/updateLineData` | `line,data` | 创建或更新独立线路；`data` 可为对象或 JSON 字符串，常用字段是 `walletConfig`、`walletCount`、`withdrawAddress`。可选 `bossPrivateKey` 用于导入已有 boss |
+| `POST /api/v1/executerobin/updateWithdrawAddress` | `lineId,withdrawAddress,password` | 修改线路提现地址；密码必须匹配私钥导出密码 |
 | `POST /api/v1/executerobin/addLine` | `name`（可选） | 自动分配下一个 lineId，创建线路和第一条 active boss 批次 |
 | `POST /api/v1/executerobin/deleteLine` | `lineId,password` | 删除线路；boss 或活动批次的 active 钱包仍有原生币余额时拒绝删除 |
 | `POST /api/v1/executerobin/start` | `line` | 校验线路钱包并创建活动 `eid`；上一批执行钱包仍有余额时拒绝切换 |

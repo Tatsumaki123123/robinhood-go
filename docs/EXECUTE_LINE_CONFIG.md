@@ -91,9 +91,11 @@ POST /api/v1/executerobin/updateLineData
 }
 ```
 
-`data` 可以传对象，也可以传 JSON 字符串。顶层字段 `walletConfig`、`walletCount`、`withdrawAddress`、`autoSwap`、`name`、`enabled` 也会合并到线路配置中。
+`data` 可以传对象，也可以传 JSON 字符串。顶层字段 `walletConfig`、`walletCount`、`withdrawAddress`、`autoSwap`、`name`、`sourceWeb`、`groupSort`、`minFollowStates`、`maxBuyTax`、`lineBots`、`enabled` 也会合并到线路配置中。
 
-如果配置 `sourceWeb: "ave"`，`POST /api/v1/executerobin/tokenList` 会按 `groupSort.category`、`groupSort.mcp_min`、`groupSort.mcp_max`、`groupSort.create_day` 从 Robinhood AVE 获取 Uniswap V4 候选池，并排除当前批次已买入或已卖出的 token；未配置时只返回当前批次已保存的 execute token。
+新建线路默认使用 AVE，默认 `walletConfig` 为一个钱包（`buyAmount=0.001`、`transferAmount=0.01`），并设置 `minFollowStates=2`、`maxBuyTax=1.5`、空的 `lineBots`。默认 `groupSort` 为 `sort_field=created_at`、`sort_order=desc`、`mcp_min=10000`、`mcp_max=50000`、`create_day=1`、`create_day_end=0`、`category=pump_out_new`、`duration=6`、空的 `address`。
+
+如果配置 `sourceWeb: "ave"`，`POST /api/v1/executerobin/tokenList` 会按 `groupSort.category`、`sort_field`、`sort_order`、`mcp_min`、`mcp_max`、`create_day`、`create_day_end`、可选的 `holder_min` 和分页字段从 Robinhood AVE 获取 Uniswap V4 候选池，并排除当前批次已买入或已卖出的 token；未配置时只返回当前批次已保存的 execute token。
 
 ### 2.2 导入已有 boss
 

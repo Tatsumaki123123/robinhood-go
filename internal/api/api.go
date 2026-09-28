@@ -89,6 +89,9 @@ func (a *API) Register(app *fiber.App) {
 	g.Get("/chain/pons-v2/deployments", a.deploymentsList)
 	g.Get("/chain/pons-v2/swaps", a.swapsList)
 	g.Get("/chain/pons-v2/deployments/:hash", a.deploymentGet)
+	appData := g.Group("/appdata")
+	appData.Post("/getXAuth", a.appDataGetXAuth)
+	appData.Post("/updateXAuth", a.appDataUpdateXAuth)
 	b := g.Group("/chain/bottom-fishing")
 	b.Post("/ave/getConfig", a.aveGetConfig)
 	b.Post("/ave/updateConfig", a.aveUpdateConfig)
@@ -317,6 +320,32 @@ func (a *API) aveUpdateConfig(c *fiber.Ctx) error {
 		return a.fail(c, e)
 	}
 	return a.ok(c, map[string]any{"id": 1, "xAuth": x})
+}
+
+func (a *API) appDataGetXAuth(c *fiber.Ctx) error {
+	x, err := a.aveAuth(c.Context())
+	if err != nil {
+		return a.fail(c, err)
+	}
+	return a.ok(c, map[string]any{"X_AUTH": x})
+}
+
+func (a *API) appDataUpdateXAuth(c *fiber.Ctx) error {
+	d := body(c)
+	raw, ok := d["X_AUTH"]
+	if !ok {
+		raw = d["xAuth"]
+	}
+	x, ok := raw.(string)
+	if !ok || strings.TrimSpace(x) == "" {
+		return httpx.Error(c, 400, "X_AUTH is required")
+	}
+	a.aveAuthMu.Lock()
+	defer a.aveAuthMu.Unlock()
+	if err := a.saveAveAuth(c.Context(), strings.TrimSpace(x)); err != nil {
+		return a.fail(c, err)
+	}
+	return a.ok(c, true)
 }
 func (a *API) userList(c *fiber.Ctx) error {
 	u, e := a.Store.Users(c.Context())

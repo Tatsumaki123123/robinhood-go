@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"strconv"
 	"strings"
@@ -154,6 +155,41 @@ func executeConfigItems(cfg map[string]any) []map[string]any {
 	return result
 }
 
+func defaultExecuteLineConfig(name string) map[string]any {
+	return map[string]any{
+		"autoSwap": false,
+		"name":     name,
+		"walletConfig": []any{
+			map[string]any{
+				"firstBuy": map[string]any{
+					"buyAmount": 0.001,
+					"enable":    true,
+				},
+				"firstSell": map[string]any{
+					"enable":    true,
+					"sellRatio": 1,
+				},
+				"transferAmount": 0.01,
+			},
+		},
+		"sourceWeb": "ave",
+		"groupSort": map[string]any{
+			"sort_field":     "created_at",
+			"sort_order":     "desc",
+			"mcp_min":        10000,
+			"mcp_max":        50000,
+			"create_day":     1,
+			"create_day_end": 0,
+			"category":       "pump_out_new",
+			"address":        []any{},
+			"duration":       6,
+		},
+		"minFollowStates": 2,
+		"maxBuyTax":       1.5,
+		"lineBots":        []any{},
+	}
+}
+
 func executeConfigBuyAmount(item map[string]any, stage string) (*big.Int, bool) {
 	stage = executeBuyStage(stage)
 	if item == nil || stage == "" || stage == "all" {
@@ -238,13 +274,17 @@ func (a *API) executeLineUpdate(c *fiber.Ctx) error {
 		for k, v := range line.Config {
 			cfg[k] = v
 		}
+	} else {
+		cfg = defaultExecuteLineConfig(fmt.Sprintf("Line %d", lineID))
 	}
+	withdrawAddressRequested := false
 	if raw, ok := d["data"]; ok {
 		switch value := raw.(type) {
 		case map[string]any:
 			for k, v := range value {
 				cfg[k] = v
 			}
+			_, withdrawAddressRequested = value["withdrawAddress"]
 		case string:
 			var parsed map[string]any
 			if err := json.Unmarshal([]byte(value), &parsed); err != nil {
@@ -253,12 +293,26 @@ func (a *API) executeLineUpdate(c *fiber.Ctx) error {
 			for k, v := range parsed {
 				cfg[k] = v
 			}
+			_, withdrawAddressRequested = parsed["withdrawAddress"]
 		}
 	}
-	for _, key := range []string{"walletConfig", "walletCount", "withdrawAddress", "autoSwap", "name"} {
+	for _, key := range []string{"walletConfig", "walletCount", "withdrawAddress", "autoSwap", "name", "sourceWeb", "groupSort", "minFollowStates", "maxBuyTax", "lineBots"} {
 		if value, ok := d[key]; ok {
 			cfg[key] = value
+			if key == "withdrawAddress" {
+				withdrawAddressRequested = true
+			}
 		}
+	}
+	if withdrawAddressRequested {
+		if str(d["password"]) != a.Cfg.ExportPassword {
+			return httpx.Error(c, 400, "invalid password")
+		}
+		address := low(str(cfg["withdrawAddress"]))
+		if !common.IsHexAddress(address) || address == executeZeroCurve {
+			return httpx.Error(c, 400, "withdrawAddress must be a valid non-zero EVM address")
+		}
+		cfg["withdrawAddress"] = address
 	}
 	enabled := true
 	if hasLine {
@@ -270,6 +324,12 @@ func (a *API) executeLineUpdate(c *fiber.Ctx) error {
 	name := str(d["name"])
 	if name == "" && hasLine {
 		name = line.Name
+	}
+	if name == "" {
+		name = str(cfg["name"])
+	}
+	if name != "" {
+		cfg["name"] = name
 	}
 	bossAddress, bossPrivateKey := "", ""
 	if hasLine {
@@ -328,6 +388,113 @@ func (a *API) executeLines(c *fiber.Ctx) error {
 	return a.ok(c, lines)
 }
 
+func executeFloatValue(v any) (float64, bool) {
+	text := strings.TrimSpace(str(v))
+	if text == "" {
+		return 0, false
+	}
+	value, err := strconv.ParseFloat(text, 64)
+	return value, err == nil && !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func executeLineBotAddresses(raw any) ([]string, error) {
+	addresses := []string{}
+	appendBot := func(item map[string]any) error {
+		address := low(str(item["address"]))
+		if !common.IsHexAddress(address) || address == executeZeroCurve {
+			return fmt.Errorf("lineBots contains an invalid EVM address")
+		}
+		addresses = append(addresses, address)
+		return nil
+	}
+	switch items := raw.(type) {
+	case []any:
+		for _, item := range items {
+			bot, ok := item.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("lineBots must contain objects")
+			}
+			if err := appendBot(bot); err != nil {
+				return nil, err
+			}
+		}
+	case []map[string]any:
+		for _, bot := range items {
+			if err := appendBot(bot); err != nil {
+				return nil, err
+			}
+		}
+	case nil:
+	default:
+		return nil, fmt.Errorf("lineBots must be an array")
+	}
+	return addresses, nil
+}
+
+func (a *API) executeCheckLineBotBalance(ctx context.Context, line store.ExecuteLine, token string) error {
+	addresses, err := executeLineBotAddresses(line.Config["lineBots"])
+	if err != nil {
+		return err
+	}
+	if len(addresses) == 0 {
+		return nil
+	}
+	decimals, err := a.RPC.ERC20Decimals(ctx, token)
+	if err != nil {
+		return fmt.Errorf("read line bot token decimals: %w", err)
+	}
+	total := big.NewInt(0)
+	for _, address := range addresses {
+		balance, balanceErr := a.RPC.ERC20Balance(ctx, token, address)
+		if balanceErr != nil {
+			return fmt.Errorf("read line bot token balance: %w", balanceErr)
+		}
+		total.Add(total, balance)
+	}
+	threshold := new(big.Int).Mul(big.NewInt(1000), new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil))
+	if total.Cmp(threshold) > 0 {
+		return fmt.Errorf("line bots hold more than 1000 tokens")
+	}
+	return nil
+}
+
+func aveNestedData(payload map[string]any) map[string]any {
+	if nested, ok := payload["data"].(map[string]any); ok {
+		return nested
+	}
+	return payload
+}
+
+func (a *API) executeCheckTokenRules(ctx context.Context, line store.ExecuteLine, token string) error {
+	if maxBuyTax, configured := executeFloatValue(line.Config["maxBuyTax"]); configured {
+		extra, err := a.aveJSON(ctx, "/v1api/v2/tokens/"+token+"-robinhood/extraDetail", nil)
+		if err != nil {
+			return err
+		}
+		tax, ok := executeFloatValue(aveNestedData(extra)["total_buy_tax"])
+		if !ok {
+			return fmt.Errorf("cannot get token buy tax by AVE")
+		}
+		if tax > maxBuyTax {
+			return fmt.Errorf("buy tax %v exceeds maxBuyTax %v", tax, maxBuyTax)
+		}
+	}
+	if minFollowStates, configured := executeFloatValue(line.Config["minFollowStates"]); configured && minFollowStates > 0 {
+		follow, err := a.aveJSON(ctx, "/v1api/v3/stats/follows/aggregatestates", map[string]string{"token_id": token + "-robinhood"})
+		if err != nil {
+			return err
+		}
+		followCount, ok := executeFloatValue(aveNestedData(follow)["all"])
+		if !ok {
+			return fmt.Errorf("cannot get token follow states by AVE")
+		}
+		if followCount <= minFollowStates {
+			return fmt.Errorf("token follow states %v do not exceed minFollowStates %v", followCount, minFollowStates)
+		}
+	}
+	return nil
+}
+
 func (a *API) executeAddLine(c *fiber.Ctx) error {
 	executeMu.Lock()
 	defer executeMu.Unlock()
@@ -353,7 +520,7 @@ func (a *API) executeAddLine(c *fiber.Ctx) error {
 	if err != nil {
 		return a.fail(c, err)
 	}
-	updated, err := a.Store.UpsertExecuteLine(c.Context(), lineID, 0, name, map[string]any{"name": name}, true, address, encrypted)
+	updated, err := a.Store.UpsertExecuteLine(c.Context(), lineID, 0, name, defaultExecuteLineConfig(name), true, address, encrypted)
 	if err != nil {
 		return a.fail(c, err)
 	}
@@ -788,6 +955,9 @@ func (a *API) executeCheckToken(c *fiber.Ctx) error {
 		if _, activeErr := a.Store.ActiveExecuteTokenByAddress(c.Context(), batch.EID, target); activeErr == nil {
 			return httpx.Error(c, 409, "another execute batch is already buying this token")
 		}
+		if botErr := a.executeCheckLineBotBalance(c.Context(), line, target); botErr != nil {
+			return a.fail(c, botErr)
+		}
 	}
 	targetHop, pair, err := a.resolveExecutePool(c.Context(), target, d)
 	if err != nil {
@@ -825,6 +995,9 @@ func (a *API) executeCheckToken(c *fiber.Ctx) error {
 	}
 	if err := validateExecuteRoute(sellHops); err != nil {
 		return a.fail(c, err)
+	}
+	if ruleErr := a.executeCheckTokenRules(c.Context(), line, target); ruleErr != nil {
+		return a.fail(c, ruleErr)
 	}
 	metadata := map[string]any{"name": str(d["tokenName"]), "symbol": str(d["tokenSymbol"]), "pair": pair}
 	if metadata["name"] == "" {
@@ -1240,13 +1413,21 @@ func (a *API) executeAveTokenList(ctx context.Context, line store.ExecuteLine, e
 	if category == "" {
 		category = "pons_out_hot"
 	}
+	sortField := str(group["sort_field"])
+	if sortField == "" {
+		sortField = "created_at"
+	}
+	sortOrder := str(group["sort_order"])
+	if sortOrder == "" {
+		sortOrder = "desc"
+	}
 	params := map[string]string{
 		"chain":         "robinhood",
 		"category":      category,
 		"pageNO":        "1",
 		"pageSize":      "500",
-		"sort":          "created_at",
-		"sort_dir":      "desc",
+		"sort":          sortField,
+		"sort_dir":      sortOrder,
 		"marketcap_min": str(group["mcp_min"]),
 		"marketcap_max": str(group["mcp_max"]),
 	}
@@ -1256,8 +1437,22 @@ func (a *API) executeAveTokenList(ctx context.Context, line store.ExecuteLine, e
 	if params["marketcap_max"] == "" {
 		params["marketcap_max"] = "200000"
 	}
-	if days := id(group["create_day"]); days > 0 {
-		params["created_at_min"] = strconv.FormatInt(time.Now().Unix()-days*86400, 10)
+	createDay := id(group["create_day"])
+	createDayEnd := id(group["create_day_end"])
+	if createDay > 0 {
+		params["created_at_min"] = strconv.FormatInt(time.Now().Unix()-createDay*86400, 10)
+	}
+	if createDayEnd >= 0 && (group["create_day_end"] != nil || createDay > 0) {
+		params["created_at_max"] = strconv.FormatInt(time.Now().Unix()-createDayEnd*86400, 10)
+	}
+	if holderMin := str(group["holder_min"]); holderMin != "" {
+		params["holder_min"] = holderMin
+	}
+	if pageNo := str(group["page_no"]); pageNo != "" {
+		params["pageNO"] = pageNo
+	}
+	if pageSize := str(group["page_size"]); pageSize != "" {
+		params["pageSize"] = pageSize
 	}
 	payload, err := a.aveJSON(ctx, "/v1api/v4/tokens/treasure/list", params)
 	if err != nil {
@@ -1433,6 +1628,44 @@ func (a *API) executeWithdraw(c *fiber.Ctx) error {
 	return a.ok(c, result)
 }
 
+func (a *API) executeUpdateWithdrawAddress(c *fiber.Ctx) error {
+	d := body(c)
+	if str(d["password"]) != a.Cfg.ExportPassword {
+		return httpx.Error(c, 400, "invalid password")
+	}
+	lineID := id(d["lineId"])
+	if lineID <= 0 {
+		lineID = id(d["line"])
+	}
+	if lineID <= 0 {
+		return httpx.Error(c, 400, "lineId is required")
+	}
+	address := low(str(d["withdrawAddress"]))
+	if !common.IsHexAddress(address) || address == executeZeroCurve {
+		return httpx.Error(c, 400, "withdrawAddress must be a valid non-zero EVM address")
+	}
+	executeMu.Lock()
+	defer executeMu.Unlock()
+	line, err := a.Store.ExecuteLine(c.Context(), lineID)
+	if err != nil {
+		return httpx.Error(c, 404, "execute line not found")
+	}
+	config := make(map[string]any, len(line.Config)+1)
+	for key, value := range line.Config {
+		config[key] = value
+	}
+	config["withdrawAddress"] = address
+	updated, err := a.Store.UpsertExecuteLine(c.Context(), line.LineID, 0, line.Name, config, line.Enabled, line.BossAddress, line.BossPrivateKey)
+	if err != nil {
+		return a.fail(c, err)
+	}
+	return a.ok(c, map[string]any{
+		"line":            updated.LineID,
+		"withdrawAddress": updated.Config["withdrawAddress"],
+		"updatedAt":       updated.UpdatedAt,
+	})
+}
+
 func (a *API) executeNextWallet(c *fiber.Ctx) error {
 	d := body(c)
 	executeMu.Lock()
@@ -1528,6 +1761,8 @@ func (a *API) executeRegisterRoutes(app *fiber.App) {
 	g.Post("/sellToken", a.executeSell)
 	g.Post("/end", a.executeEnd)
 	g.Post("/withdraw", a.executeWithdraw)
+	g.Post("/updateWithdrawAddress", a.executeUpdateWithdrawAddress)
+	g.Post("/updateLineWithdrawAddress", a.executeUpdateWithdrawAddress)
 	g.Post("/nextWallet", a.executeNextWallet)
 	g.Post("/closeAllAccounts", a.executeCloseAccounts)
 	g.Post("/autoSwap", a.executeAutoSwap)

@@ -51,7 +51,7 @@ RobinhoodGo 是原 NestJS/Prisma Robinhood 链上交易服务的 Go 后端替代
 
 ### AVE 与监控用户
 
-保留 `ave/getConfig`、`ave/updateConfig`，AVE 请求固定携带 `x-auth`；
+保留 `ave/getConfig`、`ave/updateConfig`，并提供 `POST /api/v1/appdata/getXAuth`、`POST /api/v1/appdata/updateXAuth` 修改 AVE 认证数据；更新请求支持 `X_AUTH`（兼容 `xAuth`）字段，AVE 请求固定携带 `x-auth`；
 `monitorUser` 全部八个接口均可用。新增用户省略 `userId` 时自动分配，自动生成钱包并
 用 `PRIVATE_KEY_ENCRYPTION_KEY` 加密私钥；导出和删除都必须匹配
 `ROBINHOOD_MONITOR_PRIVATE_KEY_EXPORT_PASSWORD`。`config` 支持旧字段以及新分组字段：
