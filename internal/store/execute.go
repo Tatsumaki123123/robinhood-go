@@ -103,6 +103,12 @@ func (s *Store) ExecuteLine(ctx context.Context, lineID int64) (ExecuteLine, err
 	return scanExecuteLine(s.DB.QueryRow(ctx, `SELECT line_id,user_id,name,config,boss_address,boss_private_key_encrypted,enabled,created_at,updated_at FROM execute_lines WHERE line_id=$1`, lineID))
 }
 
+func (s *Store) NextExecuteLineID(ctx context.Context) (int64, error) {
+	var lineID int64
+	err := s.DB.QueryRow(ctx, `SELECT COALESCE(MAX(line_id),0)+1 FROM execute_lines`).Scan(&lineID)
+	return lineID, err
+}
+
 func (s *Store) ExecuteLines(ctx context.Context) ([]ExecuteLine, error) {
 	rows, err := s.DB.Query(ctx, `SELECT line_id,user_id,name,config,boss_address,boss_private_key_encrypted,enabled,created_at,updated_at FROM execute_lines ORDER BY line_id`)
 	if err != nil {

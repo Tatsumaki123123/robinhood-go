@@ -226,7 +226,12 @@ func (a *API) executeLineUpdate(c *fiber.Ctx) error {
 	if lineID <= 0 {
 		return httpx.Error(c, 400, "line is required")
 	}
+	executeMu.Lock()
+	defer executeMu.Unlock()
 	line, lineErr := a.Store.ExecuteLine(c.Context(), lineID)
+	if lineErr != nil && !errors.Is(lineErr, pgx.ErrNoRows) {
+		return a.fail(c, lineErr)
+	}
 	hasLine := lineErr == nil
 	cfg := map[string]any{}
 	if hasLine {
@@ -306,6 +311,12 @@ func (a *API) executeLineUpdate(c *fiber.Ctx) error {
 	if err != nil {
 		return a.fail(c, err)
 	}
+	if !hasLine {
+		if _, batchErr := a.Store.CreateExecuteBatch(c.Context(), lineID, updated.BossAddress, updated.BossPrivateKey); batchErr != nil {
+			_ = a.Store.DeleteExecuteLine(c.Context(), lineID)
+			return a.fail(c, batchErr)
+		}
+	}
 	return a.ok(c, map[string]any{"line": updated.LineID, "name": updated.Name, "config": cfg, "bossAddress": updated.BossAddress, "enabled": updated.Enabled, "createdAt": updated.CreatedAt, "updatedAt": updated.UpdatedAt})
 }
 
@@ -315,6 +326,53 @@ func (a *API) executeLines(c *fiber.Ctx) error {
 		return a.fail(c, err)
 	}
 	return a.ok(c, lines)
+}
+
+func (a *API) executeAddLine(c *fiber.Ctx) error {
+	executeMu.Lock()
+	defer executeMu.Unlock()
+
+	lineID, err := a.Store.NextExecuteLineID(c.Context())
+	if err != nil {
+		return a.fail(c, err)
+	}
+	name := str(body(c)["name"])
+	if name == "" {
+		name = fmt.Sprintf("Line %d", lineID)
+	}
+	key, err := gethcrypto.GenerateKey()
+	if err != nil {
+		return a.fail(c, err)
+	}
+	private, err := executePrivateKey("", key)
+	if err != nil {
+		return a.fail(c, err)
+	}
+	address := strings.ToLower(gethcrypto.PubkeyToAddress(key.PublicKey).Hex())
+	encrypted, err := secret.Encrypt(private, a.Cfg.EncryptionKey)
+	if err != nil {
+		return a.fail(c, err)
+	}
+	updated, err := a.Store.UpsertExecuteLine(c.Context(), lineID, 0, name, map[string]any{"name": name}, true, address, encrypted)
+	if err != nil {
+		return a.fail(c, err)
+	}
+	batch, err := a.Store.CreateExecuteBatch(c.Context(), lineID, address, encrypted)
+	if err != nil {
+		_ = a.Store.DeleteExecuteLine(c.Context(), lineID)
+		return a.fail(c, err)
+	}
+	return a.ok(c, map[string]any{
+		"line":        updated.LineID,
+		"name":        updated.Name,
+		"config":      updated.Config,
+		"bossAddress": updated.BossAddress,
+		"enabled":     updated.Enabled,
+		"eid":         batch.EID,
+		"active":      batch.Active,
+		"createdAt":   updated.CreatedAt,
+		"updatedAt":   updated.UpdatedAt,
+	})
 }
 
 func (a *API) executeDeleteLine(c *fiber.Ctx) error {
@@ -394,14 +452,20 @@ func (a *API) executeStart(c *fiber.Ctx) error {
 	executeMu.Lock()
 	defer executeMu.Unlock()
 	previous, previousErr := a.Store.ActiveExecuteBatch(c.Context(), lineID)
+	if previousErr != nil && !errors.Is(previousErr, pgx.ErrNoRows) {
+		return a.fail(c, previousErr)
+	}
 	if previousErr == nil {
-		wallets, walletErr := a.Store.ExecuteWallets(c.Context(), previous.EID, false)
+		wallets, walletErr := a.Store.ExecuteWallets(c.Context(), previous.EID, true)
 		if walletErr != nil {
 			return a.fail(c, walletErr)
 		}
 		for _, wallet := range wallets {
 			balance, balanceErr := a.RPC.Balance(c.Context(), wallet.Address)
-			if balanceErr == nil && chain.ToBig(balance).Sign() > 0 {
+			if balanceErr != nil {
+				return a.fail(c, balanceErr)
+			}
+			if chain.ToBig(balance).Sign() > 0 {
 				return httpx.Error(c, 409, "active execute wallets still have native balance; call /api/v1/executerobin/end first")
 			}
 		}
@@ -1451,6 +1515,7 @@ func (a *API) executeCloseAccounts(c *fiber.Ctx) error {
 func (a *API) executeRegisterRoutes(app *fiber.App) {
 	g := app.Group("/api/v1/executerobin")
 	g.Post("/start", a.executeStart)
+	g.Post("/addLine", a.executeAddLine)
 	g.Post("/updateLineData", a.executeLineUpdate)
 	g.Post("/deleteLine", a.executeDeleteLine)
 	g.Post("/generateWallets", a.executeGenerateWallets)
