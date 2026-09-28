@@ -203,18 +203,42 @@ func inferredHop(poolID, tokenIn, tokenOut string, hooksList []string) (routeHop
 	return routeHop{}, false
 }
 
-func (a *API) resolvePonsHop(ctx context.Context, token string) (routeHop, bool) {
-	if a.RPC == nil || !common.IsHexAddress(token) || !common.IsHexAddress(a.Cfg.PonsFactory) || !common.IsHexAddress(a.Cfg.PonsExternalHooks) {
-		return routeHop{}, false
+func (a *API) resolvePonsHop(ctx context.Context, token string, pairTokenHint ...string) (routeHop, error) {
+	if a.RPC == nil {
+		return routeHop{}, fmt.Errorf("RPC is not configured")
+	}
+	if !common.IsHexAddress(token) {
+		return routeHop{}, fmt.Errorf("token address is invalid")
+	}
+	if !common.IsHexAddress(a.Cfg.PonsFactory) {
+		return routeHop{}, fmt.Errorf("Pons factory address is not configured")
+	}
+	if !common.IsHexAddress(a.Cfg.PonsExternalHooks) {
+		return routeHop{}, fmt.Errorf("Pons external hooks address is not configured")
 	}
 	launched, err := a.RPC.LaunchedToken(ctx, a.Cfg.PonsFactory, token)
-	if err != nil || !launched.Exists || launched.Curve == (common.Address{}) || launched.Curve == common.HexToAddress(chain.NativeAddress) {
-		return routeHop{}, false
+	if err != nil {
+		return routeHop{}, fmt.Errorf("read Pons launch record: %w", err)
+	}
+	if !launched.Exists {
+		return routeHop{}, fmt.Errorf("Pons launch record does not exist")
+	}
+	if launched.Curve == (common.Address{}) || launched.Curve == common.HexToAddress(chain.NativeAddress) {
+		return routeHop{}, fmt.Errorf("Pons launch record has no valid curve")
 	}
 	tokenIn := normalizeAddress(launched.PairToken.Hex())
+	// Native-quote Pons launches keep pairToken at zero while AVE exposes the
+	// wrapped quote currency in the V4 pair. Use that hint only for PoolId
+	// derivation; the caller still verifies the result against AVE's pair ID.
+	if tokenIn == executeZeroCurve && len(pairTokenHint) > 0 {
+		tokenIn = executeNativeAlias(normalizeAddress(pairTokenHint[0]))
+	}
 	tokenOut := normalizeAddress(token)
 	if !common.IsHexAddress(tokenIn) || tokenIn == executeZeroCurve || launched.PoolFee == nil || launched.TickSpacing == nil {
-		return routeHop{}, false
+		if launched.PairToken == (common.Address{}) && len(pairTokenHint) == 0 {
+			return routeHop{}, fmt.Errorf("Pons launch record has no pairToken; AVE quote currency is required")
+		}
+		return routeHop{}, fmt.Errorf("Pons launch record has incomplete pair or PoolKey data")
 	}
 	c0, c1 := tokenIn, tokenOut
 	if c1 < c0 {
@@ -222,9 +246,9 @@ func (a *API) resolvePonsHop(ctx context.Context, token string) (routeHop, bool)
 	}
 	poolID, err := chain.PoolID(map[string]any{"currency0": c0, "currency1": c1, "fee": launched.PoolFee, "tickSpacing": launched.TickSpacing, "hooks": a.Cfg.PonsExternalHooks})
 	if err != nil {
-		return routeHop{}, false
+		return routeHop{}, fmt.Errorf("calculate Pons PoolId: %w", err)
 	}
-	return routeHop{PoolID: normalizePoolID(poolID), Currency0: c0, Currency1: c1, Fee: bigIntToInt64(launched.PoolFee), TickSpacing: bigIntToInt64(launched.TickSpacing), Hooks: normalizeAddress(a.Cfg.PonsExternalHooks), TokenIn: tokenIn, TokenOut: tokenOut, HookData: "0x"}, true
+	return routeHop{PoolID: normalizePoolID(poolID), Currency0: c0, Currency1: c1, Fee: bigIntToInt64(launched.PoolFee), TickSpacing: bigIntToInt64(launched.TickSpacing), Hooks: normalizeAddress(a.Cfg.PonsExternalHooks), TokenIn: tokenIn, TokenOut: tokenOut, HookData: "0x"}, nil
 }
 
 func (a *API) resolveAveHop(ctx context.Context, pair map[string]any, tokenIn, tokenOut string) (routeHop, bool) {
@@ -240,7 +264,7 @@ func (a *API) resolveAveHop(ctx context.Context, pair map[string]any, tokenIn, t
 	}
 	// Pons pools expose the authoritative fee, tick spacing and hook through
 	// the factory even when AVE only returns pair/has_hook.
-	if hop, ok := a.resolvePonsHop(ctx, tokenOut); ok && strings.EqualFold(hop.TokenIn, tokenIn) && strings.EqualFold(hop.PoolID, poolID) {
+	if hop, err := a.resolvePonsHop(ctx, tokenOut, tokenIn); err == nil && strings.EqualFold(hop.TokenIn, tokenIn) && strings.EqualFold(hop.PoolID, poolID) {
 		return hop, true
 	}
 	return routeHop{}, false

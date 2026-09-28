@@ -862,7 +862,8 @@ func (a *API) resolveExecutePool(ctx context.Context, target string, d map[strin
 	data, _ := detail["data"].(map[string]any)
 	pairs, _ := data["pairs"].([]any)
 	requested := normalizePoolID(str(d["poolId"]))
-	ponsHop, hasPonsHop := a.resolvePonsHop(ctx, target)
+	ponsHop, ponsErr := a.resolvePonsHop(ctx, target)
+	hasPonsHop := ponsErr == nil
 	if hasPonsHop && requested != "" && !strings.EqualFold(requested, ponsHop.PoolID) {
 		hasPonsHop = false
 	}
@@ -888,6 +889,15 @@ func (a *API) resolveExecutePool(ctx context.Context, target string, d map[strin
 			continue
 		}
 		hasTargetV4Pair = true
+		pairPonsHop, pairPonsErr := a.resolvePonsHop(ctx, target, quote)
+		if pairPonsErr == nil && strings.EqualFold(pairID, pairPonsHop.PoolID) {
+			return pairPonsHop, pair, nil
+		}
+		if pairPonsErr != nil {
+			ponsErr = pairPonsErr
+		} else if pairID != "" {
+			ponsErr = fmt.Errorf("derived Pons PoolId %s does not match AVE pair %s", pairPonsHop.PoolID, pairID)
+		}
 		if hasPonsHop && strings.EqualFold(pairID, ponsHop.PoolID) {
 			return ponsHop, pair, nil
 		}
@@ -896,16 +906,16 @@ func (a *API) resolveExecutePool(ctx context.Context, target string, d map[strin
 			return hop, pair, nil
 		}
 	}
-	if hasPonsHop {
-		return ponsHop, nil, nil
-	}
 	if !hasV4Pair {
 		return routeHop{}, nil, fmt.Errorf("AVE has no Uniswap V4 pair for token %s", target)
 	}
 	if !hasTargetV4Pair {
 		return routeHop{}, nil, fmt.Errorf("AVE Uniswap V4 pairs do not contain token %s", target)
 	}
-	return routeHop{}, nil, fmt.Errorf("AVE returned Uniswap V4 pairs for token %s, but no verifiable PoolKey was found; configure Pons factory/hooks or submit fee, tickSpacing and hooks", target)
+	if ponsErr != nil {
+		return routeHop{}, nil, fmt.Errorf("AVE returned Uniswap V4 pairs for token %s, but no verifiable PoolKey was found: %w", target, ponsErr)
+	}
+	return routeHop{}, nil, fmt.Errorf("AVE returned Uniswap V4 pairs for token %s, but no verifiable PoolKey was found", target)
 }
 
 func routeMap(h routeHop) map[string]any { return h.mapValue() }
