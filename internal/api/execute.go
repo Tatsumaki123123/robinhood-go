@@ -27,7 +27,10 @@ import (
 // recycle) while individual wallet swaps remain independent.
 var executeMu sync.Mutex
 
-const executeZeroCurve = "0x0000000000000000000000000000000000000000"
+const (
+	executeZeroCurve            = "0x0000000000000000000000000000000000000000"
+	executeAveFollowSelfAddress = "0xa65ad9201b6d48519822a3a1972ee68ec0437e1b"
+)
 
 func executeLineID(d map[string]any) int64 { return id(d["line"]) }
 
@@ -473,7 +476,7 @@ func (a *API) executeCheckTokenRules(ctx context.Context, line store.ExecuteLine
 	if maxBuyTax, configured := executeFloatValue(line.Config["maxBuyTax"]); configured {
 		extra, err := a.aveJSON(ctx, "/v1api/v2/tokens/"+token+"-robinhood/extraDetail", nil)
 		if err != nil {
-			return err
+			return fmt.Errorf("get AVE token extra detail: %w", err)
 		}
 		tax, ok := executeFloatValue(aveNestedData(extra)["total_buy_tax"])
 		if !ok {
@@ -484,9 +487,12 @@ func (a *API) executeCheckTokenRules(ctx context.Context, line store.ExecuteLine
 		}
 	}
 	if minFollowStates, configured := executeFloatValue(line.Config["minFollowStates"]); configured && minFollowStates > 0 {
-		follow, err := a.aveJSON(ctx, "/v1api/v3/stats/follows/aggregatestates", map[string]string{"token_id": token + "-robinhood"})
+		follow, err := a.aveJSON(ctx, "/v1api/v3/stats/follows/aggregatestates", map[string]string{
+			"token_id":     token + "-robinhood",
+			"self_address": executeAveFollowSelfAddress,
+		})
 		if err != nil {
-			return err
+			return fmt.Errorf("get AVE follow aggregate states: %w", err)
 		}
 		followCount, ok := executeFloatValue(aveNestedData(follow)["all"])
 		if !ok {
