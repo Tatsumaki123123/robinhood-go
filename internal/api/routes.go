@@ -202,6 +202,30 @@ func inferredHop(poolID, tokenIn, tokenOut string, hooksList []string) (routeHop
 	return routeHop{}, false
 }
 
+func (a *API) resolvePonsHop(ctx context.Context, token string) (routeHop, bool) {
+	if a.RPC == nil || !common.IsHexAddress(token) || !common.IsHexAddress(a.Cfg.PonsFactory) || !common.IsHexAddress(a.Cfg.PonsExternalHooks) {
+		return routeHop{}, false
+	}
+	launched, err := a.RPC.LaunchedToken(ctx, a.Cfg.PonsFactory, token)
+	if err != nil || !launched.Exists || launched.Curve == (common.Address{}) || launched.Curve == common.HexToAddress(chain.NativeAddress) {
+		return routeHop{}, false
+	}
+	tokenIn := normalizeAddress(launched.PairToken.Hex())
+	tokenOut := normalizeAddress(token)
+	if !common.IsHexAddress(tokenIn) || tokenIn == executeZeroCurve || launched.PoolFee == nil || launched.TickSpacing == nil {
+		return routeHop{}, false
+	}
+	c0, c1 := tokenIn, tokenOut
+	if c1 < c0 {
+		c0, c1 = c1, c0
+	}
+	poolID, err := chain.PoolID(map[string]any{"currency0": c0, "currency1": c1, "fee": launched.PoolFee, "tickSpacing": launched.TickSpacing, "hooks": a.Cfg.PonsExternalHooks})
+	if err != nil {
+		return routeHop{}, false
+	}
+	return routeHop{PoolID: normalizePoolID(poolID), Currency0: c0, Currency1: c1, Fee: bigIntToInt64(launched.PoolFee), TickSpacing: bigIntToInt64(launched.TickSpacing), Hooks: normalizeAddress(a.Cfg.PonsExternalHooks), TokenIn: tokenIn, TokenOut: tokenOut, HookData: "0x"}, true
+}
+
 func (a *API) resolveAveHop(ctx context.Context, pair map[string]any, tokenIn, tokenOut string) (routeHop, bool) {
 	if hop, ok := routeHopFromPair(pair, tokenIn, tokenOut); ok {
 		return hop, true
@@ -213,20 +237,10 @@ func (a *API) resolveAveHop(ctx context.Context, pair map[string]any, tokenIn, t
 	if hop, ok := inferredHop(poolID, tokenIn, tokenOut, []string{nativeAddress, a.Cfg.PonsExternalHooks}); ok {
 		return hop, true
 	}
-	// Graduated Pons pools expose their fee and tick spacing through the
-	// factory even when AVE omits the PoolKey fields.
-	if a.RPC != nil {
-		launched, err := a.RPC.LaunchedToken(ctx, a.Cfg.PonsFactory, tokenOut)
-		if err == nil && launched.Exists && strings.EqualFold(launched.PairToken.Hex(), tokenIn) {
-			c0, c1 := normalizeAddress(tokenIn), normalizeAddress(tokenOut)
-			if c1 < c0 {
-				c0, c1 = c1, c0
-			}
-			calculated, err := chain.PoolID(map[string]any{"currency0": c0, "currency1": c1, "fee": launched.PoolFee, "tickSpacing": launched.TickSpacing, "hooks": a.Cfg.PonsExternalHooks})
-			if err == nil && strings.EqualFold(calculated, poolID) {
-				return routeHop{PoolID: poolID, Currency0: c0, Currency1: c1, Fee: bigIntToInt64(launched.PoolFee), TickSpacing: bigIntToInt64(launched.TickSpacing), Hooks: normalizeAddress(a.Cfg.PonsExternalHooks), TokenIn: normalizeAddress(tokenIn), TokenOut: normalizeAddress(tokenOut), HookData: "0x"}, true
-			}
-		}
+	// Pons pools expose the authoritative fee, tick spacing and hook through
+	// the factory even when AVE only returns pair/has_hook.
+	if hop, ok := a.resolvePonsHop(ctx, tokenOut); ok && strings.EqualFold(hop.TokenIn, tokenIn) && strings.EqualFold(hop.PoolID, poolID) {
+		return hop, true
 	}
 	return routeHop{}, false
 }

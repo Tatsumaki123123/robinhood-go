@@ -103,7 +103,6 @@ POST /api/v1/executerobin/updateLineData
   "name": "v4-main-line",
   "enabled": true,
   "data": {
-    "walletCount": 2,
     "walletConfig": [
       {
         "transferAmount": 0.01,
@@ -125,7 +124,7 @@ POST /api/v1/executerobin/updateLineData
 说明：
 
 - `data` 可以是对象，也可以是 JSON 字符串。
-- `walletConfig`、`walletCount`、`autoSwap`、`name` 等字段也可以直接放在请求顶层。修改 `withdrawAddress` 时必须同时传入 `password`，且密码必须匹配 `ROBINHOOD_MONITOR_PRIVATE_KEY_EXPORT_PASSWORD`；也可以使用专用的 `updateWithdrawAddress` 接口。
+- `walletConfig`、`autoSwap`、`name` 等字段也可以直接放在请求顶层。修改 `withdrawAddress` 时必须同时传入 `password`，且密码必须匹配 `ROBINHOOD_MONITOR_PRIVATE_KEY_EXPORT_PASSWORD`；也可以使用专用的 `updateWithdrawAddress` 接口。
 - 创建线路时会自动生成 boss；也可以传 `bossPrivateKey` 导入已有 boss。私钥会加密保存，不会出现在响应中。
 
 返回 `line`、`name`、`config`、`bossAddress`、`enabled` 和时间字段。
@@ -216,7 +215,7 @@ POST /api/v1/executerobin/generateWallets
 { "line": 1001 }
 ```
 
-也可以传 `{ "eid": 1 }`。钱包数量为 `max(walletCount, walletConfig.length, 1)`。每个钱包生成独立私钥并由 boss 按 `transferAmount` 充值。重复调用时，余额为 0 的 active 钱包可以再次补款。
+也可以传 `{ "eid": 1 }`。钱包数量为 `max(walletConfig.length, 1)`。每个钱包生成独立私钥并由 boss 按 `transferAmount` 充值。重复调用时，余额为 0 的 active 钱包可以再次补款。
 
 ### 3.8 结束批次并回收钱包余额
 

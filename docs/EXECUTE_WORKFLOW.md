@@ -19,12 +19,12 @@ updateLineData -> start -> generateWallets -> checkToken -> buyToken
 
 | 接口 | 请求重点 | 作用 |
 | --- | --- | --- |
-| `POST /api/v1/executerobin/updateLineData` | `line,data` | 创建或更新独立线路；`data` 可为对象或 JSON 字符串，常用字段是 `walletConfig`、`walletCount`、`withdrawAddress`。可选 `bossPrivateKey` 用于导入已有 boss |
+| `POST /api/v1/executerobin/updateLineData` | `line,data` | 创建或更新独立线路；`data` 可为对象或 JSON 字符串，常用字段是 `walletConfig`、`withdrawAddress`。可选 `bossPrivateKey` 用于导入已有 boss |
 | `POST /api/v1/executerobin/updateWithdrawAddress` | `lineId,withdrawAddress,password` | 修改线路提现地址；密码必须匹配私钥导出密码 |
 | `POST /api/v1/executerobin/addLine` | `name`（可选） | 自动分配下一个 lineId，创建线路和第一条 active boss 批次 |
 | `POST /api/v1/executerobin/deleteLine` | `lineId,password` | 删除线路；boss 或活动批次的 active 钱包仍有原生币余额时拒绝删除 |
 | `POST /api/v1/executerobin/start` | `line` | 校验线路钱包并创建活动 `eid`；上一批执行钱包仍有余额时拒绝切换 |
-| `POST /api/v1/executerobin/generateWallets` | `line` 或 `eid` | 按 `walletConfig`/`walletCount` 生成执行钱包；`transferAmount` 为 JSON number，单位是 ETH，并从 boss 钱包充值 |
+| `POST /api/v1/executerobin/generateWallets` | `line` 或 `eid` | 按 `walletConfig` 生成执行钱包；`transferAmount` 为 JSON number，单位是 ETH，并从 boss 钱包充值 |
 | `POST /api/v1/executerobin/checkToken` | `eid`、`tokenAddress`、PoolKey | 校验 V4 PoolKey，保存 1--3 跳买入/卖出路线并创建 `tid` |
 | `POST /api/v1/executerobin/buyToken` | `tid`、`type` | 按 `walletConfig[index].firstBuy/secondBuy/thirdBuy/multiBuy` 的 `enable` 和 `buyAmount` 选择钱包；同一阶段的多个钱包并发调用 Universal Router，也支持 `walletAddress` |
 | `POST /api/v1/executerobin/sellToken` | `tid`、`type`、`percent`/`amountInRaw` | 按 `firstSell/secondSell/thirdSell/multiSell` 的 `enable` 和 `sellRatio` 选择钱包并发卖出；`type=all` 对所有 active 钱包按 100% 卖出并将任务置为 `sell` |

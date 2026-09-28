@@ -60,7 +60,6 @@ POST /api/v1/executerobin/updateLineData
   "line": 1001,
   "name": "v4-main-line",
   "data": {
-    "walletCount": 2,
     "walletConfig": [
       {
         "transferAmount": 0.01,
@@ -91,7 +90,7 @@ POST /api/v1/executerobin/updateLineData
 }
 ```
 
-`data` 可以传对象，也可以传 JSON 字符串。顶层字段 `walletConfig`、`walletCount`、`withdrawAddress`、`autoSwap`、`name`、`sourceWeb`、`groupSort`、`minFollowStates`、`maxBuyTax`、`lineBots`、`enabled` 也会合并到线路配置中。
+`data` 可以传对象，也可以传 JSON 字符串。顶层字段 `walletConfig`、`withdrawAddress`、`autoSwap`、`name`、`sourceWeb`、`groupSort`、`minFollowStates`、`maxBuyTax`、`lineBots`、`enabled` 也会合并到线路配置中。
 
 新建线路默认使用 AVE，默认 `walletConfig` 为一个钱包（`buyAmount=0.001`、`transferAmount=0.01`），并设置 `minFollowStates=2`、`maxBuyTax=1.5`、空的 `lineBots`。默认 `groupSort` 为 `sort_field=created_at`、`sort_order=desc`、`mcp_min=10000`、`mcp_max=50000`、`create_day=1`、`create_day_end=0`、`category=pump_out_new`、`duration=6`、空的 `address`。
 
@@ -145,8 +144,10 @@ POST /api/v1/executerobin/generateWallets
 钱包数量计算规则：
 
 ```text
-walletCount = max(config.walletCount, len(config.walletConfig), 1)
+wallets = max(len(config.walletConfig), 1)
 ```
+
+`walletCount` 不再作为线路配置字段保存或读取。
 
 每个新钱包生成独立 EVM 私钥并加密保存。`transferAmount` 是 JSON number，单位为 ETH；boss 会在生成后按钱包下标向该钱包充值。再次调用时，已有 active 钱包余额为 0 的钱包也会按相同配置补款。
 
@@ -384,7 +385,6 @@ POST /api/v1/executerobin/sellToken
   "name": "robinhood-v4-two-wallets",
   "enabled": true,
   "data": {
-    "walletCount": 2,
     "walletConfig": [
       {
         "transferAmount": 0.01,

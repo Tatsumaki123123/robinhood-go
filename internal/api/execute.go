@@ -296,7 +296,7 @@ func (a *API) executeLineUpdate(c *fiber.Ctx) error {
 			_, withdrawAddressRequested = parsed["withdrawAddress"]
 		}
 	}
-	for _, key := range []string{"walletConfig", "walletCount", "withdrawAddress", "autoSwap", "name", "sourceWeb", "groupSort", "minFollowStates", "maxBuyTax", "lineBots"} {
+	for _, key := range []string{"walletConfig", "withdrawAddress", "autoSwap", "name", "sourceWeb", "groupSort", "minFollowStates", "maxBuyTax", "lineBots"} {
 		if value, ok := d[key]; ok {
 			cfg[key] = value
 			if key == "withdrawAddress" {
@@ -304,6 +304,7 @@ func (a *API) executeLineUpdate(c *fiber.Ctx) error {
 			}
 		}
 	}
+	delete(cfg, "walletCount")
 	if withdrawAddressRequested {
 		if str(d["password"]) != a.Cfg.ExportPassword {
 			return httpx.Error(c, 400, "invalid password")
@@ -384,6 +385,9 @@ func (a *API) executeLines(c *fiber.Ctx) error {
 	lines, err := a.Store.ExecuteLines(c.Context())
 	if err != nil {
 		return a.fail(c, err)
+	}
+	for index := range lines {
+		delete(lines[index].Config, "walletCount")
 	}
 	return a.ok(c, lines)
 }
@@ -691,10 +695,7 @@ func (a *API) executeGenerateWallets(c *fiber.Ctx) error {
 		return a.fail(c, err)
 	}
 	items := executeConfigItems(line.Config)
-	count := int(id(line.Config["walletCount"]))
-	if len(items) > count {
-		count = len(items)
-	}
+	count := len(items)
 	if count <= 0 {
 		count = 1
 	}
@@ -861,9 +862,20 @@ func (a *API) resolveExecutePool(ctx context.Context, target string, d map[strin
 	data, _ := detail["data"].(map[string]any)
 	pairs, _ := data["pairs"].([]any)
 	requested := normalizePoolID(str(d["poolId"]))
+	ponsHop, hasPonsHop := a.resolvePonsHop(ctx, target)
+	if hasPonsHop && requested != "" && !strings.EqualFold(requested, ponsHop.PoolID) {
+		hasPonsHop = false
+	}
+	hasV4Pair := false
+	hasTargetV4Pair := false
 	for _, raw := range pairs {
 		pair, ok := raw.(map[string]any)
-		if !ok || !isV4Pair(pair) || requested != "" && !strings.EqualFold(normalizePoolID(str(pairValue(pair, "pair", "poolId"))), requested) {
+		if !ok || !isV4Pair(pair) {
+			continue
+		}
+		hasV4Pair = true
+		pairID := normalizePoolID(str(pairValue(pair, "pair", "poolId")))
+		if requested != "" && !strings.EqualFold(pairID, requested) {
 			continue
 		}
 		left := pairAddress(pair, "token0_address", "token0Address", "currency0", "currency0_address")
@@ -875,12 +887,25 @@ func (a *API) resolveExecutePool(ctx context.Context, target string, d map[strin
 		} else {
 			continue
 		}
+		hasTargetV4Pair = true
+		if hasPonsHop && strings.EqualFold(pairID, ponsHop.PoolID) {
+			return ponsHop, pair, nil
+		}
 		hop, ok := a.resolveAveHop(ctx, pair, quote, target)
 		if ok {
 			return hop, pair, nil
 		}
 	}
-	return routeHop{}, nil, fmt.Errorf("AVE has no verified Uniswap V4 pool for token %s", target)
+	if hasPonsHop {
+		return ponsHop, nil, nil
+	}
+	if !hasV4Pair {
+		return routeHop{}, nil, fmt.Errorf("AVE has no Uniswap V4 pair for token %s", target)
+	}
+	if !hasTargetV4Pair {
+		return routeHop{}, nil, fmt.Errorf("AVE Uniswap V4 pairs do not contain token %s", target)
+	}
+	return routeHop{}, nil, fmt.Errorf("AVE returned Uniswap V4 pairs for token %s, but no verifiable PoolKey was found; configure Pons factory/hooks or submit fee, tickSpacing and hooks", target)
 }
 
 func routeMap(h routeHop) map[string]any { return h.mapValue() }
