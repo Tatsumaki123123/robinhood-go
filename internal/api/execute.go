@@ -862,10 +862,27 @@ func (a *API) resolveExecutePool(ctx context.Context, target string, d map[strin
 	data, _ := detail["data"].(map[string]any)
 	pairs, _ := data["pairs"].([]any)
 	requested := normalizePoolID(str(d["poolId"]))
+	requestedPair := normalizePoolID(str(d["pair"]))
 	ponsHop, ponsErr := a.resolvePonsHop(ctx, target)
-	hasPonsHop := ponsErr == nil
-	if hasPonsHop && requested != "" && !strings.EqualFold(requested, ponsHop.PoolID) {
-		hasPonsHop = false
+	var selectedPair map[string]any
+	for _, raw := range pairs {
+		pair, ok := raw.(map[string]any)
+		if !ok || !strings.EqualFold(str(pairValue(pair, "target_token", "targetToken")), target) {
+			continue
+		}
+		pairID := normalizePoolID(str(pairValue(pair, "pair", "poolId")))
+		if requestedPair != "" && !strings.EqualFold(pairID, requestedPair) &&
+			(ponsErr != nil || !strings.EqualFold(requestedPair, ponsHop.PoolID)) {
+			continue
+		}
+		selectedPair = pair
+		break
+	}
+	if ponsErr == nil && selectedPair != nil {
+		if requested != "" && !strings.EqualFold(requested, ponsHop.PoolID) {
+			return routeHop{}, nil, fmt.Errorf("poolId does not match the Pons PoolKey derived from startAveToken")
+		}
+		return ponsHop, selectedPair, nil
 	}
 	hasV4Pair := false
 	hasTargetV4Pair := false
@@ -889,18 +906,6 @@ func (a *API) resolveExecutePool(ctx context.Context, target string, d map[strin
 			continue
 		}
 		hasTargetV4Pair = true
-		pairPonsHop, pairPonsErr := a.resolvePonsHop(ctx, target, quote)
-		if pairPonsErr == nil && strings.EqualFold(pairID, pairPonsHop.PoolID) {
-			return pairPonsHop, pair, nil
-		}
-		if pairPonsErr != nil {
-			ponsErr = pairPonsErr
-		} else if pairID != "" {
-			ponsErr = fmt.Errorf("derived Pons PoolId %s does not match AVE pair %s", pairPonsHop.PoolID, pairID)
-		}
-		if hasPonsHop && strings.EqualFold(pairID, ponsHop.PoolID) {
-			return ponsHop, pair, nil
-		}
 		hop, ok := a.resolveAveHop(ctx, pair, quote, target)
 		if ok {
 			return hop, pair, nil

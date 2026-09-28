@@ -203,7 +203,7 @@ func inferredHop(poolID, tokenIn, tokenOut string, hooksList []string) (routeHop
 	return routeHop{}, false
 }
 
-func (a *API) resolvePonsHop(ctx context.Context, token string, pairTokenHint ...string) (routeHop, error) {
+func (a *API) resolvePonsHop(ctx context.Context, token string) (routeHop, error) {
 	if a.RPC == nil {
 		return routeHop{}, fmt.Errorf("RPC is not configured")
 	}
@@ -227,17 +227,8 @@ func (a *API) resolvePonsHop(ctx context.Context, token string, pairTokenHint ..
 		return routeHop{}, fmt.Errorf("Pons launch record has no valid curve")
 	}
 	tokenIn := normalizeAddress(launched.PairToken.Hex())
-	// Native-quote Pons launches keep pairToken at zero while AVE exposes the
-	// wrapped quote currency in the V4 pair. Use that hint only for PoolId
-	// derivation; the caller still verifies the result against AVE's pair ID.
-	if tokenIn == executeZeroCurve && len(pairTokenHint) > 0 {
-		tokenIn = executeNativeAlias(normalizeAddress(pairTokenHint[0]))
-	}
 	tokenOut := normalizeAddress(token)
-	if !common.IsHexAddress(tokenIn) || tokenIn == executeZeroCurve || launched.PoolFee == nil || launched.TickSpacing == nil {
-		if launched.PairToken == (common.Address{}) && len(pairTokenHint) == 0 {
-			return routeHop{}, fmt.Errorf("Pons launch record has no pairToken; AVE quote currency is required")
-		}
+	if !common.IsHexAddress(tokenIn) || strings.EqualFold(tokenIn, tokenOut) || launched.PoolFee == nil || launched.TickSpacing == nil {
 		return routeHop{}, fmt.Errorf("Pons launch record has incomplete pair or PoolKey data")
 	}
 	c0, c1 := tokenIn, tokenOut
@@ -264,7 +255,7 @@ func (a *API) resolveAveHop(ctx context.Context, pair map[string]any, tokenIn, t
 	}
 	// Pons pools expose the authoritative fee, tick spacing and hook through
 	// the factory even when AVE only returns pair/has_hook.
-	if hop, err := a.resolvePonsHop(ctx, tokenOut, tokenIn); err == nil && strings.EqualFold(hop.TokenIn, tokenIn) && strings.EqualFold(hop.PoolID, poolID) {
+	if hop, err := a.resolvePonsHop(ctx, tokenOut); err == nil && strings.EqualFold(hop.TokenIn, tokenIn) && strings.EqualFold(hop.PoolID, poolID) {
 		return hop, true
 	}
 	return routeHop{}, false
