@@ -141,6 +141,11 @@ func (s *Store) SetExecuteLineBoss(ctx context.Context, lineID int64, address, e
 	return err
 }
 
+func (s *Store) DeleteExecuteLine(ctx context.Context, lineID int64) error {
+	_, err := s.DB.Exec(ctx, `DELETE FROM execute_lines WHERE line_id=$1`, lineID)
+	return err
+}
+
 func scanExecuteBatch(row interface{ Scan(...any) error }) (ExecuteBatch, error) {
 	var out ExecuteBatch
 	err := row.Scan(&out.EID, &out.LineID, &out.Active, &out.BossAddress, &out.PrivateKeyEnc, &out.WalletsExist, &out.Status, &out.CreatedAt, &out.UpdatedAt)

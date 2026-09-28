@@ -97,7 +97,7 @@ POST /api/v1/executerobin/updateLineData
 
 ### 2.2 导入已有 boss
 
-如果不希望首次启动时生成新 boss，可以在更新线路时传入：
+创建线路时服务会自动生成并保存 boss。 如果不希望使用自动生成的 boss，可以在更新线路时传入已有私钥：
 
 ```json
 {
@@ -106,7 +106,7 @@ POST /api/v1/executerobin/updateLineData
 }
 ```
 
-服务会校验私钥并推导 `bossAddress`。私钥不会写入线路 JSON，也不会在接口响应中返回，只会使用 `PRIVATE_KEY_ENCRYPTION_KEY` 加密保存。
+服务会校验私钥并推导 `bossAddress`。私钥不会写入线路 JSON，也不会在接口响应中返回，只会使用 `PRIVATE_KEY_ENCRYPTION_KEY` 加密保存。旧线路如果没有 boss，下一次更新线路时会自动补齐。
 
 ## 3. boss 和批次生命周期
 
@@ -123,7 +123,7 @@ POST /api/v1/executerobin/start
 行为：
 
 1. 线路不存在或 `enabled=false` 时拒绝启动。
-2. 首次启动优先使用线路导入的 boss；没有导入私钥时自动生成 boss。
+2. 首次启动优先使用线路中已保存的 boss；历史上没有 boss 的线路会在启动时生成并保存。
 3. 如果线路已有活动 `eid`，会检查该批次的全部执行钱包余额。
 4. 只要仍有原生币余额，就拒绝切换并要求先调用 `end`。
 5. 余额清零后创建新的 boss 和新的 `eid`，并尝试把旧 boss 的可用余额归集到新 boss。

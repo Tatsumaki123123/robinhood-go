@@ -126,7 +126,7 @@ POST /api/v1/executerobin/updateLineData
 
 - `data` 可以是对象，也可以是 JSON 字符串。
 - `walletConfig`、`walletCount`、`withdrawAddress`、`autoSwap`、`name` 等字段也可以直接放在请求顶层。
-- 可以传 `bossPrivateKey` 导入已有 boss；私钥会加密保存，不会出现在响应中。
+- 创建线路时会自动生成 boss；也可以传 `bossPrivateKey` 导入已有 boss。私钥会加密保存，不会出现在响应中。
 
 返回 `line`、`name`、`config`、`bossAddress`、`enabled` 和时间字段。
 
@@ -138,7 +138,22 @@ POST /api/v1/executerobin/getLines
 
 请求体可以为空。返回线路数组，线路列表不会返回 boss 私钥。
 
-### 3.3 启动执行批次
+### 3.3 删除线路
+
+```http
+POST /api/v1/executerobin/deleteLine
+```
+
+```json
+{
+  "lineId": 1001,
+  "password": "your-export-password"
+}
+```
+
+密码必须匹配服务端配置的 `ROBINHOOD_MONITOR_PRIVATE_KEY_EXPORT_PASSWORD`。删除前会检查线路 boss 和当前活动批次的 active 执行钱包原生币余额；任一余额大于 0 时返回失败。删除成功后会级联删除该线路的批次、钱包和 token。
+
+### 3.4 启动执行批次
 
 ```http
 POST /api/v1/executerobin/start
@@ -148,7 +163,7 @@ POST /api/v1/executerobin/start
 { "line": 1001 }
 ```
 
-首次启动会使用线路导入的 boss，否则生成新的 boss。已有活动批次时，只有执行钱包原生余额清零后才允许切换到新批次。返回：
+首次启动会使用线路中已保存的 boss；历史上没有 boss 的线路会在启动时生成新的 boss。已有活动批次时，只有执行钱包原生余额清零后才允许切换到新批次。返回：
 
 ```json
 {

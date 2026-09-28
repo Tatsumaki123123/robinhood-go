@@ -20,6 +20,7 @@ updateLineData -> start -> generateWallets -> checkToken -> buyToken
 | 接口 | 请求重点 | 作用 |
 | --- | --- | --- |
 | `POST /api/v1/executerobin/updateLineData` | `line,data` | 创建或更新独立线路；`data` 可为对象或 JSON 字符串，常用字段是 `walletConfig`、`walletCount`、`withdrawAddress`。可选 `bossPrivateKey` 用于导入已有 boss |
+| `POST /api/v1/executerobin/deleteLine` | `lineId,password` | 删除线路；boss 或活动批次的 active 钱包仍有原生币余额时拒绝删除 |
 | `POST /api/v1/executerobin/start` | `line` | 校验线路钱包并创建活动 `eid`；上一批执行钱包仍有余额时拒绝切换 |
 | `POST /api/v1/executerobin/generateWallets` | `line` 或 `eid` | 按 `walletConfig`/`walletCount` 生成执行钱包；`transferAmount` 为 JSON number，单位是 ETH，并从 boss 钱包充值 |
 | `POST /api/v1/executerobin/checkToken` | `eid`、`tokenAddress`、PoolKey | 校验 V4 PoolKey，保存 1--3 跳买入/卖出路线并创建 `tid` |
@@ -73,4 +74,4 @@ updateLineData -> start -> generateWallets -> checkToken -> buyToken
 
 请求 `/api/v1/executerobin/buyToken` 时，服务会读取每个钱包 `walletConfig[index].firstBuy.buyAmount`；同一 `type` 下的多个钱包会并发提交。`type` 也可以是数组，服务会按数组顺序逐阶段执行。卖出时使用 `/api/v1/executerobin/sellToken`，可传 `percent: 100` 或明确的 `amountInRaw`，同样支持阶段数组。实际交易仍由现有 V4 `Trading.Swap` 负责签名、Permit2 授权、广播和回执等待。
 
-首次 `start` 会生成独立 boss；如果线路通过 `bossPrivateKey` 导入了已有 boss，首次启动会使用该钱包。后续启动会在执行钱包余额归零后创建新 boss，并尝试将旧 boss 的可用原生币归集到新 boss。boss 和执行钱包的私钥只以加密形式存储。
+创建线路时会生成并保存独立 boss；如果线路通过 `bossPrivateKey` 导入了已有 boss，线路会使用该钱包。历史上没有 boss 的线路会在首次 `start` 时补齐。后续启动会在执行钱包余额归零后创建新 boss，并尝试将旧 boss 的可用原生币归集到新 boss。boss 和执行钱包的私钥只以加密形式存储。

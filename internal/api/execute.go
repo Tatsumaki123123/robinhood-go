@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/gofiber/fiber/v2"
+	"github.com/jackc/pgx/v5"
 	"robinhood-go/internal/chain"
 	secret "robinhood-go/internal/crypto"
 	"robinhood-go/internal/httpx"
@@ -283,6 +285,22 @@ func (a *API) executeLineUpdate(c *fiber.Ctx) error {
 		if err != nil {
 			return a.fail(c, err)
 		}
+	} else if strings.TrimSpace(bossAddress) == "" {
+		// Every line has a stable boss from creation onward. Legacy lines with
+		// no boss are repaired here and remain compatible with /start.
+		key, err := gethcrypto.GenerateKey()
+		if err != nil {
+			return a.fail(c, err)
+		}
+		private, keyErr := executePrivateKey("", key)
+		if keyErr != nil {
+			return a.fail(c, keyErr)
+		}
+		bossAddress = strings.ToLower(gethcrypto.PubkeyToAddress(key.PublicKey).Hex())
+		bossPrivateKey, err = secret.Encrypt(private, a.Cfg.EncryptionKey)
+		if err != nil {
+			return a.fail(c, err)
+		}
 	}
 	updated, err := a.Store.UpsertExecuteLine(c.Context(), lineID, 0, name, cfg, enabled, bossAddress, bossPrivateKey)
 	if err != nil {
@@ -297,6 +315,70 @@ func (a *API) executeLines(c *fiber.Ctx) error {
 		return a.fail(c, err)
 	}
 	return a.ok(c, lines)
+}
+
+func (a *API) executeDeleteLine(c *fiber.Ctx) error {
+	d := body(c)
+	if str(d["password"]) != a.Cfg.ExportPassword {
+		return httpx.Error(c, 400, "invalid password")
+	}
+	lineID := id(d["lineId"])
+	if lineID <= 0 {
+		lineID = id(d["line"])
+	}
+	if lineID <= 0 {
+		return httpx.Error(c, 400, "lineId is required")
+	}
+
+	executeMu.Lock()
+	defer executeMu.Unlock()
+
+	line, err := a.Store.ExecuteLine(c.Context(), lineID)
+	if err != nil {
+		return httpx.Error(c, 404, "execute line not found")
+	}
+	batch, batchErr := a.Store.ActiveExecuteBatch(c.Context(), lineID)
+	if batchErr != nil && !errors.Is(batchErr, pgx.ErrNoRows) {
+		return a.fail(c, batchErr)
+	}
+	bossAddresses := map[string]struct{}{}
+	if address := strings.TrimSpace(line.BossAddress); address != "" {
+		bossAddresses[strings.ToLower(address)] = struct{}{}
+	}
+	if batchErr == nil {
+		if address := strings.TrimSpace(batch.BossAddress); address != "" {
+			bossAddresses[strings.ToLower(address)] = struct{}{}
+		}
+	}
+	for address := range bossAddresses {
+		balanceRaw, balanceErr := a.RPC.Balance(c.Context(), address)
+		if balanceErr != nil {
+			return a.fail(c, balanceErr)
+		}
+		if chain.ToBig(balanceRaw).Sign() > 0 {
+			return httpx.Error(c, 409, "boss wallet still has native balance")
+		}
+	}
+	if batchErr == nil {
+		wallets, walletErr := a.Store.ExecuteWallets(c.Context(), batch.EID, true)
+		if walletErr != nil {
+			return a.fail(c, walletErr)
+		}
+		for _, wallet := range wallets {
+			balanceRaw, balanceErr := a.RPC.Balance(c.Context(), wallet.Address)
+			if balanceErr != nil {
+				return a.fail(c, balanceErr)
+			}
+			if chain.ToBig(balanceRaw).Sign() > 0 {
+				return httpx.Error(c, 409, "active execute wallet still has native balance")
+			}
+		}
+	}
+
+	if err = a.Store.DeleteExecuteLine(c.Context(), lineID); err != nil {
+		return a.fail(c, err)
+	}
+	return a.ok(c, map[string]any{"deleted": true, "line": lineID})
 }
 
 func (a *API) executeStart(c *fiber.Ctx) error {
@@ -1370,6 +1452,7 @@ func (a *API) executeRegisterRoutes(app *fiber.App) {
 	g := app.Group("/api/v1/executerobin")
 	g.Post("/start", a.executeStart)
 	g.Post("/updateLineData", a.executeLineUpdate)
+	g.Post("/deleteLine", a.executeDeleteLine)
 	g.Post("/generateWallets", a.executeGenerateWallets)
 	g.Post("/getWallets", a.executeWallets)
 	g.Post("/getWalletBalances", a.executeWallets)
