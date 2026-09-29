@@ -160,6 +160,22 @@ func executeConfigItems(cfg map[string]any) []map[string]any {
 	return result
 }
 
+func executeWalletConfigView(item map[string]any) map[string]any {
+	view := make(map[string]any)
+	for _, key := range []string{
+		"transferAmount",
+		"firstBuy", "firstSell",
+		"secondBuy", "secondSell",
+		"thirdBuy", "thirdSell",
+		"multiBuy", "multiSell",
+	} {
+		if value, ok := item[key]; ok {
+			view[key] = value
+		}
+	}
+	return view
+}
+
 func defaultExecuteLineConfig(name string) map[string]any {
 	return map[string]any{
 		"autoSwap": false,
@@ -889,6 +905,11 @@ func (a *API) executeWallets(c *fiber.Ctx) error {
 	if err != nil {
 		return httpx.Error(c, 404, "active execute batch not found")
 	}
+	line, err := a.Store.ExecuteLine(c.Context(), batch.LineID)
+	if err != nil {
+		return a.fail(c, err)
+	}
+	configItems := executeConfigItems(line.Config)
 	activeOnly := true
 	if all, ok := d["all"].(bool); ok && all {
 		activeOnly = false
@@ -900,13 +921,18 @@ func (a *API) executeWallets(c *fiber.Ctx) error {
 	result := make([]map[string]any, 0, len(wallets))
 	for _, wallet := range wallets {
 		view := executeWalletView(wallet)
+		if wallet.WalletIndex >= 0 && wallet.WalletIndex < len(configItems) {
+			for key, value := range executeWalletConfigView(configItems[wallet.WalletIndex]) {
+				view[key] = value
+			}
+		}
 		balanceRaw, balanceErr := a.RPC.Balance(c.Context(), wallet.Address)
 		if balanceErr != nil {
 			return a.fail(c, balanceErr)
 		}
 		balance := chain.ToBig(balanceRaw)
 		view["balanceRaw"] = balance.String()
-		view["balance"] = executeNativeDisplay(balance)
+		view["balance"] = json.Number(executeNativeDisplay(balance))
 		result = append(result, view)
 	}
 	return a.ok(c, result)

@@ -263,7 +263,7 @@ POST /api/v1/executerobin/getWalletBalances
 { "eid": 1, "all": false }
 ```
 
-`getWalletBalances` 是兼容别名。默认只返回 active 钱包；传 `all: true` 时包含 inactive 历史钱包。每个钱包返回 `address`、`index`、`active`、`balanceRaw` 和 ETH 单位的 `balance`，不会返回私钥。
+`getWalletBalances` 是兼容别名。默认只返回 active 钱包；传 `all: true` 时包含 inactive 历史钱包。每个钱包返回 `address`、`index`、`active`、`balanceRaw` 和 ETH 单位的数字型 `balance`，并按 `index` 合并线路 `walletConfig[index]` 中的 `transferAmount`、买入/卖出阶段配置（例如 `firstBuy`、`firstSell`），不会返回私钥。
 
 ### 4.2 查询 boss
 
