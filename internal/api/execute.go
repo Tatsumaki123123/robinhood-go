@@ -1488,7 +1488,10 @@ func (a *API) executeSellData(ctx context.Context, d map[string]any) (map[string
 	}
 	configItems := executeConfigItems(line.Config)
 	wallets, err := a.executeSelectedWallets(ctx, batch, low(str(d["walletAddress"])))
-	if err != nil || len(wallets) == 0 {
+	if err != nil {
+		return nil, err
+	}
+	if len(wallets) == 0 && stage != "all" {
 		return nil, fmt.Errorf("there are no active execute wallets")
 	}
 	type sellJob struct {
@@ -1521,7 +1524,7 @@ func (a *API) executeSellData(ctx context.Context, d map[string]any) (map[string
 		}
 		jobs = append(jobs, sellJob{wallet: wallet, amount: amount})
 	}
-	if len(jobs) == 0 {
+	if len(jobs) == 0 && stage != "all" {
 		return nil, fmt.Errorf("there are no execute wallets enabled for %sSell", stage)
 	}
 	results := make([]any, len(jobs))
@@ -1675,7 +1678,7 @@ func (a *API) executeAveTokenList(ctx context.Context, line store.ExecuteLine, e
 	}
 	excluded := map[string]bool{}
 	for _, token := range existing {
-		if token.Status == "buy" || token.Status == "sell" {
+		if token.Status == "buy" {
 			excluded[strings.ToLower(token.TokenAddress)] = true
 		}
 	}

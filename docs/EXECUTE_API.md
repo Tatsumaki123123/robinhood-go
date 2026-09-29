@@ -405,7 +405,7 @@ POST /api/v1/executerobin/deleteToken
 { "tid": 1 }
 ```
 
-只允许删除 `pending` 状态任务。
+只允许删除 `pending` 状态任务。删除或完成全部卖出后可以再次调用 `checkToken`；同一批次的已卖出任务会重置为 `pending`，并重新出现在 AVE 候选列表。
 
 ## 6. 买入和卖出接口
 
@@ -475,7 +475,7 @@ POST /api/v1/executerobin/sellToken
 - `type=first/second/third/multi` 只选择对应 `*Sell.enable=true` 的钱包。
 - `type=all` 忽略阶段卖出配置，对所有 active 钱包按 100% 计算。
 - `type` 可以是数组，服务按数组顺序逐阶段执行。
-- `type=all` 成功后任务状态更新为 `sell`。
+- `type=all` 成功后任务状态更新为 `sell`；所有 active 钱包的 token 余额均为零时也返回成功，`results` 为 `[]`。
 
 卖出前服务会准备目标 ERC-20 的 Permit2/Router 授权。
 

@@ -36,7 +36,7 @@ updateLineData -> start -> generateWallets -> checkToken -> buyToken
 | `POST /api/v1/executerobin/getBossPrivateKey` | `eid` 或 `line`、`password` | 使用私钥导出密码导出当前 active boss 私钥 |
 | `POST /api/v1/executerobin/getLines` | 无 | 查询 execute 线路列表，不返回 boss 私钥 |
 | `POST /api/v1/executerobin/getTokenAccounts` | `eid` 或 `line`、`tokenAddress` | 查询执行钱包的 ERC-20 token balance |
-| `POST /api/v1/executerobin/deleteToken` | `tid` | 只删除 `pending` 状态的 execute token |
+| `POST /api/v1/executerobin/deleteToken` | `tid` | 删除 `pending` 状态的 execute token；之后可重新检查 |
 | `POST /api/v1/executerobin/getBuyTokes` | `eid`、`line` 或 `tid` | 按批次返回 `pending/buy` token 列表及数量，传 `tid` 时返回单个任务 |
 | `POST /api/v1/executerobin/tokenList` | `eid` 或 `line` | `sourceWeb=ave` 时查询并过滤 Robinhood AVE 的 V4 候选池，否则查询批次代币任务 |
 | `POST /api/v1/executerobin/nextWallet` | `eid`、可选 `walletAddress` | 替换一个或全部 active 执行钱包；先把旧钱包可用 ETH 转给新钱包，原索引保持不变 |
