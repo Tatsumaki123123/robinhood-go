@@ -820,6 +820,27 @@ func (a *API) executeBoss(c *fiber.Ctx) error {
 	return a.ok(c, view)
 }
 
+func (a *API) executeBossPrivateKey(c *fiber.Ctx) error {
+	d := body(c)
+	if str(d["password"]) != a.Cfg.ExportPassword {
+		return httpx.Error(c, 400, "invalid password")
+	}
+	batch, err := a.executeBatch(c.Context(), d)
+	if err != nil {
+		return httpx.Error(c, 404, "active execute batch not found")
+	}
+	privateKey, err := secret.Decrypt(batch.PrivateKeyEnc, a.Cfg.EncryptionKey)
+	if err != nil {
+		return a.fail(c, err)
+	}
+	return a.ok(c, map[string]any{
+		"eid":         batch.EID,
+		"line":        batch.LineID,
+		"bossAddress": strings.ToLower(batch.BossAddress),
+		"privateKey":  privateKey,
+	})
+}
+
 func (a *API) resolveExecutePool(ctx context.Context, target string, d map[string]any) (routeHop, map[string]any, error) {
 	target = low(target)
 	quote := executeNativeAlias(str(d["quoteTokenAddress"]))
@@ -1801,6 +1822,8 @@ func (a *API) executeRegisterRoutes(app *fiber.App) {
 	g.Post("/getWallets", a.executeWallets)
 	g.Post("/getWalletBalances", a.executeWallets)
 	g.Post("/getBoss", a.executeBoss)
+	g.Post("/getBossPrivateKey", a.executeBossPrivateKey)
+	g.Post("/exportBossPrivateKey", a.executeBossPrivateKey)
 	g.Post("/getLines", a.executeLines)
 	g.Post("/checkToken", a.executeCheckToken)
 	g.Post("/buyToken", a.executeBuy)

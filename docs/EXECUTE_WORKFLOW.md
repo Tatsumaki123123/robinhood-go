@@ -33,6 +33,7 @@ updateLineData -> start -> generateWallets -> checkToken -> buyToken
 | `POST /api/v1/executerobin/getWallets` | `eid` 或 `line` | 查询 active 批次钱包及 ETH balance（传 `all:true` 可包含 inactive 钱包，不含私钥） |
 | `POST /api/v1/executerobin/getWalletBalances` | `eid` 或 `line` | `getWallets` 的余额查询兼容别名 |
 | `POST /api/v1/executerobin/getBoss` | `eid` 或 `line` | 查询 boss 地址、ETH balance 和批次 token 数量 |
+| `POST /api/v1/executerobin/getBossPrivateKey` | `eid` 或 `line`、`password` | 使用私钥导出密码导出当前 active boss 私钥 |
 | `POST /api/v1/executerobin/getLines` | 无 | 查询 execute 线路列表，不返回 boss 私钥 |
 | `POST /api/v1/executerobin/getTokenAccounts` | `eid` 或 `line`、`tokenAddress` | 查询执行钱包的 ERC-20 token balance |
 | `POST /api/v1/executerobin/deleteToken` | `tid` | 只删除 `pending` 状态的 execute token |

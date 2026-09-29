@@ -277,7 +277,26 @@ POST /api/v1/executerobin/getBoss
 
 返回批次信息、`bossAddress`、`balanceRaw`、ETH 单位的 `balance` 和 `tokenCount`。
 
-### 4.3 替换执行钱包
+### 4.3 导出 boss 私钥
+
+```http
+POST /api/v1/executerobin/getBossPrivateKey
+```
+
+请求需要传入 `eid` 或 `line`，以及服务端配置的
+`ROBINHOOD_MONITOR_PRIVATE_KEY_EXPORT_PASSWORD`：
+
+```json
+{
+  "eid": 1,
+  "password": "your-export-password"
+}
+```
+
+成功返回当前 active batch 的 `eid`、`line`、`bossAddress` 和 `privateKey`。
+兼容路径为 `/api/v1/executerobin/exportBossPrivateKey`。
+
+### 4.4 替换执行钱包
 
 ```http
 POST /api/v1/executerobin/nextWallet
