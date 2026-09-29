@@ -1208,12 +1208,20 @@ func (a *API) executeCheckToken(c *fiber.Ctx) error {
 	if ruleErr := a.executeCheckTokenRules(c.Context(), line, target); ruleErr != nil {
 		return a.fail(c, ruleErr)
 	}
-	metadata := map[string]any{"name": str(d["tokenName"]), "symbol": str(d["tokenSymbol"]), "pair": pair}
-	if metadata["name"] == "" {
-		metadata["name"] = str(pairValue(pair, "token_name", "name"))
+	name := str(d["tokenName"])
+	symbol := str(d["tokenSymbol"])
+	if name == "" {
+		name = str(aveValue([]map[string]any{pair}, "token_name", "name_en", "name_zh", "name"))
 	}
-	if metadata["symbol"] == "" {
-		metadata["symbol"] = str(pairValue(pair, "token_symbol", "symbol"))
+	if symbol == "" {
+		symbol = str(aveValue([]map[string]any{pair}, "token_symbol", "symbol"))
+	}
+	if symbol == "" {
+		if strings.EqualFold(str(pairValue(pair, "token0_address", "token0Address")), target) {
+			symbol = str(pairValue(pair, "token0_symbol", "token0Symbol"))
+		} else if strings.EqualFold(str(pairValue(pair, "token1_address", "token1Address")), target) {
+			symbol = str(pairValue(pair, "token1_symbol", "token1Symbol"))
+		}
 	}
 	status := "pending"
 	if current, currentErr := a.Store.ExecuteTokenByPool(c.Context(), batch.EID, target, targetHop.PoolID); currentErr == nil {
@@ -1221,7 +1229,17 @@ func (a *API) executeCheckToken(c *fiber.Ctx) error {
 		if status == "sell" || status == "end" {
 			status = "pending"
 		}
+		if name == "" {
+			name = str(current.Metadata["name"])
+		}
+		if symbol == "" {
+			symbol = str(current.Metadata["symbol"])
+		}
 	}
+	if name == "" {
+		name = symbol
+	}
+	metadata := map[string]any{"name": name, "symbol": symbol, "pair": pair}
 	token := store.ExecuteToken{EID: batch.EID, LineID: batch.LineID, TokenAddress: target, PoolID: targetHop.PoolID, QuoteTokenAddress: quote, Currency0: targetHop.Currency0, Currency1: targetHop.Currency1, Fee: int(targetHop.Fee), TickSpacing: int(targetHop.TickSpacing), Hooks: targetHop.Hooks, RouteBuy: buyHops, RouteSell: sellHops, AMM: "uniswapv4", Status: status, Metadata: metadata}
 	tracked, err := a.Store.UpsertExecuteToken(c.Context(), token)
 	if err != nil {
