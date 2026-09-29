@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -190,6 +192,101 @@ func defaultExecuteLineConfig(name string) map[string]any {
 		"minFollowStates": 2,
 		"maxBuyTax":       1.5,
 		"lineBots":        []any{},
+	}
+}
+
+var (
+	executeConfigFieldOrder    = []string{"autoSwap", "name", "walletConfig", "sourceWeb", "groupSort", "minFollowStates", "maxBuyTax", "lineBots", "withdrawAddress"}
+	executeGroupSortFieldOrder = []string{"sort_field", "sort_order", "mcp_min", "mcp_max", "create_day", "create_day_end", "category", "address", "duration"}
+	executeWalletFieldOrder    = []string{"firstBuy", "firstSell", "transferAmount"}
+	executeBuyFieldOrder       = []string{"buyAmount", "enable"}
+	executeSellFieldOrder      = []string{"enable", "sellRatio"}
+)
+
+type orderedExecuteConfig map[string]any
+
+func (c orderedExecuteConfig) MarshalJSON() ([]byte, error) {
+	return marshalExecuteOrderedMap(map[string]any(c), executeConfigFieldOrder)
+}
+
+func executeNestedConfigOrder(key string) []string {
+	switch key {
+	case "groupSort":
+		return executeGroupSortFieldOrder
+	case "walletConfig":
+		return executeWalletFieldOrder
+	case "firstBuy":
+		return executeBuyFieldOrder
+	case "firstSell":
+		return executeSellFieldOrder
+	default:
+		return nil
+	}
+}
+
+func marshalExecuteOrderedMap(values map[string]any, preferred []string) ([]byte, error) {
+	keys := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, key := range preferred {
+		if _, ok := values[key]; ok {
+			keys = append(keys, key)
+			seen[key] = true
+		}
+	}
+	remaining := make([]string, 0, len(values)-len(keys))
+	for key := range values {
+		if !seen[key] {
+			remaining = append(remaining, key)
+		}
+	}
+	sort.Strings(remaining)
+	keys = append(keys, remaining...)
+
+	var out bytes.Buffer
+	out.WriteByte('{')
+	for index, key := range keys {
+		if index > 0 {
+			out.WriteByte(',')
+		}
+		encodedKey, err := json.Marshal(key)
+		if err != nil {
+			return nil, err
+		}
+		out.Write(encodedKey)
+		out.WriteByte(':')
+		encodedValue, err := marshalExecuteOrderedValue(values[key], executeNestedConfigOrder(key))
+		if err != nil {
+			return nil, err
+		}
+		out.Write(encodedValue)
+	}
+	out.WriteByte('}')
+	return out.Bytes(), nil
+}
+
+func marshalExecuteOrderedValue(value any, preferred []string) ([]byte, error) {
+	switch item := value.(type) {
+	case map[string]any:
+		return marshalExecuteOrderedMap(item, preferred)
+	case orderedExecuteConfig:
+		return marshalExecuteOrderedMap(map[string]any(item), preferred)
+	case []any:
+		var out bytes.Buffer
+		out.WriteByte('[')
+		for index, element := range item {
+			if index > 0 {
+				out.WriteByte(',')
+			}
+			encoded, err := marshalExecuteOrderedValue(element, preferred)
+			if err != nil {
+				return nil, err
+			}
+			out.Write(encoded)
+		}
+		out.WriteByte(']')
+		return out.Bytes(), nil
+	default:
+		return json.Marshal(value)
 	}
 }
 
@@ -381,7 +478,7 @@ func (a *API) executeLineUpdate(c *fiber.Ctx) error {
 			return a.fail(c, batchErr)
 		}
 	}
-	return a.ok(c, map[string]any{"line": updated.LineID, "name": updated.Name, "config": cfg, "bossAddress": updated.BossAddress, "enabled": updated.Enabled, "createdAt": updated.CreatedAt, "updatedAt": updated.UpdatedAt})
+	return a.ok(c, map[string]any{"line": updated.LineID, "name": updated.Name, "config": orderedExecuteConfig(cfg), "bossAddress": updated.BossAddress, "enabled": updated.Enabled, "createdAt": updated.CreatedAt, "updatedAt": updated.UpdatedAt})
 }
 
 func (a *API) executeLines(c *fiber.Ctx) error {
@@ -389,10 +486,24 @@ func (a *API) executeLines(c *fiber.Ctx) error {
 	if err != nil {
 		return a.fail(c, err)
 	}
+	result := make([]map[string]any, 0, len(lines))
 	for index := range lines {
 		delete(lines[index].Config, "walletCount")
+		item := map[string]any{
+			"line":        lines[index].LineID,
+			"name":        lines[index].Name,
+			"config":      orderedExecuteConfig(lines[index].Config),
+			"bossAddress": lines[index].BossAddress,
+			"enabled":     lines[index].Enabled,
+			"createdAt":   lines[index].CreatedAt,
+			"updatedAt":   lines[index].UpdatedAt,
+		}
+		if lines[index].UserID != 0 {
+			item["userId"] = lines[index].UserID
+		}
+		result = append(result, item)
 	}
-	return a.ok(c, lines)
+	return a.ok(c, result)
 }
 
 func executeFloatValue(v any) (float64, bool) {
@@ -542,7 +653,7 @@ func (a *API) executeAddLine(c *fiber.Ctx) error {
 	return a.ok(c, map[string]any{
 		"line":        updated.LineID,
 		"name":        updated.Name,
-		"config":      updated.Config,
+		"config":      orderedExecuteConfig(updated.Config),
 		"bossAddress": updated.BossAddress,
 		"enabled":     updated.Enabled,
 		"eid":         batch.EID,
