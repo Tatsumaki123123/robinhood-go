@@ -356,7 +356,7 @@ POST /api/v1/executerobin/checkToken
 
 可选字段：`poolId`、`routeBuy`、`routeSell`、`tokenName`、`tokenSymbol`、`quoteTokenSymbol`、`forceCheck`。
 
-服务会重新计算并校验 PoolId，检查 PoolKey 地址和 route hop 是否连接。没有显式 route 时，会尝试发现 native ETH 到目标 token 的 1--3 跳 V4 路由。线路配置中的 `maxBuyTax` 会校验 AVE 的 `total_buy_tax`，`minFollowStates` 会校验 AVE 关注聚合数据中的 `all`，`lineBots` 会统计这些 EVM 地址的 ERC-20 持仓；规则不满足时不会创建 token 任务。成功返回的 `data` 是 ExecuteToken，包含 `tid`、`eid`、`poolId`、`routeBuy`、`routeSell`、`status` 等字段。
+服务会重新计算并校验 PoolId，检查 PoolKey 地址和 route hop 是否连接。没有显式 route 时，会尝试发现 native ETH 到目标 token 的 1--3 跳 V4 路由。线路配置中的 `maxBuyTax` 会校验 AVE 的 `total_buy_tax`，`minFollowStates` 会校验 AVE 关注聚合数据中的 `all`。`lineBots` 的 ERC-20 余额总和按 token 的 `decimals` 换算后必须小于 100；规则不满足时不会创建 token 任务。成功返回的 `data` 是 ExecuteToken，包含 `tid`、`eid`、`poolId`、`routeBuy`、`routeSell`、`status` 等字段。
 
 默认情况下，如果其他 eid 已经在买入同一 token，会返回冲突错误；确需重新检查时传 `forceCheck: true`。
 
@@ -393,7 +393,7 @@ POST /api/v1/executerobin/getTokenAccounts
 }
 ```
 
-也可以使用 `token` 代替 `tokenAddress`。返回执行钱包和当前线路 `lineBots` 地址的 ERC-20 持仓；执行钱包包含 `walletIndex`，两类地址都包含 `balanceRaw`、`balanceNonZero` 和 `source`（分别为 `executeWallet` 或 `lineBot`）。重复配置的地址只返回一次。
+也可以使用 `token` 代替 `tokenAddress`。返回 `tokenAccounts` 和 `lineBotsAccounts` 两个数组。执行钱包条目包含 `address`、`tokenBalance`；线路机器人条目还包含配置中的 `name`。`tokenBalance` 是按 ERC-20 `decimals` 换算后的数字，余额为零时返回 `0`。
 
 ### 5.5 删除待处理 Token
 

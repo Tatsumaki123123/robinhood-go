@@ -531,14 +531,19 @@ func executeFloatValue(v any) (float64, bool) {
 	return value, err == nil && !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
-func executeLineBotAddresses(raw any) ([]string, error) {
-	addresses := []string{}
+type executeLineBot struct {
+	Name    string
+	Address string
+}
+
+func executeLineBots(raw any) ([]executeLineBot, error) {
+	bots := []executeLineBot{}
 	appendBot := func(item map[string]any) error {
 		address := low(str(item["address"]))
 		if !common.IsHexAddress(address) || address == executeZeroCurve {
 			return fmt.Errorf("lineBots contains an invalid EVM address")
 		}
-		addresses = append(addresses, address)
+		bots = append(bots, executeLineBot{Name: str(item["name"]), Address: address})
 		return nil
 	}
 	switch items := raw.(type) {
@@ -562,15 +567,15 @@ func executeLineBotAddresses(raw any) ([]string, error) {
 	default:
 		return nil, fmt.Errorf("lineBots must be an array")
 	}
-	return addresses, nil
+	return bots, nil
 }
 
 func (a *API) executeCheckLineBotBalance(ctx context.Context, line store.ExecuteLine, token string) error {
-	addresses, err := executeLineBotAddresses(line.Config["lineBots"])
+	bots, err := executeLineBots(line.Config["lineBots"])
 	if err != nil {
 		return err
 	}
-	if len(addresses) == 0 {
+	if len(bots) == 0 {
 		return nil
 	}
 	decimals, err := a.RPC.ERC20Decimals(ctx, token)
@@ -578,16 +583,16 @@ func (a *API) executeCheckLineBotBalance(ctx context.Context, line store.Execute
 		return fmt.Errorf("read line bot token decimals: %w", err)
 	}
 	total := big.NewInt(0)
-	for _, address := range addresses {
-		balance, balanceErr := a.RPC.ERC20Balance(ctx, token, address)
+	for _, bot := range bots {
+		balance, balanceErr := a.RPC.ERC20Balance(ctx, token, bot.Address)
 		if balanceErr != nil {
 			return fmt.Errorf("read line bot token balance: %w", balanceErr)
 		}
 		total.Add(total, balance)
 	}
-	threshold := new(big.Int).Mul(big.NewInt(1000), new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil))
-	if total.Cmp(threshold) > 0 {
-		return fmt.Errorf("line bots hold more than 1000 tokens")
+	threshold := new(big.Int).Mul(big.NewInt(100), new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil))
+	if total.Cmp(threshold) >= 0 {
+		return fmt.Errorf("line bots hold 100 or more tokens")
 	}
 	return nil
 }
@@ -1715,6 +1720,17 @@ func (a *API) executeBuyTokens(c *fiber.Ctx) error {
 	return a.ok(c, map[string]any{"list": list, "total": len(list)})
 }
 
+type executeTokenAccountBalance struct {
+	Address      string      `json:"address"`
+	TokenBalance json.Number `json:"tokenBalance"`
+}
+
+type executeLineBotTokenBalance struct {
+	Name         string      `json:"name"`
+	Address      string      `json:"address"`
+	TokenBalance json.Number `json:"tokenBalance"`
+}
+
 func (a *API) executeTokenAccounts(c *fiber.Ctx) error {
 	d := body(c)
 	batch, err := a.executeBatch(c.Context(), d)
@@ -1736,48 +1752,40 @@ func (a *API) executeTokenAccounts(c *fiber.Ctx) error {
 	if err != nil {
 		return a.fail(c, err)
 	}
-	lineBotAddresses, err := executeLineBotAddresses(line.Config["lineBots"])
+	lineBots, err := executeLineBots(line.Config["lineBots"])
 	if err != nil {
 		return a.fail(c, err)
 	}
-	accounts := make([]map[string]any, 0, len(wallets))
-	seen := make(map[string]struct{}, len(wallets)+len(lineBotAddresses))
+	decimals, err := a.RPC.ERC20Decimals(c.Context(), tokenAddress)
+	if err != nil {
+		return a.fail(c, fmt.Errorf("read token decimals: %w", err))
+	}
+	tokenAccounts := make([]executeTokenAccountBalance, 0, len(wallets))
 	for _, wallet := range wallets {
 		balance, balanceErr := a.RPC.ERC20Balance(c.Context(), tokenAddress, wallet.Address)
 		if balanceErr != nil {
 			return a.fail(c, balanceErr)
 		}
-		address := strings.ToLower(wallet.Address)
-		seen[address] = struct{}{}
-		accounts = append(accounts, map[string]any{
-			"address":        address,
-			"tokenAddress":   tokenAddress,
-			"balanceRaw":     balance.String(),
-			"walletIndex":    wallet.WalletIndex,
-			"executeBatch":   batch.EID,
-			"source":         "executeWallet",
-			"balanceNonZero": balance.Sign() > 0,
+		amount, _ := scaledRawAmount(balance.String(), decimals)
+		tokenAccounts = append(tokenAccounts, executeTokenAccountBalance{
+			Address: strings.ToLower(wallet.Address), TokenBalance: json.Number(amount),
 		})
 	}
-	for _, address := range lineBotAddresses {
-		if _, exists := seen[address]; exists {
-			continue
-		}
-		balance, balanceErr := a.RPC.ERC20Balance(c.Context(), tokenAddress, address)
+	lineBotsAccounts := make([]executeLineBotTokenBalance, 0, len(lineBots))
+	for _, bot := range lineBots {
+		balance, balanceErr := a.RPC.ERC20Balance(c.Context(), tokenAddress, bot.Address)
 		if balanceErr != nil {
 			return a.fail(c, balanceErr)
 		}
-		accounts = append(accounts, map[string]any{
-			"address":        address,
-			"tokenAddress":   tokenAddress,
-			"balanceRaw":     balance.String(),
-			"executeBatch":   batch.EID,
-			"source":         "lineBot",
-			"balanceNonZero": balance.Sign() > 0,
+		amount, _ := scaledRawAmount(balance.String(), decimals)
+		lineBotsAccounts = append(lineBotsAccounts, executeLineBotTokenBalance{
+			Name: bot.Name, Address: bot.Address, TokenBalance: json.Number(amount),
 		})
-		seen[address] = struct{}{}
 	}
-	return a.ok(c, map[string]any{"eid": batch.EID, "tokenAddress": tokenAddress, "wallets": accounts})
+	return a.ok(c, struct {
+		TokenAccounts    []executeTokenAccountBalance `json:"tokenAccounts"`
+		LineBotsAccounts []executeLineBotTokenBalance `json:"lineBotsAccounts"`
+	}{tokenAccounts, lineBotsAccounts})
 }
 
 func (a *API) executeDeleteToken(c *fiber.Ctx) error {
