@@ -1732,20 +1732,50 @@ func (a *API) executeTokenAccounts(c *fiber.Ctx) error {
 	if err != nil {
 		return a.fail(c, err)
 	}
+	line, err := a.Store.ExecuteLine(c.Context(), batch.LineID)
+	if err != nil {
+		return a.fail(c, err)
+	}
+	lineBotAddresses, err := executeLineBotAddresses(line.Config["lineBots"])
+	if err != nil {
+		return a.fail(c, err)
+	}
 	accounts := make([]map[string]any, 0, len(wallets))
+	seen := make(map[string]struct{}, len(wallets)+len(lineBotAddresses))
 	for _, wallet := range wallets {
 		balance, balanceErr := a.RPC.ERC20Balance(c.Context(), tokenAddress, wallet.Address)
 		if balanceErr != nil {
 			return a.fail(c, balanceErr)
 		}
+		address := strings.ToLower(wallet.Address)
+		seen[address] = struct{}{}
 		accounts = append(accounts, map[string]any{
-			"address":        wallet.Address,
+			"address":        address,
 			"tokenAddress":   tokenAddress,
 			"balanceRaw":     balance.String(),
 			"walletIndex":    wallet.WalletIndex,
 			"executeBatch":   batch.EID,
+			"source":         "executeWallet",
 			"balanceNonZero": balance.Sign() > 0,
 		})
+	}
+	for _, address := range lineBotAddresses {
+		if _, exists := seen[address]; exists {
+			continue
+		}
+		balance, balanceErr := a.RPC.ERC20Balance(c.Context(), tokenAddress, address)
+		if balanceErr != nil {
+			return a.fail(c, balanceErr)
+		}
+		accounts = append(accounts, map[string]any{
+			"address":        address,
+			"tokenAddress":   tokenAddress,
+			"balanceRaw":     balance.String(),
+			"executeBatch":   batch.EID,
+			"source":         "lineBot",
+			"balanceNonZero": balance.Sign() > 0,
+		})
+		seen[address] = struct{}{}
 	}
 	return a.ok(c, map[string]any{"eid": batch.EID, "tokenAddress": tokenAddress, "wallets": accounts})
 }

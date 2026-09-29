@@ -393,7 +393,7 @@ POST /api/v1/executerobin/getTokenAccounts
 }
 ```
 
-也可以使用 `token` 代替 `tokenAddress`。返回每个执行钱包的 ERC-20 `balanceRaw`、`walletIndex` 和 `balanceNonZero`。
+也可以使用 `token` 代替 `tokenAddress`。返回执行钱包和当前线路 `lineBots` 地址的 ERC-20 持仓；执行钱包包含 `walletIndex`，两类地址都包含 `balanceRaw`、`balanceNonZero` 和 `source`（分别为 `executeWallet` 或 `lineBot`）。重复配置的地址只返回一次。
 
 ### 5.5 删除待处理 Token
 
