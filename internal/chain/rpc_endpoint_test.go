@@ -3,6 +3,7 @@ package chain
 import (
 	"context"
 	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -53,5 +54,41 @@ func TestRPCEndpointSeparation(t *testing.T) {
 	}
 	if fallbackCalls.Load() != 1 {
 		t.Fatalf("expected empty send endpoint to fall back to read endpoint, got %d calls", fallbackCalls.Load())
+	}
+}
+
+func TestEstimateNativeGasRetriesWithoutZeroGasPrice(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var body struct {
+			Method string           `json:"method"`
+			Params []map[string]any `json:"params"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		if body.Method != "eth_estimateGas" || len(body.Params) != 1 {
+			t.Errorf("unexpected estimate request: %+v", body)
+			return
+		}
+		calls++
+		if calls == 1 {
+			if body.Params[0]["gasPrice"] != "0x0" {
+				t.Errorf("first estimate must omit gas charges: %+v", body.Params[0])
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "error": map[string]any{"code": -32000, "message": "fee cap below base fee"}})
+			return
+		}
+		if _, hasPrice := body.Params[0]["gasPrice"]; hasPrice {
+			t.Errorf("retry retained gasPrice: %+v", body.Params[0])
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": 1, "result": "0xcf08"})
+	}))
+	defer server.Close()
+
+	gas, err := New(server.URL, "").EstimateNativeGas(context.Background(), "0x0000000000000000000000000000000000000001", "0x0000000000000000000000000000000000000002", big.NewInt(1))
+	if err != nil || gas != 53000 || calls != 2 {
+		t.Fatalf("estimate gas = %d, calls = %d, err = %v", gas, calls, err)
 	}
 }

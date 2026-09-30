@@ -227,7 +227,7 @@ POST /api/v1/executerobin/end
 { "eid": 1 }
 ```
 
-或者传 `{ "line": 1001 }`。接口会把执行钱包可转出的原生币扣除转账 gas 后归集到 boss，返回 `eid`、`recycled` 交易结果和 `dust` 零头数组。余额为 0 的钱包跳过；余额大于 0 但不超过当时一笔普通转账 gas 成本的，视为不可转出的零头并在 `dust` 中返回 `address`、`balanceRaw`、`gasCostRaw`（单位均为 wei），接口仍返回成功。转账后若仍有超过 gas 成本的余额，则返回错误。
+或者传 `{ "line": 1001 }`。接口会把执行钱包可转出的原生币扣除转账 gas 后归集到 boss，返回 `eid`、`recycled` 交易结果和 `dust` 零头数组。原生币转账的 gas limit 由 RPC 估算，最低按 30000 预留。余额为 0 的钱包跳过；余额大于 0 但不超过该 gas limit 乘以 gas 价格的，视为零头并在 `dust` 中返回 `address`、`balanceRaw`、`gasCostRaw`（单位均为 wei），接口仍返回成功。转账后若仍有超过 gas 成本的余额，则返回错误。
 
 ### 3.9 boss 提现
 

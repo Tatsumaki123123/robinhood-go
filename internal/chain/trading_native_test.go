@@ -26,8 +26,8 @@ func TestSendNativeAllUsesSignedGasPriceForAmount(t *testing.T) {
 	var sent *types.Transaction
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Method string   `json:"method"`
-			Params []string `json:"params"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("decode RPC request: %v", err)
@@ -40,6 +40,8 @@ func TestSendNativeAllUsesSignedGasPriceForAmount(t *testing.T) {
 			result = fmt.Sprintf("0x%x", gasPrice/int64(gasPriceCalls))
 		case "eth_getBalance":
 			result = fmt.Sprintf("0x%x", balance)
+		case "eth_estimateGas":
+			result = "0xcf08" // 53,000 gas
 		case "eth_getTransactionCount":
 			result = "0x0"
 		case "eth_sendRawTransaction":
@@ -47,7 +49,12 @@ func TestSendNativeAllUsesSignedGasPriceForAmount(t *testing.T) {
 				t.Errorf("unexpected send params: %v", req.Params)
 				return
 			}
-			raw, err := hex.DecodeString(req.Params[0][2:])
+			var rawHex string
+			if err := json.Unmarshal(req.Params[0], &rawHex); err != nil {
+				t.Errorf("decode raw transaction param: %v", err)
+				return
+			}
+			raw, err := hex.DecodeString(rawHex[2:])
 			if err != nil {
 				t.Errorf("decode transaction: %v", err)
 				return
@@ -76,9 +83,9 @@ func TestSendNativeAllUsesSignedGasPriceForAmount(t *testing.T) {
 	if gasPriceCalls != 1 || sent == nil {
 		t.Fatalf("expected one gas quote and a transaction, got %d quotes and transaction %v", gasPriceCalls, sent)
 	}
-	expected := big.NewInt(balance - 21000*gasPrice)
-	if sent.Value().Cmp(expected) != 0 || sent.GasPrice().Cmp(big.NewInt(gasPrice)) != 0 {
-		t.Fatalf("sweep value %s and gas price %s, want %s and %d", sent.Value(), sent.GasPrice(), expected, gasPrice)
+	expected := big.NewInt(balance - 53000*gasPrice)
+	if sent.Value().Cmp(expected) != 0 || sent.GasPrice().Cmp(big.NewInt(gasPrice)) != 0 || sent.Gas() != 53000 {
+		t.Fatalf("sweep value %s, gas price %s, gas limit %d; want %s, %d, 53000", sent.Value(), sent.GasPrice(), sent.Gas(), expected, gasPrice)
 	}
 }
 
@@ -101,6 +108,8 @@ func TestSendNativeAllReportsDustBalance(t *testing.T) {
 			result = "0x3938700" // 60,000,000 wei
 		case "eth_getBalance":
 			result = "0xb14d0e6380" // 761,502,000,000 wei
+		case "eth_estimateGas":
+			result = "0x5208" // 21,000 gas; transfers reserve at least 30,000
 		default:
 			t.Errorf("unexpected RPC method: %s", req.Method)
 			return
@@ -115,7 +124,7 @@ func TestSendNativeAllReportsDustBalance(t *testing.T) {
 	if !errors.As(err, &insufficient) {
 		t.Fatalf("expected insufficient sweep balance, got %v", err)
 	}
-	if insufficient.Balance.Cmp(big.NewInt(761_502_000_000)) != 0 || insufficient.GasCost.Cmp(big.NewInt(1_260_000_000_000)) != 0 {
+	if insufficient.Balance.Cmp(big.NewInt(761_502_000_000)) != 0 || insufficient.GasCost.Cmp(big.NewInt(1_800_000_000_000)) != 0 {
 		t.Fatalf("unexpected balance %s or gas cost %s", insufficient.Balance, insufficient.GasCost)
 	}
 }

@@ -620,13 +620,14 @@ func (t *Trading) sendNative(ctx context.Context, privateKey, to string, amount 
 	if err != nil {
 		return nil, err
 	}
-	gas := uint64(21000)
+	estimateValue := amount
+	var balance *big.Int
 	if all {
 		balanceHex, balanceErr := t.RPC.Balance(ctx, from)
 		if balanceErr != nil {
 			return nil, balanceErr
 		}
-		balance := new(big.Int)
+		balance = new(big.Int)
 		if strings.HasPrefix(balanceHex, "0x") {
 			if _, ok := balance.SetString(balanceHex[2:], 16); !ok {
 				return nil, fmt.Errorf("invalid native balance")
@@ -634,6 +635,16 @@ func (t *Trading) sendNative(ctx context.Context, privateKey, to string, amount 
 		} else if _, ok := balance.SetString(balanceHex, 10); !ok {
 			return nil, fmt.Errorf("invalid native balance")
 		}
+		if balance.Sign() == 0 {
+			return nil, &NativeSweepInsufficientError{Balance: balance, GasCost: big.NewInt(0)}
+		}
+		estimateValue = big.NewInt(1)
+	}
+	gas, err := t.nativeTransferGasLimit(ctx, from, to, estimateValue)
+	if err != nil {
+		return nil, err
+	}
+	if all {
 		gasCost := new(big.Int).Mul(gasPrice, new(big.Int).SetUint64(gas))
 		amount = new(big.Int).Sub(balance, gasCost)
 		if amount.Sign() <= 0 {
@@ -673,12 +684,27 @@ func (t *Trading) gasPrice(ctx context.Context) (*big.Int, error) {
 	return t.RPC.GasPrice(ctx)
 }
 
-func (t *Trading) NativeTransferGasCost(ctx context.Context) (*big.Int, error) {
+func (t *Trading) nativeTransferGasLimit(ctx context.Context, from, to string, value *big.Int) (uint64, error) {
+	gas, err := t.RPC.EstimateNativeGas(ctx, from, to, value)
+	if err != nil {
+		return 0, err
+	}
+	if gas < 30000 {
+		gas = 30000
+	}
+	return gas, nil
+}
+
+func (t *Trading) NativeTransferGasCost(ctx context.Context, from, to string) (*big.Int, error) {
 	gasPrice, err := t.gasPrice(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return new(big.Int).Mul(gasPrice, big.NewInt(21000)), nil
+	gas, err := t.nativeTransferGasLimit(ctx, from, to, big.NewInt(1))
+	if err != nil {
+		return nil, err
+	}
+	return new(big.Int).Mul(gasPrice, new(big.Int).SetUint64(gas)), nil
 }
 
 func (t *Trading) sendContract(ctx context.Context, key *ecdsa.PrivateKey, to common.Address, data []byte, value *big.Int) (string, error) {

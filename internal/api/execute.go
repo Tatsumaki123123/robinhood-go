@@ -775,7 +775,7 @@ func (a *API) executeStart(c *fiber.Ctx) error {
 				return a.fail(c, balanceErr)
 			}
 			if nativeBalance := chain.ToBig(balance); nativeBalance.Sign() > 0 {
-				gasCost, gasErr := a.Trading.NativeTransferGasCost(c.Context())
+				gasCost, gasErr := a.Trading.NativeTransferGasCost(c.Context(), wallet.Address, previous.BossAddress)
 				if gasErr != nil {
 					return a.fail(c, gasErr)
 				}
@@ -1864,7 +1864,7 @@ func (a *API) executeEnd(c *fiber.Ctx) error {
 			return a.fail(c, balanceErr)
 		}
 		if balance := chain.ToBig(balanceRaw); balance.Sign() != 0 {
-			gasCost, gasErr := a.Trading.NativeTransferGasCost(c.Context())
+			gasCost, gasErr := a.Trading.NativeTransferGasCost(c.Context(), wallet.Address, batch.BossAddress)
 			if gasErr != nil {
 				return a.fail(c, gasErr)
 			}

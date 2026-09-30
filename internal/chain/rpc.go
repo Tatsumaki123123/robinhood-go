@@ -430,6 +430,33 @@ func (r *RPC) GasPrice(ctx context.Context) (*big.Int, error) {
 	return n, nil
 }
 
+func (r *RPC) EstimateNativeGas(ctx context.Context, from, to string, value *big.Int) (uint64, error) {
+	amount := big.NewInt(0)
+	if value != nil {
+		amount = value
+	}
+	call := map[string]any{
+		"from": from, "to": to, "value": "0x" + amount.Text(16), "gasPrice": "0x0",
+	}
+	v, err := r.sendCall(ctx, "eth_estimateGas", []any{call})
+	if err != nil {
+		delete(call, "gasPrice")
+		v, err = r.sendCall(ctx, "eth_estimateGas", []any{call})
+	}
+	if err != nil {
+		return 0, err
+	}
+	var gasHex string
+	if err := json.Unmarshal(v, &gasHex); err != nil {
+		return 0, err
+	}
+	gas, err := strconv.ParseUint(strings.TrimPrefix(gasHex, "0x"), 16, 64)
+	if err != nil || gas == 0 {
+		return 0, fmt.Errorf("invalid native gas estimate: %s", gasHex)
+	}
+	return gas, nil
+}
+
 func (r *RPC) BaseFee(ctx context.Context) (*big.Int, error) {
 	v, e := r.sendCall(ctx, "eth_getBlockByNumber", []any{"latest", false})
 	if e != nil {
