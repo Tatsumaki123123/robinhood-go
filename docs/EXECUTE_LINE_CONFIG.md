@@ -149,7 +149,7 @@ wallets = max(len(config.walletConfig), 1)
 
 `walletCount` 不再作为线路配置字段保存或读取。
 
-每个新钱包生成独立 EVM 私钥并加密保存。`transferAmount` 是 JSON number，单位为 ETH；boss 会在生成后按钱包下标向该钱包充值。再次调用时，已有 active 钱包余额为 0 的钱包也会按相同配置补款。
+每个新钱包生成独立 EVM 私钥并加密保存。`transferAmount` 是 JSON number，单位为 ETH；boss 会在生成后按钱包下标向该钱包充值。再次调用时，已有 active 钱包余额低于 `transferAmount` 会补足差额，余额达到或超过该金额时不转账。
 
 ### 3.3 结束和提现
 
@@ -158,7 +158,7 @@ POST /api/v1/executerobin/end
 {"eid": 1}
 ```
 
-`end` 会逐个执行钱包归集原生币，扣除转账 gas 后发送到当前批次 boss。
+`end` 会逐个执行钱包归集原生币，扣除转账 gas 后发送到当前批次 boss。非零余额若不足以支付转账 gas，会先由 boss 补入手续费再归集；boss 余额不足时返回错误。
 
 ```http
 POST /api/v1/executerobin/withdraw

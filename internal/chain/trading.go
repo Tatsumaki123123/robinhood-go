@@ -581,11 +581,32 @@ func (t *Trading) PrepareV4SellApproval(ctx context.Context, privateKey, token s
 // uses this helper so nonce serialization and the configured gas policy stay
 // identical to V4 swaps.
 func (t *Trading) SendNative(ctx context.Context, privateKey, to string, amount *big.Int) (map[string]any, error) {
+	return t.sendNative(ctx, privateKey, to, amount, false)
+}
+
+// NativeSweepInsufficientError reports a non-transferable balance and the
+// quoted fee so callers can fund a non-empty wallet before sweeping it.
+type NativeSweepInsufficientError struct {
+	Balance *big.Int
+	GasCost *big.Int
+}
+
+func (e *NativeSweepInsufficientError) Error() string {
+	return "wallet balance is not enough to pay transfer gas"
+}
+
+// SendNativeAll sends the full spendable balance using the same gas price for
+// both the amount calculation and the signed transaction.
+func (t *Trading) SendNativeAll(ctx context.Context, privateKey, to string) (map[string]any, error) {
+	return t.sendNative(ctx, privateKey, to, nil, true)
+}
+
+func (t *Trading) sendNative(ctx context.Context, privateKey, to string, amount *big.Int, all bool) (map[string]any, error) {
 	keyText := strings.TrimPrefix(strings.TrimSpace(privateKey), "0x")
 	if keyText == "" || !common.IsHexAddress(to) {
 		return nil, fmt.Errorf("privateKey and a valid destination are required")
 	}
-	if amount == nil || amount.Sign() <= 0 {
+	if !all && (amount == nil || amount.Sign() <= 0) {
 		return nil, fmt.Errorf("native transfer amount must be positive")
 	}
 	key, err := gethcrypto.HexToECDSA(keyText)
@@ -595,16 +616,34 @@ func (t *Trading) SendNative(ctx context.Context, privateKey, to string, amount 
 	from := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
 	unlock := t.lockWallet(from)
 	defer unlock()
+	gasPrice, err := t.gasPrice(ctx)
+	if err != nil {
+		return nil, err
+	}
+	gas := uint64(21000)
+	if all {
+		balanceHex, balanceErr := t.RPC.Balance(ctx, from)
+		if balanceErr != nil {
+			return nil, balanceErr
+		}
+		balance := new(big.Int)
+		if strings.HasPrefix(balanceHex, "0x") {
+			if _, ok := balance.SetString(balanceHex[2:], 16); !ok {
+				return nil, fmt.Errorf("invalid native balance")
+			}
+		} else if _, ok := balance.SetString(balanceHex, 10); !ok {
+			return nil, fmt.Errorf("invalid native balance")
+		}
+		gasCost := new(big.Int).Mul(gasPrice, new(big.Int).SetUint64(gas))
+		amount = new(big.Int).Sub(balance, gasCost)
+		if amount.Sign() <= 0 {
+			return nil, &NativeSweepInsufficientError{Balance: balance, GasCost: gasCost}
+		}
+	}
 	nonce, err := t.reserveNonce(ctx, from, nil)
 	if err != nil {
 		return nil, err
 	}
-	gasPrice, err := t.gasPrice(ctx)
-	if err != nil {
-		t.invalidateNonce(from)
-		return nil, err
-	}
-	gas := uint64(21000)
 	tx := types.NewTx(&types.LegacyTx{Nonce: nonce, To: ptrAddress(to), Value: new(big.Int).Set(amount), GasPrice: gasPrice, Gas: gas})
 	signed, err := types.SignTx(tx, types.LatestSignerForChainID(big.NewInt(t.ChainID)), key)
 	if err != nil {
@@ -627,41 +666,6 @@ func (t *Trading) SendNative(ctx context.Context, privateKey, to string, amount 
 	}
 	return map[string]any{"mode": "live", "status": "confirmed", "transactionHash": hash, "hash": hash, "from": strings.ToLower(from), "to": strings.ToLower(to), "nonce": nonce, "amountRaw": amount.String(), "receipt": receipt}, nil
 }
-
-// SendNativeAll leaves enough native currency to pay the transfer gas and
-// sends the remainder.  It is deliberately explicit about the amount so a
-// caller can use a fixed amount when a wallet must retain a reserve.
-func (t *Trading) SendNativeAll(ctx context.Context, privateKey, to string) (map[string]any, error) {
-	keyText := strings.TrimPrefix(strings.TrimSpace(privateKey), "0x")
-	key, err := gethcrypto.HexToECDSA(keyText)
-	if err != nil {
-		return nil, fmt.Errorf("invalid privateKey: %w", err)
-	}
-	from := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
-	balanceHex, err := t.RPC.Balance(ctx, from)
-	if err != nil {
-		return nil, err
-	}
-	balance := new(big.Int)
-	if strings.HasPrefix(balanceHex, "0x") {
-		if _, ok := balance.SetString(balanceHex[2:], 16); !ok {
-			return nil, fmt.Errorf("invalid native balance")
-		}
-	} else if _, ok := balance.SetString(balanceHex, 10); !ok {
-		return nil, fmt.Errorf("invalid native balance")
-	}
-	gasPrice, err := t.gasPrice(ctx)
-	if err != nil {
-		return nil, err
-	}
-	gasCost := new(big.Int).Mul(gasPrice, big.NewInt(21000))
-	amount := new(big.Int).Sub(balance, gasCost)
-	if amount.Sign() <= 0 {
-		return nil, fmt.Errorf("wallet balance is not enough to pay transfer gas")
-	}
-	return t.SendNative(ctx, privateKey, to, amount)
-}
-
 func (t *Trading) gasPrice(ctx context.Context) (*big.Int, error) {
 	if t.FixedGasPrice != nil && t.FixedGasPrice.Sign() > 0 {
 		return new(big.Int).Set(t.FixedGasPrice), nil

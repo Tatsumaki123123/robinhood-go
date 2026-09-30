@@ -215,7 +215,7 @@ POST /api/v1/executerobin/generateWallets
 { "line": 1001 }
 ```
 
-也可以传 `{ "eid": 1 }`。钱包数量为 `max(walletConfig.length, 1)`。每个钱包生成独立私钥并由 boss 按 `transferAmount` 充值。重复调用时，余额为 0 的 active 钱包可以再次补款。
+也可以传 `{ "eid": 1 }`。钱包数量为 `max(walletConfig.length, 1)`。每个钱包生成独立私钥并由 boss 按 `transferAmount` 充值。重复调用时，active 钱包余额低于配置的 `transferAmount` 会由 boss 补足差额；余额达到或超过该金额时不转账。实际转账的钱包会在返回的 `wallets` 条目中包含 `funding` 交易结果。
 
 ### 3.8 结束批次并回收钱包余额
 
@@ -227,7 +227,7 @@ POST /api/v1/executerobin/end
 { "eid": 1 }
 ```
 
-或者传 `{ "line": 1001 }`。接口会把执行钱包的剩余原生币扣除转账 gas 后归集到 boss，返回 `eid` 和 `recycled` 交易结果数组。
+或者传 `{ "line": 1001 }`。接口会把执行钱包的剩余原生币扣除转账 gas 后归集到 boss，返回 `eid` 和 `recycled` 交易结果数组。余额为 0 的钱包跳过；余额不足以支付转账 gas 的钱包会先由 boss 补入手续费，再归集余额。此类结果包含 `gasFunding` 补款交易。boss 余额不足或交易失败时接口返回错误，不会把未清零的钱包作为成功跳过。
 
 ### 3.9 boss 提现
 

@@ -874,25 +874,24 @@ func (a *API) executeGenerateWallets(c *fiber.Ctx) error {
 		if wallet.Active {
 			item := map[string]any{"wallet": executeWalletView(wallet)}
 			if index < len(items) {
-				amount := executePositiveRaw(items[index]["transferAmountRaw"])
-				if amount.Sign() == 0 {
-					amount = executeNativeAmount(items[index]["transferAmount"])
+				target := executePositiveRaw(items[index]["transferAmountRaw"])
+				if target.Sign() == 0 {
+					target = executeNativeAmount(items[index]["transferAmount"])
 				}
-				shouldFund := !found
-				if found {
+				if target.Sign() > 0 {
 					balanceRaw, balanceErr := a.RPC.Balance(c.Context(), wallet.Address)
 					if balanceErr != nil {
 						return a.fail(c, balanceErr)
 					}
-					shouldFund = chain.ToBig(balanceRaw).Sign() == 0
-				}
-				if amount.Sign() > 0 && shouldFund {
-					bossKeyHex := strings.TrimPrefix(bossKey, "0x")
-					transfer, transferErr := a.Trading.SendNative(c.Context(), bossKeyHex, wallet.Address, amount)
-					if transferErr != nil {
-						return a.fail(c, transferErr)
+					amount := new(big.Int).Sub(target, chain.ToBig(balanceRaw))
+					if amount.Sign() > 0 {
+						bossKeyHex := strings.TrimPrefix(bossKey, "0x")
+						transfer, transferErr := a.Trading.SendNative(c.Context(), bossKeyHex, wallet.Address, amount)
+						if transferErr != nil {
+							return a.fail(c, transferErr)
+						}
+						item["funding"] = transfer
 					}
-					item["funding"] = transfer
 				}
 			}
 			result = append(result, item)
@@ -1832,6 +1831,10 @@ func (a *API) executeEnd(c *fiber.Ctx) error {
 	if err != nil {
 		return a.fail(c, err)
 	}
+	bossKey, err := secret.Decrypt(batch.PrivateKeyEnc, a.Cfg.EncryptionKey)
+	if err != nil {
+		return a.fail(c, err)
+	}
 	results := []any{}
 	for _, wallet := range wallets {
 		if strings.EqualFold(wallet.Address, batch.BossAddress) {
@@ -1843,11 +1846,34 @@ func (a *API) executeEnd(c *fiber.Ctx) error {
 		}
 		result, transferErr := a.Trading.SendNativeAll(c.Context(), privateKey, batch.BossAddress)
 		if transferErr != nil {
-			// Empty wallets are already recycled; retain the other results.
-			if strings.Contains(strings.ToLower(transferErr.Error()), "balance") {
+			var insufficient *chain.NativeSweepInsufficientError
+			if !errors.As(transferErr, &insufficient) {
+				return a.fail(c, transferErr)
+			}
+			if insufficient.Balance.Sign() == 0 {
 				continue
 			}
-			return a.fail(c, transferErr)
+			// A fee-sized cushion is returned by the sweep; it only covers gas
+			// price changes between the boss top-up and the wallet transfer.
+			topUp := new(big.Int).Mul(insufficient.GasCost, big.NewInt(2))
+			topUp.Sub(topUp, insufficient.Balance)
+			topUp.Add(topUp, big.NewInt(1))
+			gasFunding, fundingErr := a.Trading.SendNative(c.Context(), bossKey, wallet.Address, topUp)
+			if fundingErr != nil {
+				return a.fail(c, fundingErr)
+			}
+			result, transferErr = a.Trading.SendNativeAll(c.Context(), privateKey, batch.BossAddress)
+			if transferErr != nil {
+				return a.fail(c, transferErr)
+			}
+			result["gasFunding"] = gasFunding
+		}
+		balanceRaw, balanceErr := a.RPC.Balance(c.Context(), wallet.Address)
+		if balanceErr != nil {
+			return a.fail(c, balanceErr)
+		}
+		if balance := chain.ToBig(balanceRaw); balance.Sign() != 0 {
+			return a.fail(c, fmt.Errorf("wallet %s still has %s wei after recycling", wallet.Address, balance))
 		}
 		results = append(results, result)
 	}
