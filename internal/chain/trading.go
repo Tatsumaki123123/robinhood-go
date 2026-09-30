@@ -585,7 +585,7 @@ func (t *Trading) SendNative(ctx context.Context, privateKey, to string, amount 
 }
 
 // NativeSweepInsufficientError reports a non-transferable balance and the
-// quoted fee so callers can fund a non-empty wallet before sweeping it.
+// quoted fee so callers can distinguish dust from an empty wallet.
 type NativeSweepInsufficientError struct {
 	Balance *big.Int
 	GasCost *big.Int
@@ -672,6 +672,15 @@ func (t *Trading) gasPrice(ctx context.Context) (*big.Int, error) {
 	}
 	return t.RPC.GasPrice(ctx)
 }
+
+func (t *Trading) NativeTransferGasCost(ctx context.Context) (*big.Int, error) {
+	gasPrice, err := t.gasPrice(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return new(big.Int).Mul(gasPrice, big.NewInt(21000)), nil
+}
+
 func (t *Trading) sendContract(ctx context.Context, key *ecdsa.PrivateKey, to common.Address, data []byte, value *big.Int) (string, error) {
 	from := gethcrypto.PubkeyToAddress(key.PublicKey).Hex()
 	unlockWallet := t.lockWallet(from)

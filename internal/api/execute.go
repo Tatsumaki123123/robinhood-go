@@ -774,8 +774,14 @@ func (a *API) executeStart(c *fiber.Ctx) error {
 			if balanceErr != nil {
 				return a.fail(c, balanceErr)
 			}
-			if chain.ToBig(balance).Sign() > 0 {
-				return httpx.Error(c, 409, "active execute wallets still have native balance; call /api/v1/executerobin/end first")
+			if nativeBalance := chain.ToBig(balance); nativeBalance.Sign() > 0 {
+				gasCost, gasErr := a.Trading.NativeTransferGasCost(c.Context())
+				if gasErr != nil {
+					return a.fail(c, gasErr)
+				}
+				if nativeBalance.Cmp(gasCost) > 0 {
+					return httpx.Error(c, 409, "active execute wallets still have transferable native balance; call /api/v1/executerobin/end first")
+				}
 			}
 		}
 	}
@@ -1831,11 +1837,8 @@ func (a *API) executeEnd(c *fiber.Ctx) error {
 	if err != nil {
 		return a.fail(c, err)
 	}
-	bossKey, err := secret.Decrypt(batch.PrivateKeyEnc, a.Cfg.EncryptionKey)
-	if err != nil {
-		return a.fail(c, err)
-	}
 	results := []any{}
+	dust := []map[string]any{}
 	for _, wallet := range wallets {
 		if strings.EqualFold(wallet.Address, batch.BossAddress) {
 			continue
@@ -1853,31 +1856,26 @@ func (a *API) executeEnd(c *fiber.Ctx) error {
 			if insufficient.Balance.Sign() == 0 {
 				continue
 			}
-			// A fee-sized cushion is returned by the sweep; it only covers gas
-			// price changes between the boss top-up and the wallet transfer.
-			topUp := new(big.Int).Mul(insufficient.GasCost, big.NewInt(2))
-			topUp.Sub(topUp, insufficient.Balance)
-			topUp.Add(topUp, big.NewInt(1))
-			gasFunding, fundingErr := a.Trading.SendNative(c.Context(), bossKey, wallet.Address, topUp)
-			if fundingErr != nil {
-				return a.fail(c, fundingErr)
-			}
-			result, transferErr = a.Trading.SendNativeAll(c.Context(), privateKey, batch.BossAddress)
-			if transferErr != nil {
-				return a.fail(c, transferErr)
-			}
-			result["gasFunding"] = gasFunding
+			dust = append(dust, map[string]any{"address": strings.ToLower(wallet.Address), "balanceRaw": insufficient.Balance.String(), "gasCostRaw": insufficient.GasCost.String()})
+			continue
 		}
 		balanceRaw, balanceErr := a.RPC.Balance(c.Context(), wallet.Address)
 		if balanceErr != nil {
 			return a.fail(c, balanceErr)
 		}
 		if balance := chain.ToBig(balanceRaw); balance.Sign() != 0 {
-			return a.fail(c, fmt.Errorf("wallet %s still has %s wei after recycling", wallet.Address, balance))
+			gasCost, gasErr := a.Trading.NativeTransferGasCost(c.Context())
+			if gasErr != nil {
+				return a.fail(c, gasErr)
+			}
+			if balance.Cmp(gasCost) > 0 {
+				return a.fail(c, fmt.Errorf("wallet %s still has %s wei after recycling", wallet.Address, balance))
+			}
+			dust = append(dust, map[string]any{"address": strings.ToLower(wallet.Address), "balanceRaw": balance.String(), "gasCostRaw": gasCost.String()})
 		}
 		results = append(results, result)
 	}
-	return a.ok(c, map[string]any{"eid": batch.EID, "recycled": results})
+	return a.ok(c, map[string]any{"eid": batch.EID, "recycled": results, "dust": dust})
 }
 
 func (a *API) executeWithdraw(c *fiber.Ctx) error {

@@ -126,8 +126,8 @@ POST /api/v1/executerobin/start
 1. 线路不存在或 `enabled=false` 时拒绝启动。
 2. 创建线路时会先创建一条 active boss 批次；后续启动会先检查当前批次的 active 执行钱包余额，余额清零后生成新的 boss，并将旧 boss 的可用余额归集到新 boss。历史上没有 boss 批次的线路会在启动时补齐。
 3. 如果线路已有活动 `eid`，会检查该批次的 active 执行钱包余额。
-4. 只要仍有原生币余额，就拒绝切换并要求先调用 `end`。
-5. 余额清零后创建新的 boss 和新的 `eid`，并尝试把旧 boss 的可用余额归集到新 boss。
+4. 仍有超过一笔普通转账 gas 成本的原生币余额时，拒绝切换并要求先调用 `end`。
+5. 没有可转出的余额后创建新的 boss 和新的 `eid`，并尝试把旧 boss 的可用余额归集到新 boss。
 
 返回值包含 `eid`、`line`、`bossAddress`、`active` 和时间字段，不包含私钥。
 
@@ -158,7 +158,7 @@ POST /api/v1/executerobin/end
 {"eid": 1}
 ```
 
-`end` 会逐个执行钱包归集原生币，扣除转账 gas 后发送到当前批次 boss。非零余额若不足以支付转账 gas，会先由 boss 补入手续费再归集；boss 余额不足时返回错误。
+`end` 会逐个执行钱包归集可转出的原生币，扣除转账 gas 后发送到当前批次 boss。余额不超过一笔普通转账 gas 成本的零头会保留在钱包中，并通过响应的 `dust` 数组返回，不影响接口成功。
 
 ```http
 POST /api/v1/executerobin/withdraw

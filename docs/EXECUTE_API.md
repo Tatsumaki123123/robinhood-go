@@ -192,7 +192,7 @@ POST /api/v1/executerobin/start
 { "line": 1001 }
 ```
 
-创建线路时会先创建一条 active boss 批次。后续调用 `start` 时，会先检查当前批次的 active 执行钱包余额；余额清零后生成新的 boss，保留旧批次并将旧 boss 的可用余额转给新 boss。历史上没有 boss 批次的线路会在首次启动时补齐。返回：
+创建线路时会先创建一条 active boss 批次。后续调用 `start` 时，会先检查当前批次的 active 执行钱包余额；没有可转出的余额（允许不超过转账 gas 成本的零头）后生成新的 boss，保留旧批次并将旧 boss 的可用余额转给新 boss。历史上没有 boss 批次的线路会在首次启动时补齐。返回：
 
 ```json
 {
@@ -227,7 +227,7 @@ POST /api/v1/executerobin/end
 { "eid": 1 }
 ```
 
-或者传 `{ "line": 1001 }`。接口会把执行钱包的剩余原生币扣除转账 gas 后归集到 boss，返回 `eid` 和 `recycled` 交易结果数组。余额为 0 的钱包跳过；余额不足以支付转账 gas 的钱包会先由 boss 补入手续费，再归集余额。此类结果包含 `gasFunding` 补款交易。boss 余额不足或交易失败时接口返回错误，不会把未清零的钱包作为成功跳过。
+或者传 `{ "line": 1001 }`。接口会把执行钱包可转出的原生币扣除转账 gas 后归集到 boss，返回 `eid`、`recycled` 交易结果和 `dust` 零头数组。余额为 0 的钱包跳过；余额大于 0 但不超过当时一笔普通转账 gas 成本的，视为不可转出的零头并在 `dust` 中返回 `address`、`balanceRaw`、`gasCostRaw`（单位均为 wei），接口仍返回成功。转账后若仍有超过 gas 成本的余额，则返回错误。
 
 ### 3.9 boss 提现
 
