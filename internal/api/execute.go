@@ -988,6 +988,47 @@ func (a *API) executeBossPrivateKey(c *fiber.Ctx) error {
 	})
 }
 
+func (a *API) executeWalletPrivateKey(c *fiber.Ctx) error {
+	d := body(c)
+	if a.Cfg.ExportPassword == "" {
+		return httpx.Error(c, 503, "private key export password is not configured")
+	}
+	if str(d["password"]) == "" || str(d["password"]) != a.Cfg.ExportPassword {
+		return httpx.Error(c, 400, "invalid password")
+	}
+	address := low(str(d["address"]))
+	if !common.IsHexAddress(address) || address == executeZeroCurve {
+		return httpx.Error(c, 400, "address must be a valid non-zero EVM address")
+	}
+	batch, err := a.executeBatch(c.Context(), d)
+	if err != nil {
+		return httpx.Error(c, 404, "execute batch not found")
+	}
+	wallet, err := a.Store.ExecuteWallet(c.Context(), batch.EID, address)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return httpx.Error(c, 404, "execute wallet not found")
+	}
+	if err != nil {
+		return a.fail(c, err)
+	}
+	privateKey, err := secret.Decrypt(wallet.PrivateKeyEnc, a.Cfg.EncryptionKey)
+	if err != nil {
+		return a.fail(c, err)
+	}
+	key, err := gethcrypto.HexToECDSA(strings.TrimPrefix(privateKey, "0x"))
+	if err != nil || !strings.EqualFold(gethcrypto.PubkeyToAddress(key.PublicKey).Hex(), wallet.Address) {
+		return httpx.Error(c, 500, "stored private key does not match wallet address")
+	}
+	c.Set("Cache-Control", "no-store")
+	return a.ok(c, map[string]any{
+		"eid":        wallet.EID,
+		"address":    strings.ToLower(wallet.Address),
+		"index":      wallet.WalletIndex,
+		"active":     wallet.Active,
+		"privateKey": privateKey,
+	})
+}
+
 func (a *API) resolveExecutePool(ctx context.Context, target string, d map[string]any) (routeHop, map[string]any, error) {
 	target = low(target)
 	quote := executeNativeAlias(str(d["quoteTokenAddress"]))
@@ -1257,6 +1298,15 @@ func executeSwapRequest(token store.ExecuteToken, route []map[string]any, privat
 	if len(route) == 0 || len(route) > 3 {
 		return nil, fmt.Errorf("execute route must contain between 1 and 3 hops")
 	}
+	if amount == nil || amount.Sign() <= 0 {
+		return nil, fmt.Errorf("amountInRaw must be greater than zero")
+	}
+	if side == "sell" && (minimum == nil || minimum.Sign() <= 0) {
+		return nil, fmt.Errorf("amountOutMinimumRaw must be greater than zero for a sell")
+	}
+	if !common.IsHexAddress(recipient) || common.HexToAddress(recipient) == (common.Address{}) {
+		return nil, fmt.Errorf("execute recipient must be a valid non-zero EVM address")
+	}
 	first := route[0]
 	currencyIn := executeNativeAlias(str(first["tokenIn"]))
 	if currencyIn == "" {
@@ -1275,7 +1325,15 @@ func executeSwapRequest(token store.ExecuteToken, route []map[string]any, privat
 		path = append(path, map[string]any{"intermediateCurrency": out, "fee": hop["fee"], "tickSpacing": hop["tickSpacing"], "hooks": hop["hooks"], "hookData": hop["hookData"]})
 	}
 	lastOut := executeNativeAlias(str(route[len(route)-1]["tokenOut"]))
-	return map[string]any{"currencyIn": currencyIn, "path": path, "amountInRaw": amount.String(), "amountOutMinimumRaw": minimum.String(), "recipient": recipient, "privateKey": privateKey, "side": side, "wrapNative": side == "buy" && currencyIn == chain.WrappedNativeAddress, "unwrapNative": side == "sell" && (lastOut == chain.NativeAddress || lastOut == chain.WrappedNativeAddress)}, nil
+	if side == "sell" {
+		if !strings.EqualFold(currencyIn, token.TokenAddress) {
+			return nil, fmt.Errorf("sell route must start with the execute token")
+		}
+		if lastOut != chain.NativeAddress && lastOut != chain.WrappedNativeAddress {
+			return nil, fmt.Errorf("sell route must end with native ETH or WETH")
+		}
+	}
+	return map[string]any{"currencyIn": currencyIn, "path": path, "amountInRaw": amount.String(), "amountOutMinimumRaw": minimum.String(), "recipient": recipient, "privateKey": privateKey, "side": side, "wrapNative": side == "buy" && currencyIn == chain.WrappedNativeAddress, "unwrapNative": side == "sell" && lastOut == chain.WrappedNativeAddress}, nil
 }
 
 func (a *API) executeTrade(ctx context.Context, token store.ExecuteToken, wallet store.ExecuteWallet, side, stage string, amount, minimum *big.Int) (map[string]any, error) {
@@ -1283,10 +1341,9 @@ func (a *API) executeTrade(ctx context.Context, token store.ExecuteToken, wallet
 	if err != nil {
 		return nil, err
 	}
-	if side == "sell" && !strings.EqualFold(token.TokenAddress, chain.NativeAddress) {
-		if err = a.Trading.PrepareV4SellApproval(ctx, privateKey, token.TokenAddress); err != nil {
-			return nil, err
-		}
+	key, err := gethcrypto.HexToECDSA(strings.TrimPrefix(privateKey, "0x"))
+	if err != nil || !strings.EqualFold(gethcrypto.PubkeyToAddress(key.PublicKey).Hex(), wallet.Address) {
+		return nil, fmt.Errorf("execute wallet private key does not match wallet address")
 	}
 	route := token.RouteBuy
 	if side == "sell" {
@@ -1295,6 +1352,11 @@ func (a *API) executeTrade(ctx context.Context, token store.ExecuteToken, wallet
 	request, err := executeSwapRequest(token, route, privateKey, wallet.Address, side, amount, minimum)
 	if err != nil {
 		return nil, err
+	}
+	if side == "sell" && !strings.EqualFold(token.TokenAddress, chain.NativeAddress) {
+		if err = a.Trading.PrepareV4SellApproval(ctx, privateKey, token.TokenAddress); err != nil {
+			return nil, err
+		}
 	}
 	tradeID, err := a.Store.RecordExecuteTrade(ctx, token.TID, token.EID, wallet.Address, side, stage, amount.String(), minimum.String())
 	if err != nil {
@@ -1505,6 +1567,9 @@ func (a *API) executeSellData(ctx context.Context, d map[string]any) (map[string
 		return nil, fmt.Errorf("percent must be between 1 and 100")
 	}
 	minimum := executePositiveRaw(d["amountOutMinimumRaw"])
+	if minimum.Sign() <= 0 {
+		return nil, fmt.Errorf("amountOutMinimumRaw must be greater than zero for a sell")
+	}
 	line, err := a.Store.ExecuteLine(ctx, batch.LineID)
 	if err != nil {
 		return nil, err
@@ -1547,8 +1612,8 @@ func (a *API) executeSellData(ctx context.Context, d map[string]any) (map[string
 		}
 		jobs = append(jobs, sellJob{wallet: wallet, amount: amount})
 	}
-	if len(jobs) == 0 && stage != "all" {
-		return nil, fmt.Errorf("there are no execute wallets enabled for %sSell", stage)
+	if len(jobs) == 0 {
+		return nil, fmt.Errorf("there are no execute wallets with tokens to sell for %sSell", stage)
 	}
 	results := make([]any, len(jobs))
 	errs := make(chan error, len(jobs))
@@ -2041,6 +2106,7 @@ func (a *API) executeRegisterRoutes(app *fiber.App) {
 	g.Post("/generateWallets", a.executeGenerateWallets)
 	g.Post("/getWallets", a.executeWallets)
 	g.Post("/getWalletBalances", a.executeWallets)
+	g.Post("/getWalletPrivateKey", a.executeWalletPrivateKey)
 	g.Post("/getBoss", a.executeBoss)
 	g.Post("/getBossPrivateKey", a.executeBossPrivateKey)
 	g.Post("/exportBossPrivateKey", a.executeBossPrivateKey)

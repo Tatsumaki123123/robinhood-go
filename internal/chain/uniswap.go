@@ -97,7 +97,12 @@ func encodeV4Single(d map[string]any) (map[string]any, error) {
 		return nil, fmt.Errorf("amountInRaw must be greater than zero")
 	}
 	hookData := bytesValue(d["hookData"])
-	recipient := common.HexToAddress(fmt.Sprint(d["recipient"]))
+	recipientText := strings.TrimSpace(fmt.Sprint(d["recipient"]))
+	custom := d["recipient"] != nil && recipientText != ""
+	if custom && (!common.IsHexAddress(recipientText) || common.HexToAddress(recipientText) == (common.Address{})) {
+		return nil, fmt.Errorf("recipient must be a valid non-zero EVM address")
+	}
+	recipient := common.HexToAddress(recipientText)
 	if recipient == (common.Address{}) {
 		recipient = common.HexToAddress(NativeAddress)
 	}
@@ -113,7 +118,6 @@ func encodeV4Single(d map[string]any) (map[string]any, error) {
 		inputCurrency, outputCurrency = c1, c0
 	}
 	settle, _ := abi.Arguments{{Type: mustType("address")}, {Type: mustType("uint256")}}.Pack(inputCurrency, amount)
-	custom := d["recipient"] != nil && strings.TrimSpace(fmt.Sprint(d["recipient"])) != ""
 	var take []byte
 	if custom {
 		take, err = abi.Arguments{{Type: mustType("address")}, {Type: mustType("address")}, {Type: mustType("uint256")}}.Pack(outputCurrency, recipient, big.NewInt(0))
@@ -189,13 +193,17 @@ func encodeV4Route(d map[string]any) (map[string]any, error) {
 	}
 	wrap := boolValue(d["wrapNative"])
 	unwrap := boolValue(d["unwrapNative"])
-	recipient := common.HexToAddress(fmt.Sprint(d["recipient"]))
-	custom := false
-	if _, supplied := d["customRecipient"]; supplied {
-		custom = boolValue(d["customRecipient"])
-	} else {
-		custom = d["recipient"] != nil && strings.TrimSpace(fmt.Sprint(d["recipient"])) != ""
+	if unwrap && current == common.HexToAddress(NativeAddress) {
+		unwrap = false
+	} else if unwrap && current != common.HexToAddress(WrappedNativeAddress) {
+		return nil, fmt.Errorf("unwrapNative requires wrapped native output")
 	}
+	recipientText := strings.TrimSpace(fmt.Sprint(d["recipient"]))
+	custom := d["recipient"] != nil && recipientText != ""
+	if custom && (!common.IsHexAddress(recipientText) || common.HexToAddress(recipientText) == (common.Address{})) {
+		return nil, fmt.Errorf("recipient must be a valid non-zero EVM address")
+	}
+	recipient := common.HexToAddress(recipientText)
 	if recipient == (common.Address{}) {
 		recipient = common.HexToAddress(NativeAddress)
 	}

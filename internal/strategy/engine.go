@@ -1925,6 +1925,18 @@ func amountAtRawPrice(amount string, rawPrice, slippage float64, buy bool) strin
 	return out.String()
 }
 
+func nativeSellMinimumOutput(ev Event, amountRaw string, rawPrice, slippage float64, hopCount int) string {
+	if hopCount != 1 || slippage < 0 || slippage >= 1 {
+		return "0"
+	}
+	if ev.QuoteAmountText != "" && ev.TokenAmountText != "" {
+		if minimum := amountAtRawRatio(amountRaw, ev.QuoteAmountText, ev.TokenAmountText, slippage, false); minimum != "0" {
+			return minimum
+		}
+	}
+	return amountAtRawPrice(amountRaw, rawPrice, slippage, false)
+}
+
 // amountAtRawRatio performs the same minimum-output calculation with the
 // exact integer quote/token amounts carried by a chain event. It avoids first
 // converting a 18-decimal raw amount to float64 and is used when the event
@@ -1941,11 +1953,12 @@ func amountAtRawRatio(amount, quoteRaw, tokenRaw string, slippage float64, buy b
 	}
 	// Convert the configured decimal ratio through a rational value so the
 	// floor operation remains deterministic.
-	slipText := strconv.FormatFloat(1-slippage, 'f', 18, 64)
+	slipText := strconv.FormatFloat(slippage, 'f', -1, 64)
 	slipRat, ok := new(big.Rat).SetString(slipText)
-	if !ok || slipRat.Sign() <= 0 {
+	if !ok || slipRat.Sign() < 0 || slipRat.Cmp(big.NewRat(1, 1)) >= 0 {
 		return "0"
 	}
+	slipRat.Sub(big.NewRat(1, 1), slipRat)
 	out := new(big.Rat).SetInt(n)
 	if buy {
 		out.Mul(out, new(big.Rat).SetInt(t))
@@ -2173,6 +2186,12 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 				minOut = amountAtRawPrice(amountRaw, rawPrice, cfg.Slippage, true)
 			}
 		}
+		if side == "sell" && (strings.EqualFold(destination, chain.NativeAddress) || strings.EqualFold(destination, chain.WrappedNativeAddress)) {
+			minOut = nativeSellMinimumOutput(ev, amountRaw, rawPrice, cfg.Slippage, len(path))
+			if minOut == "0" {
+				return nil, fmt.Errorf("cannot determine a protected minimum ETH output for V4 sell")
+			}
+		}
 		e.devInfo("交易执行参数",
 			zap.String("action", side),
 			zap.String("currencyIn", currencyIn),
@@ -2182,7 +2201,7 @@ func (e *Engine) executeLive(ctx context.Context, ev Event, side string, amount 
 			zap.Int("quoteDecimals", quoteDecimals),
 			zap.String("token", ev.TokenAddress),
 		)
-		req := map[string]any{"currencyIn": currencyIn, "path": path, "amountInRaw": amountRaw, "amountOutMinimumRaw": minOut, "recipient": u.WalletAddress, "customRecipient": false, "privateKey": key, "side": side, "wrapNative": side == "buy" && strings.EqualFold(first, chain.NativeAddress) && strings.EqualFold(currencyIn, chain.WrappedNativeAddress), "unwrapNative": side == "sell" && strings.EqualFold(destination, chain.NativeAddress) && strings.EqualFold(currencyOut, chain.WrappedNativeAddress)}
+		req := map[string]any{"currencyIn": currencyIn, "path": path, "amountInRaw": amountRaw, "amountOutMinimumRaw": minOut, "recipient": u.WalletAddress, "privateKey": key, "side": side, "wrapNative": side == "buy" && strings.EqualFold(first, chain.NativeAddress) && strings.EqualFold(currencyIn, chain.WrappedNativeAddress), "unwrapNative": side == "sell" && strings.EqualFold(destination, chain.NativeAddress) && strings.EqualFold(currencyOut, chain.WrappedNativeAddress)}
 		opts := chain.BroadcastOptions{}
 		if side == "buy" {
 			var pendingNonce *int64

@@ -220,6 +220,10 @@ func (s *Store) ExecuteWallets(ctx context.Context, eid int64, activeOnly bool) 
 	return out, rows.Err()
 }
 
+func (s *Store) ExecuteWallet(ctx context.Context, eid int64, address string) (ExecuteWallet, error) {
+	return scanExecuteWallet(s.DB.QueryRow(ctx, `SELECT id,eid,wallet_index,address,private_key_encrypted,active,created_at,updated_at FROM execute_wallets WHERE eid=$1 AND lower(address)=lower($2)`, eid, address))
+}
+
 func (s *Store) UpsertExecuteWallet(ctx context.Context, w ExecuteWallet) (ExecuteWallet, error) {
 	return scanExecuteWallet(s.DB.QueryRow(ctx, `INSERT INTO execute_wallets(eid,wallet_index,address,private_key_encrypted,active) VALUES($1,$2,$3,$4,$5)
 ON CONFLICT(eid,address) DO UPDATE SET wallet_index=EXCLUDED.wallet_index,private_key_encrypted=EXCLUDED.private_key_encrypted,active=EXCLUDED.active,updated_at=now()

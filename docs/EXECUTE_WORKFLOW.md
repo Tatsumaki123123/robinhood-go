@@ -11,7 +11,7 @@ updateLineData -> start -> generateWallets -> checkToken -> buyToken
                                       -> sellToken -> closeAllAccounts -> end -> withdraw
 ```
 
-`line` 是可复用配置，`eid` 是一次执行批次，`execute_wallets` 保存批次钱包，`tid` 是批次内的 V4 代币任务。钱包私钥使用 `PRIVATE_KEY_ENCRYPTION_KEY` 加密，所有 HTTP 响应都不会返回私钥。
+`line` 是可复用配置，`eid` 是一次执行批次，`execute_wallets` 保存批次钱包，`tid` 是批次内的 V4 代币任务。钱包私钥使用 `PRIVATE_KEY_ENCRYPTION_KEY` 加密；只有受密码保护的私钥导出接口会返回明文私钥。
 
 ## 接口
 
@@ -32,6 +32,7 @@ updateLineData -> start -> generateWallets -> checkToken -> buyToken
 | `POST /api/v1/executerobin/withdraw` | `amount`/`amountRaw`、`withdrawAddress` | 从 boss 钱包提现；`amount` 为 ETH number，省略金额时转出可用余额 |
 | `POST /api/v1/executerobin/getWallets` | `eid` 或 `line` | 查询 active 批次钱包及 ETH balance（传 `all:true` 可包含 inactive 钱包，不含私钥） |
 | `POST /api/v1/executerobin/getWalletBalances` | `eid` 或 `line` | `getWallets` 的余额查询兼容别名 |
+| `POST /api/v1/executerobin/getWalletPrivateKey` | `eid` 或 `line`、`address`、`password` | 按地址导出该批次的单个执行钱包私钥，支持 inactive 历史钱包 |
 | `POST /api/v1/executerobin/getBoss` | `eid` 或 `line` | 查询 boss 地址、ETH balance 和批次 token 数量 |
 | `POST /api/v1/executerobin/getBossPrivateKey` | `eid` 或 `line`、`password` | 使用私钥导出密码导出当前 active boss 私钥 |
 | `POST /api/v1/executerobin/getLines` | 无 | 查询 execute 线路列表，不返回 boss 私钥 |

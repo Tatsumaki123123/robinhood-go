@@ -363,7 +363,7 @@ POST /api/v1/executerobin/sellToken
   "tid": 1,
   "type": "all",
   "percent": 100,
-  "amountOutMinimumRaw": "0"
+  "amountOutMinimumRaw": "60000000000000000"
 }
 ```
 
@@ -373,9 +373,10 @@ POST /api/v1/executerobin/sellToken
 - 未传 `amountInRaw` 时，读取每个钱包的 token 余额，再按 `percent` 计算；
 - `percent` 默认 `100`，范围为 `1` 到 `100`；
 - 卖出前会为目标 ERC-20 准备 Permit2/Router 授权；
+- 卖出路径必须从当前任务代币开始，并以原生 ETH 或 WETH 结束；
 - `type=all` 成功后，`ExecuteToken.status` 更新为 `sell`；其他阶段只更新交易记录和阶段状态。
 
-`amountOutMinimumRaw` 默认是 `0`。当前服务没有内置 V4 流动性报价器，真实交易建议调用方根据外部报价和滑点自行计算并传入非零值。
+`amountOutMinimumRaw` 必须是大于 `0` 的链上最小单位，且是每个执行钱包各自的最低到账额。当前服务没有内置 V4 流动性报价器；调用方必须根据卖出前的外部报价和可接受滑点计算。缺省或传 `0` 会拒绝卖出，避免在没有价格保护时成交。
 
 ## 10. 完整推荐配置
 

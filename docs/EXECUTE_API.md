@@ -265,6 +265,18 @@ POST /api/v1/executerobin/getWalletBalances
 
 `getWalletBalances` 是兼容别名。默认只返回 active 钱包；传 `all: true` 时包含 inactive 历史钱包。每个钱包返回 `address`、`index`、`active`、`balanceRaw` 和 ETH 单位的数字型 `balance`，并按 `index` 合并线路 `walletConfig[index]` 中的 `transferAmount`、买入/卖出阶段配置（例如 `firstBuy`、`firstSell`），不会返回私钥。
 
+单独导出执行钱包私钥：
+
+```http
+POST /api/v1/executerobin/getWalletPrivateKey
+```
+
+```json
+{ "eid": 3, "address": "0xdb493c40480dc81c4b5a0fbf0f003bf9d77deac0", "password": "your-export-password" }
+```
+
+`password` 必须非空，并匹配服务端配置的 `ROBINHOOD_MONITOR_PRIVATE_KEY_EXPORT_PASSWORD`。成功时返回 `eid`、`address`、`index`、`active` 和 `privateKey`；地址可对应当前或历史（inactive）钱包。该响应不应被客户端缓存。
+
 ### 4.2 查询 boss
 
 ```http
@@ -464,7 +476,7 @@ POST /api/v1/executerobin/sellToken
   "tid": 1,
   "type": "first",
   "percent": 100,
-  "amountOutMinimumRaw": "0"
+  "amountOutMinimumRaw": "60000000000000000"
 }
 ```
 
@@ -475,7 +487,9 @@ POST /api/v1/executerobin/sellToken
 - `type=first/second/third/multi` 只选择对应 `*Sell.enable=true` 的钱包。
 - `type=all` 忽略阶段卖出配置，对所有 active 钱包按 100% 计算。
 - `type` 可以是数组，服务按数组顺序逐阶段执行。
-- `type=all` 成功后任务状态更新为 `sell`；所有 active 钱包的 token 余额均为零时也返回成功，`results` 为 `[]`。
+- 卖出路径必须从任务代币开始，并以原生 ETH 或 WETH 结束。
+- `amountOutMinimumRaw` 必须大于 `0`，表示每个执行钱包各自的最低到账额。
+- `type=all` 至少有一个钱包实际卖出后才更新任务状态为 `sell`；没有代币可卖时返回错误。
 
 卖出前服务会准备目标 ERC-20 的 Permit2/Router 授权。
 
@@ -516,7 +530,7 @@ EVM/ERC-20 没有 Solana token account 关闭流程，因此接口保留为兼�
 - boss 和执行钱包私钥只以加密形式存储，接口不返回私钥。
 - 交易由当前钱包签名，通过 Uniswap V4 Universal Router 提交。
 - 卖出会自动处理 Permit2/Router 授权。
-- 生产调用建议传入非零 `amountOutMinimumRaw`，由调用方根据报价和滑点计算。
+- 卖出必须传入非零 `amountOutMinimumRaw`，由调用方根据报价和滑点计算；示例数值仅用于展示字段格式。
 - 运行 execute 至少需要配置数据库、RPC、`PRIVATE_KEY_ENCRYPTION_KEY`、Robinhood Chain ID、V4 Pool Manager、Universal Router 和 Permit2 地址。
 
 相关文档：

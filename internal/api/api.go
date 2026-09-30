@@ -1841,8 +1841,12 @@ func (a *API) buildMonitoredSwap(c *fiber.Ctx, in map[string]any) (map[string]an
 	if amount == "" || amount == "0" {
 		return nil, fmt.Errorf("amount is zero")
 	}
+	minimum := str(in["amountOutMinimumRaw"])
+	if direction == "sell" && chain.ToBig(minimum).Sign() <= 0 {
+		return nil, fmt.Errorf("amountOutMinimumRaw must be greater than zero for a sell")
+	}
 	wrapNative := direction == "buy" && !strings.EqualFold(firstInput, str(route["sourceToken"]))
-	out := map[string]any{"currencyIn": firstInput, "path": path, "amountInRaw": amount, "amountOutMinimumRaw": str(in["amountOutMinimumRaw"]), "recipient": u.WalletAddress, "privateKey": key, "wrapNative": wrapNative, "unwrapNative": direction == "sell" && strings.EqualFold(str(route["destinationToken"]), chain.NativeAddress)}
+	out := map[string]any{"currencyIn": firstInput, "path": path, "amountInRaw": amount, "amountOutMinimumRaw": minimum, "recipient": u.WalletAddress, "privateKey": key, "wrapNative": wrapNative, "unwrapNative": direction == "sell" && strings.EqualFold(str(route["destinationToken"]), chain.NativeAddress)}
 	if out["amountOutMinimumRaw"] == "" {
 		out["amountOutMinimumRaw"] = "0"
 	}
