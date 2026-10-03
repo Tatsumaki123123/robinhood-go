@@ -31,10 +31,15 @@ Copy-Item .env.example .env
 docker compose -f docker-compose.yml up -d --build
 ```
 
-开发和生产使用不同的 PostgreSQL、Redis、上传目录卷；如需清理对应环境数据，使用
-`docker compose -f <compose-file> down -v`。
+开发环境保留原有 Compose 项目、端口和数据卷。生产使用独立的 Compose 项目，
+并复用原生产数据库卷 `robinhoodgo_postgres` 和上传卷 `robinhoodgo_uploads`。
+首次切换前先停止旧生产容器，避免两个 PostgreSQL 容器同时使用同一数据卷；
+不要使用 `down -v`，它会删除数据卷。
 
-The API is available at `http://localhost:3000/api/v1`. PostgreSQL migrations run when
+开发 API 位于 `http://localhost:3000/api/v1`，生产 API 位于 `http://localhost:3001/api/v1`。
+开发 PostgreSQL/Redis 主机端口保持 `5433`/`6380`，生产改为 `5434`/`6381`。
+生产主机端口可通过 `.env` 中的 `PROD_PORT`、`PROD_POSTGRES_PORT`、`PROD_REDIS_PORT` 覆盖。
+PostgreSQL migrations run when
 the application starts. Configure the wallet, RPC and contract settings before enabling
 live trading. WebSocket chain events are available at `/ws`.
 
