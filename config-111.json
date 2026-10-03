@@ -1,0 +1,105 @@
+{
+  "autoSwap": false,
+  "name": "Line 1",
+  "walletConfig": [
+    {
+      "firstBuy": {
+        "buyAmount": 0.06,
+        "enable": true
+      },
+      "transferAmount": 0.09
+    },
+    {
+      "firstBuy": {
+        "buyAmount": 0.03,
+        "enable": true
+      },
+      "transferAmount": 0.05
+    },
+    {
+      "firstBuy": {
+        "buyAmount": 0.02,
+        "enable": true
+      },
+      "firstSell": {
+        "enable": true,
+        "sellRatio": 1
+      },
+      "transferAmount": 0.04
+    },
+    {
+      "firstSell": {
+        "enable": true,
+        "sellRatio": 1
+      },
+      "transferAmount": 0.05,
+      "multiBuy": {
+        "buyAmount": 0.03,
+        "enable": true
+      }
+    },
+    {
+      "firstSell": {
+        "enable": true,
+        "sellRatio": 1
+      },
+      "transferAmount": 0.05,
+      "secondBuy": {
+        "buyAmount": 0.03,
+        "enable": true
+      }
+    }
+  ],
+  "sourceWeb": "ave",
+  "groupSort": {
+    "sort_field": "created_at",
+    "sort_order": "desc",
+    "mcp_min": 5000,
+    "mcp_max": 50000,
+    "create_day": 3,
+    "create_day_end": 0,
+    "category": "pons_out_new",
+    "address": [],
+    "duration": 6
+  },
+  "minFollowStates": 2,
+  "maxBuyTax": 1.5,
+  "lineBots": [
+    {
+      "address": "0x9bf265c742d96aacf1083ef24c9110240af0bea9",
+      "name": "套利--bea9"
+    },
+    {
+      "address": "0x2a4d34cd09a36f59ae3bedc0880cd5da929321d7",
+      "name": "套利--21d7"
+    },
+    {
+      "address": "0x53e68553ca08f512423628d64c01b0a14dfcda99",
+      "name": "套利--da99"
+    },
+    {
+      "address": "0x359b288eb3ab1fb4553b5424b96d62f33e6eb359",
+      "name": "套利--B359"
+    },
+    {
+      "address": "0xa67d7eb4dc68fa6ce8e34ef8cadaf075b9893fbb",
+      "name": "抄底--3fbb"
+    },
+    {
+      "address": "0xc87b51c71707cfdd08cd374a596a6946cb1d6a66",
+      "name": "抄底--6a66"
+    },
+    {
+      "address": "0x8b216cc896f32bcabca3649ca918d532f72010ef",
+      "name": "套利--10ef"
+    },
+    {
+      "address": "0xc49ac0df3d86077f4da6652beac3c9df904173c1",
+      "name": "套利--73c1"
+    },
+    {
+      "address": "0x7026a0ec3dee3c360a95dec5a8d37c1a7d6af983",
+      "name": "套利--f983"
+    }
+  ]
+}

@@ -1301,8 +1301,8 @@ func executeSwapRequest(token store.ExecuteToken, route []map[string]any, privat
 	if amount == nil || amount.Sign() <= 0 {
 		return nil, fmt.Errorf("amountInRaw must be greater than zero")
 	}
-	if side == "sell" && (minimum == nil || minimum.Sign() <= 0) {
-		return nil, fmt.Errorf("amountOutMinimumRaw must be greater than zero for a sell")
+	if minimum == nil {
+		minimum = big.NewInt(0)
 	}
 	if !common.IsHexAddress(recipient) || common.HexToAddress(recipient) == (common.Address{}) {
 		return nil, fmt.Errorf("execute recipient must be a valid non-zero EVM address")
@@ -1567,9 +1567,6 @@ func (a *API) executeSellData(ctx context.Context, d map[string]any) (map[string
 		return nil, fmt.Errorf("percent must be between 1 and 100")
 	}
 	minimum := executePositiveRaw(d["amountOutMinimumRaw"])
-	if minimum.Sign() <= 0 {
-		return nil, fmt.Errorf("amountOutMinimumRaw must be greater than zero for a sell")
-	}
 	line, err := a.Store.ExecuteLine(ctx, batch.LineID)
 	if err != nil {
 		return nil, err

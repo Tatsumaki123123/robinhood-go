@@ -362,8 +362,7 @@ POST /api/v1/executerobin/sellToken
 {
   "tid": 1,
   "type": "all",
-  "percent": 100,
-  "amountOutMinimumRaw": "60000000000000000"
+  "percent": 100
 }
 ```
 
@@ -376,7 +375,7 @@ POST /api/v1/executerobin/sellToken
 - 卖出路径必须从当前任务代币开始，并以原生 ETH 或 WETH 结束；
 - `type=all` 成功后，`ExecuteToken.status` 更新为 `sell`；其他阶段只更新交易记录和阶段状态。
 
-`amountOutMinimumRaw` 必须是大于 `0` 的链上最小单位，且是每个执行钱包各自的最低到账额。当前服务没有内置 V4 流动性报价器；调用方必须根据卖出前的外部报价和可接受滑点计算。缺省或传 `0` 会拒绝卖出，避免在没有价格保护时成交。
+`amountOutMinimumRaw` 是可选的链上最小单位，表示每个执行钱包各自的最低到账额。省略或传 `0` 时不限制最低到账额。当前服务没有内置 V4 流动性报价器；如需价格保护，调用方应根据卖出前的外部报价和可接受滑点传入正数。
 
 ## 10. 完整推荐配置
 
@@ -447,4 +446,4 @@ UNISWAP_V4_UNIVERSAL_ROUTER_ADDRESS
 PERMIT2_ADDRESS
 ```
 
-`RPC_HTTP_SEND_URL` 可以单独用于 nonce、gas 和交易提交。`TRADING_FIXED_GAS_PRICE_WEI` 配置后，交易会优先使用固定 gas price。实际启用线路前，应确认 boss 有足够原生币、每个执行钱包有足够交易 gas，并为每笔 V4 交易设置合理的 `amountOutMinimumRaw`。
+`RPC_HTTP_SEND_URL` 可以单独用于 nonce、gas 和交易提交。`TRADING_FIXED_GAS_PRICE_WEI` 配置后，交易会优先使用固定 gas price。实际启用线路前，应确认 boss 有足够原生币、每个执行钱包有足够交易 gas；如需卖出价格保护，应为每笔 V4 交易设置合理的 `amountOutMinimumRaw`。

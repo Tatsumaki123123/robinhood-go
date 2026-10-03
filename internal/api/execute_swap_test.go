@@ -31,12 +31,25 @@ func TestExecuteSwapRequestOnlyUnwrapsWrappedNative(t *testing.T) {
 	}
 }
 
-func TestExecuteSwapRequestRejectsUnprotectedSell(t *testing.T) {
+func TestExecuteSwapRequestAllowsSellWithoutMinimum(t *testing.T) {
 	token := store.ExecuteToken{TokenAddress: "0x2a00fc638ac8fbc7c7ba914a2018c07a3268d301"}
 	route := []map[string]any{{"tokenIn": token.TokenAddress, "tokenOut": chain.NativeAddress}}
-	if _, err := executeSwapRequest(token, route, "key", "0xdb493c40480dc81c4b5a0fbf0f003bf9d77deac0", "sell", big.NewInt(100), big.NewInt(0)); err == nil {
-		t.Fatal("sell without a minimum output must fail")
+	request, err := executeSwapRequest(token, route, "key", "0xdb493c40480dc81c4b5a0fbf0f003bf9d77deac0", "sell", big.NewInt(100), executePositiveRaw(nil))
+	if err != nil {
+		t.Fatal(err)
 	}
+	if request["amountOutMinimumRaw"] != "0" {
+		t.Fatalf("amountOutMinimumRaw = %v, want 0", request["amountOutMinimumRaw"])
+	}
+	request, err = executeSwapRequest(token, route, "key", "0xdb493c40480dc81c4b5a0fbf0f003bf9d77deac0", "sell", big.NewInt(100), big.NewInt(42))
+	if err != nil || request["amountOutMinimumRaw"] != "42" {
+		t.Fatalf("explicit minimum was not preserved: request=%v, err=%v", request, err)
+	}
+}
+
+func TestExecuteSwapRequestRejectsInvalidSellRoute(t *testing.T) {
+	token := store.ExecuteToken{TokenAddress: "0x2a00fc638ac8fbc7c7ba914a2018c07a3268d301"}
+	route := []map[string]any{{"tokenIn": token.TokenAddress, "tokenOut": chain.NativeAddress}}
 	if _, err := executeSwapRequest(token, route, "key", "invalid", "sell", big.NewInt(100), big.NewInt(1)); err == nil {
 		t.Fatal("sell with an invalid recipient must fail")
 	}

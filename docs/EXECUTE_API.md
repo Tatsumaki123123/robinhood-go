@@ -475,8 +475,7 @@ POST /api/v1/executerobin/sellToken
 {
   "tid": 1,
   "type": "first",
-  "percent": 100,
-  "amountOutMinimumRaw": "60000000000000000"
+  "percent": 100
 }
 ```
 
@@ -488,7 +487,7 @@ POST /api/v1/executerobin/sellToken
 - `type=all` 忽略阶段卖出配置，对所有 active 钱包按 100% 计算。
 - `type` 可以是数组，服务按数组顺序逐阶段执行。
 - 卖出路径必须从任务代币开始，并以原生 ETH 或 WETH 结束。
-- `amountOutMinimumRaw` 必须大于 `0`，表示每个执行钱包各自的最低到账额。
+- `amountOutMinimumRaw` 可选；省略时为 `0`，不限制最低到账额。传入正数时表示每个执行钱包各自的最低到账额。
 - `type=all` 至少有一个钱包实际卖出后才更新任务状态为 `sell`；没有代币可卖时返回错误。
 
 卖出前服务会准备目标 ERC-20 的 Permit2/Router 授权。
@@ -530,7 +529,7 @@ EVM/ERC-20 没有 Solana token account 关闭流程，因此接口保留为兼�
 - boss 和执行钱包私钥只以加密形式存储，接口不返回私钥。
 - 交易由当前钱包签名，通过 Uniswap V4 Universal Router 提交。
 - 卖出会自动处理 Permit2/Router 授权。
-- 卖出必须传入非零 `amountOutMinimumRaw`，由调用方根据报价和滑点计算；示例数值仅用于展示字段格式。
+- 卖出可选传入 `amountOutMinimumRaw` 以限制每个钱包的最低到账额。省略时默认为 `0`，成交不受最低到账额保护。
 - 运行 execute 至少需要配置数据库、RPC、`PRIVATE_KEY_ENCRYPTION_KEY`、Robinhood Chain ID、V4 Pool Manager、Universal Router 和 Permit2 地址。
 
 相关文档：
