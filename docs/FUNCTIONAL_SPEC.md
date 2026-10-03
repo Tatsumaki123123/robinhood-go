@@ -9,7 +9,7 @@ RobinhoodGo 是原 NestJS/Prisma Robinhood 链上交易服务的 Go 后端替代
 
 ## 技术方案
 
-- **HTTP**：Fiber v2（fasthttp），默认 3000 端口，CORS/错误响应可在反向代理统一配置。
+- **HTTP**：Fiber v2（fasthttp），生产默认 3000 端口，开发默认 3001 端口，CORS/错误响应可在反向代理统一配置。
 - **链连接**：HTTP JSON-RPC 用于查询和交易回执，gorilla/websocket 用于
   `eth_subscribe` 日志订阅；订阅断线自动重连。WSS 读协程先写入有序 ingress 队列，
   再交给策略 channel，避免数据库或 RPC 延迟阻塞 websocket；队列溢出计数可从

@@ -17,11 +17,11 @@ docker compose up -d --build
 
 ```powershell
 Copy-Item .env.dev.example .env.dev
-docker compose -f docker-compose.dev.yml up --build
+docker compose --env-file .env.dev -f docker-compose.dev.yml up --build
 ```
 
 ```powershell
-docker compose -f docker-compose.dev.yml restart app
+docker compose --env-file .env.dev -f docker-compose.dev.yml restart app
 ```
 
 生产环境使用默认的 `docker-compose.yml`，构建出的应用镜像为 distroless 静态镜像：
@@ -31,12 +31,16 @@ Copy-Item .env.example .env
 docker compose -f docker-compose.yml up -d --build
 ```
 
-开发和生产使用不同的 PostgreSQL、Redis、上传目录卷；如需清理对应环境数据，使用
-`docker compose -f <compose-file> down -v`。
+开发和生产使用不同的 Compose 项目及 PostgreSQL、Redis、上传目录卷。
+开发项目继续使用原有的 `robinhoodgo_postgres-dev` 数据卷和 `robinhoodgo_uploads-dev` 上传卷；
+首次切换前请停止旧开发容器，避免两个 PostgreSQL 容器同时使用同一数据卷。
+只有确定要删除对应环境数据时才使用 `docker compose -f <compose-file> down -v`。
 
-The API is available at `http://localhost:3000/api/v1`. PostgreSQL migrations run when
-the application starts. Configure the wallet, RPC and contract settings before enabling
-live trading. WebSocket chain events are available at `/ws`.
+生产 API 位于 `http://localhost:3000/api/v1`，开发 API 位于 `http://localhost:3001/api/v1`。
+生产环境的 PostgreSQL/Redis 主机端口为 `5433`/`6380`，开发环境为 `5434`/`6381`。
+开发主机端口可通过 `.env.dev` 中的 `DEV_PORT`、`DEV_POSTGRES_PORT`、`DEV_REDIS_PORT` 覆盖。
+应用启动时会执行 PostgreSQL 迁移。启用真实交易前请配置钱包、RPC 和合约地址；
+链上事件的 WebSocket 路径为 `/ws`。
 
 AVE 请求优先读取数据库 `ave_configs`（`id=1`）的 `x_auth`，未保存时使用
 `AVE_X_AUTH`。token 为空、收到 HTTP 401/403 或 AVE 状态码 10000/10001 时，
@@ -49,7 +53,7 @@ AVE 请求优先读取数据库 `ave_configs`（`id=1`）的 `x_auth`，未保�
 指纹库返回的 32 位十六进制 `visitorId`（在 `vemachine` 构造加密明文处查看）。
 服务端使用 `web` 平台；该值不是 `request_id` 或 `data.id`，也不能从 `server_time`
 推导。缺少指纹、刷新失败、需要验证码或数据库保存失败时会返回错误，不覆盖旧 token。
-修改环境文件后用 `docker compose -f docker-compose.dev.yml up -d --force-recreate app`
+修改环境文件后用 `docker compose --env-file .env.dev -f docker-compose.dev.yml up -d --force-recreate app`
 重建开发容器以加载新配置。
 
 服务启动后会参考 Node.js 服务执行两项后台同步：每小时从 AVE 刷新已启用
